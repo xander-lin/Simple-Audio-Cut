@@ -96,7 +96,10 @@ function App() {
 
   useEffect(() => {
     audioContextRef.current = new AudioContext();
+    const suppressWebViewContextMenu = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener("contextmenu", suppressWebViewContextMenu, true);
     return () => {
+      document.removeEventListener("contextmenu", suppressWebViewContextMenu, true);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       sourceNodeRef.current?.stop();
       void audioContextRef.current?.close();

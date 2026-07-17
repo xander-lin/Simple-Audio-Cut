@@ -1,7 +1,7 @@
 {
   "name": "simple-audio-cut",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Fast spoken-word recording and audio editing",
   "license": "GPL-3.0-only",
   "repository": "https://github.com/xander-lin/Simple-Audio-Cut",
