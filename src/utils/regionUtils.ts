@@ -3,13 +3,41 @@ export interface Region {
   end: number;
 }
 
+export interface EnvelopePoint {
+  id: string;
+  time: number;
+  gain: number;
+}
+
+export function envelopeGainAtTime(points: EnvelopePoint[], duration: number, time: number) {
+  if (points.length === 0 || duration <= 0) return 1;
+  const anchors = [
+    { time: 0, gain: 1 },
+    ...points
+      .map((point) => ({ time: Math.max(0, Math.min(duration, point.time)), gain: Math.max(0, Math.min(2, point.gain)) }))
+      .sort((left, right) => left.time - right.time),
+    { time: duration, gain: 1 },
+  ];
+
+  for (let index = 1; index < anchors.length; index++) {
+    const left = anchors[index - 1];
+    const right = anchors[index];
+    if (time > right.time && index < anchors.length - 1) continue;
+    if (right.time <= left.time) return right.gain;
+    const progress = Math.max(0, Math.min(1, (time - left.time) / (right.time - left.time)));
+    const smooth = progress * progress * (3 - 2 * progress);
+    return left.gain + (right.gain - left.gain) * smooth;
+  }
+  return 1;
+}
+
 /**
  * Merges a list of regions with a new region.
  * Overlapping adjacent regions are combined.
  */
 export function mergeRegions(regions: Region[], newRegion: Region): Region[] {
   // 1. Add new region and sort by start time
-  const sorted = [...regions, newRegion].sort((a, b) => a.start - b.start);
+  const sorted = [...regions, newRegion].map((region) => ({ ...region })).sort((a, b) => a.start - b.start);
 
   if (sorted.length === 0) return [];
 
@@ -30,6 +58,10 @@ export function mergeRegions(regions: Region[], newRegion: Region): Region[] {
   }
 
   return merged;
+}
+
+export function combineRegions(...groups: Region[][]): Region[] {
+  return groups.flat().reduce<Region[]>((regions, region) => mergeRegions(regions, region), []);
 }
 
 /**

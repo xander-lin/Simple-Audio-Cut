@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+runtime_dir="$data_home/io.github.xander_lin.simple_audio_cut/clearvoice"
+venv="$runtime_dir/.venv"
+
+if ! command -v uv >/dev/null 2>&1; then
+  printf '%s\n' 'uv is required. Install it with: sudo pacman -S uv' >&2
+  exit 1
+fi
+
+mkdir -p "$runtime_dir"
+if [[ ! -x "$venv/bin/python" ]]; then
+  uv venv --python 3.12 "$venv"
+fi
+uv pip install --python "$venv/bin/python" 'clearvoice==0.1.2'
+"$venv/bin/python" -c 'from clearvoice import ClearVoice; print("ClearVoice runtime is ready.")'
+
+printf 'Runtime: %s\n' "$venv"

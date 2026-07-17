@@ -1,35 +1,4 @@
-import { Region } from "./regionUtils";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
-
-export async function saveToDisk(blob: Blob, defaultName: string) {
-    // Convert Blob to Uint8Array
-    const arrayBuffer = await blob.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
-
-    try {
-        // Open Save Dialog
-        const path = await save({
-            defaultPath: defaultName,
-            filters: [{
-                name: 'Audio',
-                extensions: ['wav']
-            }]
-        });
-
-        if (path) {
-            // Write to file
-            await writeFile(path, uint8Array);
-            return true;
-        }
-    } catch (err) {
-        console.error("Tauri save failed:", err);
-        throw err;
-    }
-    return false;
-}
-
-
+import { envelopeGainAtTime, type EnvelopePoint, type Region } from "./regionUtils";
 export function getKeptRegions(deletedRegions: Region[], totalDuration: number): Region[] {
   const sorted = [...deletedRegions].sort((a, b) => a.start - b.start);
   const kept: Region[] = [];
@@ -49,10 +18,31 @@ export function getKeptRegions(deletedRegions: Region[], totalDuration: number):
   return kept;
 }
 
-export function exportAudio(
+export function editedOffsetAtOriginalTime(time: number, keptRegions: Region[]) {
+  let offset = 0;
+  for (const region of keptRegions) {
+    if (time <= region.start) return offset;
+    if (time < region.end) return offset + time - region.start;
+    offset += region.end - region.start;
+  }
+  return offset;
+}
+
+export function originalTimeAtEditedOffset(offset: number, keptRegions: Region[]) {
+  let remaining = offset;
+  for (const region of keptRegions) {
+    const duration = region.end - region.start;
+    if (remaining <= duration) return region.start + remaining;
+    remaining -= duration;
+  }
+  return keptRegions.length ? keptRegions[keptRegions.length - 1].end : 0;
+}
+
+export function createEditedBuffer(
   buffer: AudioBuffer,
-  deletedRegions: Region[]
-): Blob {
+  deletedRegions: Region[],
+  envelopePoints: EnvelopePoint[] = [],
+): AudioBuffer {
   const keptRegions = getKeptRegions(deletedRegions, buffer.duration);
   const sampleRate = buffer.sampleRate;
   const numberOfChannels = buffer.numberOfChannels;
@@ -88,77 +78,36 @@ export function exportAudio(
           // However, if inputData is shorter than expected endSample, we might have issues.
           // But startSample/endSample are derived from region which is constrained by duration.
           
-          const chunk = inputData.slice(startSample, startSample + length);
+      const chunk = inputData.slice(startSample, startSample + length);
+      applyEnvelope(chunk, startSample, sampleRate, buffer.duration, envelopePoints);
           
           // Double check target fit
           if (offset + chunk.length <= outputData.length) {
-             outputData.set(chunk, offset);
+      outputData.set(chunk, offset);
           } else {
              // If rounding error caused overflow, truncate
              // This effectively solves the RangeError
-             const fitLength = outputData.length - offset;
-             outputData.set(chunk.slice(0, fitLength), offset);
+      const fitLength = outputData.length - offset;
+      outputData.set(chunk.slice(0, fitLength), offset);
           }
-          offset += chunk.length;
+      offset += chunk.length;
       }
     }
   }
 
-  return bufferToWav(outputBuffer);
+  return outputBuffer;
 }
 
-// Simple WAV encoder
-function bufferToWav(abuffer: AudioBuffer) {
-  const numOfChan = abuffer.numberOfChannels,
-    length = abuffer.length * numOfChan * 2 + 44,
-    buffer = new ArrayBuffer(length),
-    view = new DataView(buffer),
-    channels = [],
-    sampleRate = abuffer.sampleRate;
-  let offset = 0,
-    pos = 0;
-
-  // write WAVE header
-  setUint32(0x46464952); // "RIFF"
-  setUint32(length - 8); // file length - 8
-  setUint32(0x45564157); // "WAVE"
-
-  setUint32(0x20746d66); // "fmt " chunk
-  setUint32(16); // length = 16
-  setUint16(1); // PCM (uncompressed)
-  setUint16(numOfChan);
-  setUint32(sampleRate);
-  setUint32(sampleRate * 2 * numOfChan); // avg. bytes/sec
-  setUint16(numOfChan * 2); // block-align
-  setUint16(16); // 16-bit (hardcoded in this simple converter)
-
-  setUint32(0x61746164); // "data" - chunk
-  setUint32(length - pos - 4); // chunk length
-
-  // write interleaved data
-  for (let i = 0; i < abuffer.numberOfChannels; i++)
-    channels.push(abuffer.getChannelData(i));
-
-  while (pos < abuffer.length) {
-    for (let i = 0; i < numOfChan; i++) {
-      // interleave channels
-      let sample = Math.max(-1, Math.min(1, channels[i][pos])); // clamp
-      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit
-      view.setInt16(44 + offset, sample, true);
-      offset += 2;
-    }
-    pos++;
-  }
-
-  return new Blob([buffer], { type: "audio/wav" });
-
-  function setUint16(data: any) {
-    view.setUint16(pos, data, true);
-    pos += 2;
-  }
-
-  function setUint32(data: any) {
-    view.setUint32(pos, data, true);
-    pos += 4;
+function applyEnvelope(
+  samples: Float32Array,
+  sourceStartSample: number,
+  sampleRate: number,
+  duration: number,
+  points: EnvelopePoint[],
+) {
+  if (points.length === 0) return;
+  for (let index = 0; index < samples.length; index++) {
+    const time = (sourceStartSample + index) / sampleRate;
+    samples[index] *= envelopeGainAtTime(points, duration, time);
   }
 }

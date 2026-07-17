@@ -1,56 +1,72 @@
+import { useEffect, useRef, useState } from "react";
 import WaveformRow from "./WaveformRow";
+import { type RmsFrame } from "../utils/audioAnalysis";
+import { type EnvelopePoint, type Region } from "../utils/regionUtils";
 
 interface WaveformScoreProps {
   buffer: AudioBuffer;
   currentTime: number;
   onSeek: (time: number) => void;
-  secondsPerRow?: number;
-  regions: { start: number; end: number }[];
+  pixelsPerSecond?: number;
+  onScale?: (deltaY: number) => void;
+  regions: Region[];
+  envelopePoints: EnvelopePoint[];
+  rmsFrames: readonly RmsFrame[];
+  silenceThresholdDb: number;
+  showSilenceThreshold: boolean;
   onRegionAdd: (start: number, end: number) => void;
   onRegionRemove: (start: number, end: number) => void;
+  onEnvelopePointAdd: (point: EnvelopePoint) => void;
+  onEnvelopePointMove: (id: string, time: number, gain: number) => void;
+  onEnvelopePointRemove: (id: string) => void;
 }
 
 const WaveformScore = ({
-  buffer,
-  currentTime,
-  onSeek,
-  secondsPerRow = 10,
-  regions,
-  onRegionAdd,
-  onRegionRemove,
+  buffer, currentTime, onSeek, pixelsPerSecond = 48, onScale, regions, envelopePoints,
+  rmsFrames, silenceThresholdDb, showSilenceThreshold, onRegionAdd, onRegionRemove, onEnvelopePointAdd, onEnvelopePointMove, onEnvelopePointRemove,
 }: WaveformScoreProps) => {
-  const duration = buffer.duration;
-  const rowCount = Math.ceil(duration / secondsPerRow);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [rowWidth, setRowWidth] = useState(0);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const updateWidth = () => setRowWidth(Math.max(1, Math.floor(container.clientWidth)));
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  const edgePadding = Math.min(
+    Math.max(24, pixelsPerSecond * 0.3),
+    Math.max(24, rowWidth * 0.25),
+  );
   const rows = [];
-
-  for (let i = 0; i < rowCount; i++) {
-    const startTime = i * secondsPerRow;
-    const endTime = Math.min((i + 1) * secondsPerRow, duration);
-
-    // Only pass currentTime if it's relevant to this row to avoid re-rendering
-    // all other rows?
-    // Actually, React will still diff the props.
-    // But since WaveformCanvas is memoized inside WaveformRow,
-    // and the Playhead logic inside WaveformRow is fast (div position),
-    // it should be fine to pass currentTime to all.
-    // The main heavy lifting (canvas drawing) is now skipped.
-
-    rows.push(
-      <WaveformRow
-        key={i}
-        buffer={buffer}
-        startTime={startTime}
-        endTime={endTime}
-        currentTime={currentTime}
-        onSeek={onSeek}
-        regions={regions}
-        onRegionAdd={onRegionAdd}
-        onRegionRemove={onRegionRemove}
-      />,
-    );
+  let startTime = 0;
+  let index = 0;
+  while (rowWidth > edgePadding && startTime < buffer.duration) {
+    const leadingPadding = index === 0 ? edgePadding : 0;
+    const remainingDuration = buffer.duration - startTime;
+    const finalWidth = leadingPadding + remainingDuration * pixelsPerSecond + edgePadding;
+    const isFinalRow = finalWidth <= rowWidth;
+    const trailingPadding = isFinalRow ? edgePadding : 0;
+    const availableAudioWidth = Math.max(1, rowWidth - leadingPadding - trailingPadding);
+    const rowDuration = isFinalRow ? remainingDuration : availableAudioWidth / pixelsPerSecond;
+    const endTime = Math.min(buffer.duration, startTime + rowDuration);
+    const renderedWidth = isFinalRow
+      ? leadingPadding + (endTime - startTime) * pixelsPerSecond + trailingPadding
+      : rowWidth;
+    rows.push(<WaveformRow key={index} buffer={buffer} startTime={startTime} endTime={endTime} width={renderedWidth} height={96} leadingPadding={leadingPadding} trailingPadding={trailingPadding} currentTime={currentTime} onSeek={onSeek} regions={regions} envelopePoints={envelopePoints} rmsFrames={rmsFrames} silenceThresholdDb={silenceThresholdDb} showSilenceThreshold={showSilenceThreshold} onRegionAdd={onRegionAdd} onRegionRemove={onRegionRemove} onEnvelopePointAdd={onEnvelopePointAdd} onEnvelopePointMove={onEnvelopePointMove} onEnvelopePointRemove={onEnvelopePointRemove} />);
+    startTime = endTime;
+    index += 1;
   }
 
-  return <div className="waveform-score-container">{rows}</div>;
+  return <div ref={containerRef} className="waveform-score-container" onWheel={(event) => {
+    if (!onScale || event.deltaY === 0) return;
+    event.preventDefault();
+    onScale(event.deltaY);
+  }}>{rows}</div>;
 };
 
 export default WaveformScore;

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Simple Audio Cut
+Comment=Fast spoken-word recording and audio editing
+Exec=simple-audio-cut
+Icon=simple-audio-cut
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;
+Keywords=audio;recording;speech;voice;editor;
+StartupWMClass=Simple Audio Cut

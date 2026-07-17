@@ -1,0 +1,51 @@
+pkgname=simple-audio-cut
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Fast spoken-word recording and audio editing'
+arch=('x86_64')
+url='https://github.com/xander-lin/Simple-Audio-Cut'
+license=('GPL-3.0-only')
+options=('!debug')
+depends=('alsa-lib' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1')
+makedepends=('cargo' 'git' 'nodejs' 'pnpm' 'pkgconf')
+optdepends=('uv: install the optional ClearVoice denoising runtime')
+if [[ -n ${SIMPLE_AUDIO_CUT_SOURCE_URL:-} ]]; then
+  source=("$pkgname-$pkgver-local-r6.tar.gz::$SIMPLE_AUDIO_CUT_SOURCE_URL")
+  _source_root="Simple-Audio-Cut-$pkgver"
+else
+  source=("$pkgname::git+$url.git#tag=v$pkgver")
+  _source_root="$pkgname"
+fi
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$_source_root"
+  pnpm install --frozen-lockfile
+  cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+}
+
+build() {
+  cd "$_source_root"
+  pnpm build
+  CARGO_TARGET_DIR="$srcdir/target" \
+    RUSTFLAGS="--remap-path-prefix=$srcdir=/build/simple-audio-cut/src" \
+    cargo build --manifest-path src-tauri/Cargo.toml --release --locked --features custom-protocol
+}
+
+check() {
+  cd "$_source_root"
+  pnpm test
+  CARGO_TARGET_DIR="$srcdir/target" cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --locked
+}
+
+package() {
+  cd "$_source_root"
+  install -Dm755 "$srcdir/target/release/simple-audio-cut" "$pkgdir/usr/bin/simple-audio-cut"
+  install -Dm755 packaging/simple-audio-cut-clearvoice-setup "$pkgdir/usr/bin/simple-audio-cut-clearvoice-setup"
+  install -Dm644 packaging/simple-audio-cut.desktop "$pkgdir/usr/share/applications/simple-audio-cut.desktop"
+  install -Dm644 src-tauri/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/simple-audio-cut.png"
+  install -Dm644 public/simple-audio-cut.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/simple-audio-cut.svg"
+  install -Dm644 tools/clearvoice_denoise.py "$pkgdir/usr/lib/simple-audio-cut/clearvoice_denoise.py"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/simple-audio-cut/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/simple-audio-cut/LICENSE"
+}

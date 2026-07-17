@@ -8,9 +8,16 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+.venv
+checkpoints
 dist
 dist-ssr
 *.local
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.*
+packaging/arch/*.tar.gz
+packaging/arch/simple-audio-cut/
 
 # Editor directories and files
 .vscode/*

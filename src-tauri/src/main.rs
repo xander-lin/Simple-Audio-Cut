@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    audio_full_cut_lib::run()
+    simple_audio_cut_lib::run()
 }
