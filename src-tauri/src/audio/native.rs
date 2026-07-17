@@ -519,6 +519,7 @@ impl AudioEngine for NativeAudioEngine {
         source: &str,
         deleted_regions: &[Region],
         envelope_points: &[EnvelopePoint],
+        destination: &str,
     ) -> Result<String, String> {
         let mut deletions = deleted_regions.to_vec();
         deletions.sort_by(|left, right| left.start.total_cmp(&right.start));
@@ -600,7 +601,15 @@ impl AudioEngine for NativeAudioEngine {
             labels.join(""),
             labels.len()
         ));
-        let output = self.unique_path("-edited.wav");
+        let mut output = PathBuf::from(destination);
+        if output.extension().is_none() {
+            output.set_extension("wav");
+        }
+        let parent = output
+            .parent()
+            .ok_or("The selected export location has no parent directory.")?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create the export directory: {error}"))?;
         self.run_ffmpeg(&[
             "-y".into(),
             "-i".into(),
@@ -613,13 +622,20 @@ impl AudioEngine for NativeAudioEngine {
             "pcm_s24le".into(),
             output.display().to_string(),
         ])?;
+        let metadata = fs::metadata(&output)
+            .map_err(|error| format!("FFmpeg did not create the export file: {error}"))?;
+        if metadata.len() == 0 {
+            return Err("FFmpeg created an empty export file.".into());
+        }
         Ok(output.display().to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::NativeAudioEngine;
+    use super::{AudioEngine, NativeAudioEngine};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn validates_ffmpeg_loudness_target_range() {
@@ -629,6 +645,44 @@ mod tests {
         assert!(NativeAudioEngine::validate_target_lufs(-70.1).is_err());
         assert!(NativeAudioEngine::validate_target_lufs(-4.9).is_err());
         assert!(NativeAudioEngine::validate_target_lufs(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn exports_directly_to_the_requested_destination() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-export-{stamp}"));
+        let source = root.join("source.wav");
+        let destination = root.join("chosen-location/export.wav");
+        fs::create_dir_all(&root).expect("create test directory");
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).expect("create source WAV");
+        for _ in 0..4_800 {
+            writer.write_sample::<i16>(1_000).expect("write source sample");
+        }
+        writer.finalize().expect("finalize source WAV");
+
+        let engine = NativeAudioEngine::new(root.join("recordings")).expect("create audio engine");
+        let exported = engine
+            .export_edit(
+                &source.display().to_string(),
+                &[],
+                &[],
+                &destination.display().to_string(),
+            )
+            .expect("export to requested path");
+
+        assert_eq!(exported, destination.display().to_string());
+        assert!(fs::metadata(&destination).expect("inspect export").len() > 44);
+        fs::remove_dir_all(root).expect("remove test directory");
     }
 }
 

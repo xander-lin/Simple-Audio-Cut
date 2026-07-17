@@ -7,11 +7,6 @@
   ],
   "permissions": [
     "core:default",
-    "dialog:default",
-    "fs:default",
-    "fs:allow-write-file",
-    "fs:allow-home-write-recursive",
-    "fs:allow-desktop-write-recursive",
-    "fs:allow-download-write-recursive"
+    "dialog:default"
   ]
 }

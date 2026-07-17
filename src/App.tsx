@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import EditorTrack from "./components/EditorTrack";
@@ -374,16 +373,23 @@ function App() {
 
   const exportEdit = async () => {
     if (!selectedTrack) return;
+    const destination = await save({
+      defaultPath: `${selectedTrack.name}-edited.wav`,
+      filters: [{ name: "WAV audio", extensions: ["wav"] }],
+    });
+    if (!destination) {
+      setMessage("Export cancelled");
+      return;
+    }
     setIsProcessing(true);
     try {
       const outputPath = await invoke<string>("export_edit", {
         sourcePath: selectedTrack.path,
         deletedRegions: selectedDeletedRegions,
         envelopePoints: selectedTrack.envelopePoints,
+        destination,
       });
-      const destination = await save({ defaultPath: `${selectedTrack.name}-edited.wav`, filters: [{ name: "WAV audio", extensions: ["wav"] }] });
-      if (destination) await writeFile(destination, await readFile(outputPath));
-      setMessage(destination ? "Edited WAV exported" : "Edited WAV is available in the recording library");
+      setMessage(`Edited WAV exported to ${outputPath}`);
     } catch (error) {
       setMessage(String(error));
     } finally {

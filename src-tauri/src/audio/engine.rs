@@ -48,5 +48,6 @@ pub trait AudioEngine: Send + Sync {
         source: &str,
         deleted_regions: &[Region],
         envelope_points: &[EnvelopePoint],
+        destination: &str,
     ) -> Result<String, String>;
 }

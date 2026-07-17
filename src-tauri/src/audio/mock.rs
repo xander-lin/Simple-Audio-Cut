@@ -59,7 +59,10 @@ impl AudioEngine for MockAudioEngine {
         source: &str,
         _deleted_regions: &[super::engine::Region],
         _envelope_points: &[super::engine::EnvelopePoint],
+        destination: &str,
     ) -> Result<String, String> {
-        Ok(source.into())
+        std::fs::copy(source, destination)
+            .map_err(|error| format!("Unable to create mock export: {error}"))?;
+        Ok(destination.into())
     }
 }

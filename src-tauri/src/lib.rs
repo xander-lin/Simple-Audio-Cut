@@ -70,16 +70,21 @@ fn export_edit(
     source_path: String,
     deleted_regions: Vec<Region>,
     envelope_points: Vec<EnvelopePoint>,
+    destination: String,
 ) -> Result<String, String> {
     engine
         .inner()
-        .export_edit(&source_path, &deleted_regions, &envelope_points)
+        .export_edit(
+            &source_path,
+            &deleted_regions,
+            &envelope_points,
+            &destination,
+        )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let recording_dir = app
