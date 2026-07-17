@@ -63,6 +63,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .track-label strong { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .track-label span { flex-shrink: 0; color: #93a29c; font-size: 10px; }
 .export-button { background: #346b51; border-color: #5d9c78; }
+.return-button { min-width: 72px !important; }
+.remove-track-button { min-width: 72px !important; color: #e5b9b4; border-color: #754843; }
+.remove-track-button:hover:not(:disabled) { background: #4a2927; border-color: #af625c; }
 .silence-control { position: relative; z-index: 200; display: flex; width: 102px; min-width: 102px; height: 32px; align-items: center; margin: 0; padding: 0; overflow: visible; border: 0; }
 .silence-button { position: relative; z-index: 2; width: 102px; min-width: 102px; height: 32px; border: 1px solid #4d5a56; border-radius: 5px; background: #222a27; color: #ecf0ee; padding: 0 12px; font-size: 12px; line-height: 30px; }
 .silence-label { display: block; width: 100%; white-space: nowrap; }

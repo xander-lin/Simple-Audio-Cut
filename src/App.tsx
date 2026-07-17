@@ -333,6 +333,30 @@ function App() {
     setMessage("Editing selected recording");
   };
 
+  const selectAfterTrackRemoval = (removedId: string) => {
+    const nextTrack = editorTracks.find((track) => track.id !== removedId) ?? null;
+    setEditorTracks((current) => current.filter((track) => track.id !== removedId));
+    setSelectedTrackId(nextTrack?.id ?? null);
+    setCurrentTime(0);
+    playbackOffsetRef.current = 0;
+    editedPlaybackOffsetRef.current = 0;
+  };
+
+  const returnToLibrary = () => {
+    if (!selectedTrack) return;
+    stopPlayback(false);
+    setRecordings((current) => appendUniqueTrack(current, selectedTrack));
+    selectAfterTrackRemoval(selectedTrack.id);
+    setMessage("Recording returned to the library");
+  };
+
+  const removeTrack = () => {
+    if (!selectedTrack) return;
+    stopPlayback(false);
+    selectAfterTrackRemoval(selectedTrack.id);
+    setMessage("Track removed from the editor");
+  };
+
   const handleDrop = (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
     const id = event.dataTransfer.getData("application/simple-audio-cut-recording");
@@ -467,7 +491,9 @@ function App() {
               }}>{selectedMinimumSilenceDurationMs} ms</button>}
             </fieldset>
             <button type="button" className={selectedTrack.collapsed ? "collapse-button is-active" : "collapse-button"} onClick={() => updateSelectedTrack((track) => ({ ...track, collapsed: !track.collapsed }))} disabled={selectedDeletedRegions.length === 0}>{selectedTrack.collapsed ? "Show cuts" : "Collapse cuts"}</button>
-            <button type="button" className="export-button" onClick={exportEdit} disabled={isProcessing || (selectedDeletedRegions.length === 0 && selectedTrack.envelopePoints.length === 0)}>Export</button>
+            <button type="button" className="return-button" onClick={returnToLibrary} disabled={isProcessing}>Return</button>
+            <button type="button" className="remove-track-button" onClick={removeTrack} disabled={isProcessing}>Remove</button>
+            <button type="button" className="export-button" onClick={exportEdit} disabled={isProcessing}>Export</button>
           </div>}
         </header>
         <div className="editor-content">

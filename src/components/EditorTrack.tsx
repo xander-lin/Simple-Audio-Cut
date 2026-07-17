@@ -68,7 +68,7 @@ export default function EditorTrack({
     ? originalTimeAtEditedOffset(time, keptRegions)
     : time;
 
-  return <article className={selected ? "editor-track is-selected" : "editor-track"} onMouseDownCapture={onSelect}>
+  return <article className={selected ? "editor-track is-selected" : "editor-track"} onMouseDownCapture={onSelect} onContextMenu={(event) => event.preventDefault()}>
     <div className="track-label"><strong>{name}</strong>{collapsed && <span>Collapsed</span>}</div>
     <WaveformScore
       buffer={displayBuffer}

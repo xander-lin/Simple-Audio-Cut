@@ -1,5 +1,5 @@
 pkgname=simple-audio-cut
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Fast spoken-word recording and audio editing'
 arch=('x86_64')
@@ -10,7 +10,7 @@ depends=('alsa-lib' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1')
 makedepends=('cargo' 'git' 'nodejs' 'pnpm' 'pkgconf')
 optdepends=('uv: install the optional ClearVoice denoising runtime')
 if [[ -n ${SIMPLE_AUDIO_CUT_SOURCE_URL:-} ]]; then
-  source=("$pkgname-$pkgver-local-r6.tar.gz::$SIMPLE_AUDIO_CUT_SOURCE_URL")
+  source=("$pkgname-$pkgver-local-r7.tar.gz::$SIMPLE_AUDIO_CUT_SOURCE_URL")
   _source_root="Simple-Audio-Cut-$pkgver"
 else
   source=("$pkgname::git+$url.git#tag=v$pkgver")

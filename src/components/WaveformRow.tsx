@@ -264,7 +264,7 @@ const WaveformRow = ({
 
   return <div ref={containerRef} className="waveform-row-container" role="application" onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={finishDrag} onMouseLeave={() => finishDrag()} onContextMenu={(event) => event.preventDefault()} style={{ width, height }}>
     <div className="waveform-row-clip">
-      <span className="row-time-label">{formatTimeCompact(startTime)}</span>
+      <span className="row-time-label">{formatTimeCompact(endTime)}</span>
       <WaveformCanvas buffer={buffer} startTime={startTime} endTime={endTime} width={width} height={height} leadingPadding={leadingPadding} trailingPadding={trailingPadding} rmsFrames={rmsFrames} silenceThresholdDb={silenceThresholdDb} showSilenceThreshold={showSilenceThreshold} />
       {regions.map((region) => {
         const start = Math.max(region.start, startTime);
