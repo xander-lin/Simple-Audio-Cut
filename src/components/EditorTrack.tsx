@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import WaveformScore from "./WaveformScore";
 import {
   createEditedBuffer,
@@ -48,6 +48,26 @@ export default function EditorTrack({
   onEnvelopePointMove,
   onEnvelopePointRemove,
 }: EditorTrackProps) {
+  const scaleHandleRef = useRef<HTMLDivElement>(null);
+  const onScaleRef = useRef(onScale);
+  const onSelectRef = useRef(onSelect);
+  onScaleRef.current = onScale;
+  onSelectRef.current = onSelect;
+
+  useEffect(() => {
+    const scaleHandle = scaleHandleRef.current;
+    if (!scaleHandle) return;
+    const scaleTrack = (event: WheelEvent) => {
+      if (event.deltaY === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onSelectRef.current();
+      onScaleRef.current(event.deltaY);
+    };
+    scaleHandle.addEventListener("wheel", scaleTrack, { passive: false });
+    return () => scaleHandle.removeEventListener("wheel", scaleTrack);
+  }, []);
+
   const keptRegions = useMemo(
     () => getKeptRegions(deletedRegions, buffer.duration),
     [buffer.duration, deletedRegions],
@@ -69,11 +89,11 @@ export default function EditorTrack({
     : time;
 
   return <article className={selected ? "editor-track is-selected" : "editor-track"} onMouseDownCapture={onSelect} onContextMenu={(event) => event.preventDefault()}>
+    <div ref={scaleHandleRef} className="track-scale-handle" title="Scale track" />
     <div className="track-label"><strong>{name}</strong>{collapsed && <span>Collapsed</span>}</div>
     <WaveformScore
       buffer={displayBuffer}
       pixelsPerSecond={pixelsPerSecond}
-      onScale={selected ? onScale : undefined}
       currentTime={selected ? (collapsed ? editedOffsetAtOriginalTime(currentTime, keptRegions) : currentTime) : -1}
       onSeek={(time) => onSeek(toSourceTime(time))}
       regions={collapsed ? [] : deletedRegions}

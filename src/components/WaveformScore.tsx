@@ -8,7 +8,6 @@ interface WaveformScoreProps {
   currentTime: number;
   onSeek: (time: number) => void;
   pixelsPerSecond?: number;
-  onScale?: (deltaY: number) => void;
   regions: Region[];
   envelopePoints: EnvelopePoint[];
   rmsFrames: readonly RmsFrame[];
@@ -22,7 +21,7 @@ interface WaveformScoreProps {
 }
 
 const WaveformScore = ({
-  buffer, currentTime, onSeek, pixelsPerSecond = 48, onScale, regions, envelopePoints,
+  buffer, currentTime, onSeek, pixelsPerSecond = 48, regions, envelopePoints,
   rmsFrames, silenceThresholdDb, showSilenceThreshold, onRegionAdd, onRegionRemove, onEnvelopePointAdd, onEnvelopePointMove, onEnvelopePointRemove,
 }: WaveformScoreProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -62,11 +61,7 @@ const WaveformScore = ({
     index += 1;
   }
 
-  return <div ref={containerRef} className="waveform-score-container" onWheel={(event) => {
-    if (!onScale || event.deltaY === 0) return;
-    event.preventDefault();
-    onScale(event.deltaY);
-  }}>{rows}</div>;
+  return <div ref={containerRef} className="waveform-score-container">{rows}</div>;
 };
 
 export default WaveformScore;

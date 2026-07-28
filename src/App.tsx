@@ -39,6 +39,12 @@ interface DenoiseEvent {
   error?: string;
 }
 
+interface RecordingContextMenu {
+  recordingId: string;
+  x: number;
+  y: number;
+}
+
 function keptDuration(regions: Region[]) {
   return regions.reduce((duration, region) => duration + region.end - region.start, 0);
 }
@@ -77,6 +83,7 @@ function App() {
   const [silenceControlOpen, setSilenceControlOpen] = useState(false);
   const [silenceDurationControlOpen, setSilenceDurationControlOpen] = useState(false);
   const [silencePrecision, setSilencePrecision] = useState<0 | 1 | 2>(0);
+  const [recordingContextMenu, setRecordingContextMenu] = useState<RecordingContextMenu | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
@@ -85,6 +92,7 @@ function App() {
   const editedPlaybackOffsetRef = useRef(0);
   const animationFrameRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
+  const recordingContextMenuRef = useRef<HTMLDivElement>(null);
   const selectedTrack = editorTracks.find((track) => track.id === selectedTrackId) ?? null;
   const selectedDeletedRegions = selectedTrack
     ? combineRegions(selectedTrack.manualDeletedRegions, selectedTrack.silenceRegions)
@@ -104,6 +112,27 @@ function App() {
       void audioContextRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (!recordingContextMenu) return;
+    const dismiss = (event: MouseEvent) => {
+      if (!recordingContextMenuRef.current?.contains(event.target as Node)) {
+        setRecordingContextMenu(null);
+      }
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setRecordingContextMenu(null);
+    };
+    const dismissOnBlur = () => setRecordingContextMenu(null);
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", dismissOnEscape);
+    window.addEventListener("blur", dismissOnBlur);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", dismissOnEscape);
+      window.removeEventListener("blur", dismissOnBlur);
+    };
+  }, [recordingContextMenu]);
 
   useEffect(() => {
     if (!isRecording) return;
@@ -371,6 +400,12 @@ function App() {
     setRecordings((current) => current.map((recording) => recording.id === id ? { ...recording, name: trimmedName } : recording));
   };
 
+  const removeRecording = (id: string) => {
+    setRecordings((current) => current.filter((recording) => recording.id !== id));
+    setRecordingContextMenu(null);
+    setMessage("Recording deleted from the library");
+  };
+
   const exportEdit = async () => {
     if (!selectedTrack) return;
     const destination = await save({
@@ -433,12 +468,22 @@ function App() {
           <p className="status-line">{isProcessing ? "Processing audio locally" : message}</p>
           <div className="recording-library">
             {recordings.map((recording) => (
-              <article key={recording.id} className="recording-item" draggable onDragStart={(event) => event.dataTransfer.setData("application/simple-audio-cut-recording", recording.id)}>
+              <article key={recording.id} className="recording-item" draggable onDragStart={(event) => event.dataTransfer.setData("application/simple-audio-cut-recording", recording.id)} onContextMenu={(event) => {
+                event.preventDefault();
+                setRecordingContextMenu({
+                  recordingId: recording.id,
+                  x: Math.min(event.clientX, window.innerWidth - 132),
+                  y: Math.min(event.clientY, window.innerHeight - 44),
+                });
+              }}>
                 <div className="recording-details"><input aria-label="Recording name" className="recording-name" defaultValue={recording.name} onBlur={(event) => renameRecording(recording.id, event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} onDragStart={(event) => event.stopPropagation()} /><span>{formatTimeStandard(recording.durationSeconds)}</span></div>
                 <div className="recording-meta"><span className="lufs-badge">{recording.integratedLufs?.toFixed(1) ?? "--"} LUFS</span><span className={recording.denoiseStatus === "processing" ? "denoise-processing" : ""}>{recording.denoiseStatus === "processing" ? "Denoising" : recording.denoiseStatus === "complete" ? "ClearVoice" : "Denoise failed"}</span></div>
               </article>
             ))}
           </div>
+        </div>}
+        {recordingContextMenu && <div ref={recordingContextMenuRef} className="recording-context-menu" role="menu" style={{ left: recordingContextMenu.x, top: recordingContextMenu.y }}>
+          <button type="button" role="menuitem" onClick={() => removeRecording(recordingContextMenu.recordingId)}>Delete</button>
         </div>}
       </section>
 
