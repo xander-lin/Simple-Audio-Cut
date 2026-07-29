@@ -1,9 +1,13 @@
-use super::{AudioEngine, DenoiseCompletion, DenoiseResult, EnvelopePoint, RecordingInfo, Region};
+use super::{
+    reserve_export_path, AudioEngine, DenoiseAvailability, DenoiseCompletion, DenoiseResult,
+    DenoiseUpdate, EnvelopePoint, ExportEdit, ExportResult, RecordingInfo, Region,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,6 +21,7 @@ struct ActiveRecording {
 pub struct NativeAudioEngine {
     recording: Mutex<Option<ActiveRecording>>,
     output_dir: PathBuf,
+    clearvoice_import: Mutex<Option<(PathBuf, bool)>>,
 }
 
 impl NativeAudioEngine {
@@ -27,25 +32,14 @@ impl NativeAudioEngine {
         Ok(Self {
             recording: Mutex::new(None),
             output_dir,
+            clearvoice_import: Mutex::new(None),
         })
     }
 
-    fn clearvoice_runtime(&self) -> Result<(PathBuf, PathBuf), String> {
-        let data_dir = self
-            .output_dir
-            .parent()
-            .ok_or("Unable to locate the application data directory.")?;
-
-        let mut python_candidates = std::env::var_os("SIMPLE_AUDIO_CUT_CLEARVOICE_PYTHON")
+    fn clearvoice_runtime(&self, model_name: &str) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+        let python = std::env::var_os("SIMPLE_AUDIO_CUT_CLEARVOICE_PYTHON")
             .map(PathBuf::from)
-            .into_iter()
-            .collect::<Vec<_>>();
-        #[cfg(debug_assertions)]
-        if let Ok(current_dir) = std::env::current_dir() {
-            python_candidates.push(current_dir.join(".venv/bin/python"));
-        }
-        python_candidates.push(data_dir.join("clearvoice/.venv/bin/python"));
-        let python = python_candidates.into_iter().find(|path| path.is_file());
+            .filter(|path| path.is_file() && self.python_has_clearvoice(path));
 
         let mut worker_candidates = std::env::var_os("SIMPLE_AUDIO_CUT_CLEARVOICE_WORKER")
             .map(PathBuf::from)
@@ -54,19 +48,57 @@ impl NativeAudioEngine {
         #[cfg(debug_assertions)]
         if let Ok(current_dir) = std::env::current_dir() {
             worker_candidates.push(current_dir.join("tools/clearvoice_denoise.py"));
+            if let Some(parent) = current_dir.parent() {
+                worker_candidates.push(parent.join("tools/clearvoice_denoise.py"));
+            }
         }
         worker_candidates.push(PathBuf::from(
             "/usr/lib/simple-audio-cut/clearvoice_denoise.py",
         ));
         let worker = worker_candidates.into_iter().find(|path| path.is_file());
 
-        match (python, worker) {
-            (Some(python), Some(worker)) => Ok((python, worker)),
-            _ => Err(
-                "ClearVoice is not installed. Run `simple-audio-cut-clearvoice-setup`, or create the source-tree `.venv` documented in README.md."
-                    .into(),
-            ),
+        let model_root = std::env::var_os("SIMPLE_AUDIO_CUT_CLEARVOICE_MODEL_ROOT")
+            .map(PathBuf::from)
+            .filter(|path| Self::has_clearvoice_model(path, model_name));
+
+        match (python, worker, model_root) {
+            (Some(python), Some(worker), Some(model_root)) => Ok((python, worker, model_root)),
+            _ => Err("ClearVoice is not configured for this audio format.".into()),
         }
+    }
+
+    fn has_clearvoice_model(root: &Path, model_name: &str) -> bool {
+        let model_dir = root.join("checkpoints").join(model_name);
+        let marker = model_dir.join("last_best_checkpoint");
+        let Ok(checkpoint_name) = fs::read_to_string(marker) else {
+            return false;
+        };
+        let checkpoint = model_dir.join(checkpoint_name.trim());
+        checkpoint
+            .metadata()
+            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+    }
+
+    fn python_has_clearvoice(&self, python: &Path) -> bool {
+        let mut cached = match self.clearvoice_import.lock() {
+            Ok(cached) => cached,
+            Err(_) => return false,
+        };
+        if let Some((cached_python, available)) = cached.as_ref() {
+            if cached_python == python {
+                return *available;
+            }
+        }
+        let available = Command::new(python)
+            .args(["-c", "import clearvoice"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        *cached = Some((python.to_path_buf(), available));
+        available
     }
 
     fn build_stream(
@@ -221,15 +253,47 @@ impl NativeAudioEngine {
         }
     }
 
-    fn run_ffmpeg_command(args: &[String]) -> Result<String, String> {
-        let output = Command::new("ffmpeg")
+    fn run_command(
+        program: &Path,
+        args: &[String],
+        current_dir: Option<&Path>,
+        label: &str,
+    ) -> Result<String, String> {
+        let mut command = Command::new(program);
+        command
             .args(args)
-            .output()
-            .map_err(|error| format!("Unable to run FFmpeg: {error}"))?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(current_dir) = current_dir {
+            command.current_dir(current_dir);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Unable to start {label}: {error}"))?;
+        let mut stdout = child.stdout.take().expect("piped child stdout");
+        let mut stderr = child.stderr.take().expect("piped child stderr");
+        let stdout_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = stdout.read_to_end(&mut output);
+            output
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = stderr.read_to_end(&mut output);
+            output
+        });
+        let status = child
+            .wait()
+            .map_err(|error| format!("Unable to wait for {label}: {error}"))?;
+        let _ = stdout_reader.join();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        if status.success() {
+            Ok(String::from_utf8_lossy(&stderr).into_owned())
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+            Err(format!(
+                "{label} failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ))
         }
     }
 
@@ -244,11 +308,15 @@ impl NativeAudioEngine {
             "null".into(),
             "-".into(),
         ])?;
+        Self::parse_lufs_report(&report)
+    }
+
+    fn parse_lufs_report(report: &str) -> Result<f64, String> {
         let marker = "I:";
         let value = report
             .rsplit(marker)
             .next()
-            .and_then(|line| line.trim().split_whitespace().next())
+            .and_then(|line| line.split_whitespace().next())
             .and_then(|value| value.parse::<f64>().ok());
         value.ok_or_else(|| "FFmpeg could not measure integrated loudness.".into())
     }
@@ -438,78 +506,135 @@ impl AudioEngine for NativeAudioEngine {
         })
     }
 
+    fn denoise_availability(&self, sample_rate: u32) -> DenoiseAvailability {
+        let model_name = if sample_rate >= 44_100 {
+            "MossFormer2_SE_48K"
+        } else {
+            "FRCRN_SE_16K"
+        };
+        DenoiseAvailability {
+            available: sample_rate > 0 && self.clearvoice_runtime(model_name).is_ok(),
+        }
+    }
+
     fn start_denoise(
         &self,
         recording_id: String,
+        task_id: String,
         source: String,
+        sample_rate: u32,
         completion: DenoiseCompletion,
     ) -> Result<(), String> {
         let output_dir = self.output_dir.clone();
-        let (python, worker) = self.clearvoice_runtime()?;
+        if sample_rate == 0 {
+            return Err("The audio stream has no sample rate.".into());
+        }
+        let (model_name, model_rate) = if sample_rate >= 44_100 {
+            ("MossFormer2_SE_48K", 48_000)
+        } else {
+            ("FRCRN_SE_16K", 16_000)
+        };
+        let (python, worker, model_root) = self.clearvoice_runtime(model_name)?;
 
         std::thread::spawn(move || {
-            let result = (|| -> Result<DenoiseResult, String> {
-                let input_rate = Self::media_sample_rate_for(&source)?;
-                let (model_name, model_rate) = if input_rate >= 44_100 {
-                    ("MossFormer2_SE_48K", 48_000)
-                } else {
-                    ("FRCRN_SE_16K", 16_000)
-                };
-                let input = output_dir.join(format!("denoise-{}-input.wav", recording_id));
-                let model_output = output_dir.join(format!("denoise-{}-model.wav", recording_id));
-                let processed = output_dir.join(format!("denoise-{}-processed.wav", recording_id));
-                Self::run_ffmpeg_command(&[
-                    "-y".into(),
-                    "-i".into(),
-                    source.clone(),
-                    "-ar".into(),
-                    model_rate.to_string(),
-                    "-c:a".into(),
-                    "pcm_s16le".into(),
-                    input.display().to_string(),
-                ])?;
-                let process = Command::new(python)
-                    .current_dir(&output_dir)
-                    .arg(worker)
-                    .arg("--model")
-                    .arg(model_name)
-                    .arg("--input")
-                    .arg(&input)
-                    .arg("--output")
-                    .arg(&model_output)
-                    .output()
-                    .map_err(|error| format!("Unable to start ClearVoice: {error}"))?;
-                if !process.status.success() {
-                    return Err(format!(
-                        "ClearVoice failed: {}",
-                        String::from_utf8_lossy(&process.stderr)
-                    ));
-                }
-                Self::run_ffmpeg_command(&[
-                    "-y".into(),
-                    "-i".into(),
-                    model_output.display().to_string(),
-                    "-af".into(),
-                    "adeclick=window=55:overlap=75:arorder=2:threshold=2:burst=2".into(),
-                    "-ar".into(),
-                    input_rate.to_string(),
-                    "-c:a".into(),
-                    "pcm_s24le".into(),
-                    processed.display().to_string(),
-                ])?;
+            let run_denoise = || -> Result<DenoiseResult, String> {
+                let input = output_dir.join(format!("denoise-{task_id}-input.wav"));
+                let model_output = output_dir.join(format!("denoise-{task_id}-model.wav"));
+                let processed = output_dir.join(format!("denoise-{task_id}-processed.wav"));
+                let _ = fs::remove_file(&input);
+                let _ = fs::remove_file(&model_output);
+                let _ = fs::remove_file(&processed);
+                let outcome = (|| {
+                    Self::run_command(
+                        Path::new("ffmpeg"),
+                        &[
+                            "-y".into(),
+                            "-i".into(),
+                            source.clone(),
+                            "-ar".into(),
+                            model_rate.to_string(),
+                            "-c:a".into(),
+                            "pcm_s16le".into(),
+                            input.display().to_string(),
+                        ],
+                        None,
+                        "FFmpeg denoise preparation",
+                    )?;
+                    Self::run_command(
+                        &python,
+                        &[
+                            worker.display().to_string(),
+                            "--model".into(),
+                            model_name.into(),
+                            "--input".into(),
+                            input.display().to_string(),
+                            "--output".into(),
+                            model_output.display().to_string(),
+                        ],
+                        Some(&model_root),
+                        "ClearVoice",
+                    )?;
+                    Self::run_command(
+                        Path::new("ffmpeg"),
+                        &[
+                            "-y".into(),
+                            "-i".into(),
+                            model_output.display().to_string(),
+                            "-af".into(),
+                            "adeclick=window=55:overlap=75:arorder=2:threshold=2:burst=2".into(),
+                            "-ar".into(),
+                            sample_rate.to_string(),
+                            "-c:a".into(),
+                            "pcm_s24le".into(),
+                            processed.display().to_string(),
+                        ],
+                        None,
+                        "FFmpeg denoise post-processing",
+                    )?;
+                    Ok::<(), String>(())
+                })();
                 let _ = fs::remove_file(input);
                 let _ = fs::remove_file(model_output);
-                let analyzer = NativeAudioEngine {
-                    recording: Mutex::new(None),
-                    output_dir: output_dir.clone(),
-                };
+                if outcome.is_err() {
+                    let _ = fs::remove_file(&processed);
+                }
+                outcome?;
+                let integrated_lufs = Self::run_command(
+                    Path::new("ffmpeg"),
+                    &[
+                        "-hide_banner".into(),
+                        "-i".into(),
+                        processed.display().to_string(),
+                        "-filter_complex".into(),
+                        "ebur128=peak=true".into(),
+                        "-f".into(),
+                        "null".into(),
+                        "-".into(),
+                    ],
+                    None,
+                    "FFmpeg loudness measurement",
+                )
+                .ok()
+                .and_then(|report| Self::parse_lufs_report(&report).ok());
                 Ok(DenoiseResult {
-                    recording_id,
+                    recording_id: recording_id.clone(),
+                    task_id: task_id.clone(),
                     path: processed.display().to_string(),
-                    integrated_lufs: analyzer.measure_lufs(&processed.display().to_string()).ok(),
+                    integrated_lufs,
                 })
-            })();
-            completion(result);
+            };
+            completion(DenoiseUpdate::Processing {
+                recording_id: recording_id.clone(),
+                task_id: task_id.clone(),
+            });
+            match run_denoise() {
+                Ok(result) => completion(DenoiseUpdate::Complete { result }),
+                Err(error) => completion(DenoiseUpdate::Failed {
+                    recording_id,
+                    task_id,
+                    error,
+                }),
+            }
         });
         Ok(())
     }
@@ -629,12 +754,63 @@ impl AudioEngine for NativeAudioEngine {
         }
         Ok(output.display().to_string())
     }
+
+    fn export_edits(&self, edits: &[ExportEdit], destination_dir: &str) -> Vec<ExportResult> {
+        let destination_dir = Path::new(destination_dir);
+        if let Err(error) = fs::create_dir_all(destination_dir) {
+            return edits
+                .iter()
+                .map(|edit| ExportResult {
+                    recording_id: edit.recording_id.clone(),
+                    path: None,
+                    error: Some(format!("Unable to create the export directory: {error}")),
+                })
+                .collect();
+        }
+        edits
+            .iter()
+            .map(|edit| {
+                let destination = match reserve_export_path(destination_dir, &edit.name) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        return ExportResult {
+                            recording_id: edit.recording_id.clone(),
+                            path: None,
+                            error: Some(error),
+                        };
+                    }
+                };
+                let result = self.export_edit(
+                    &edit.source_path,
+                    &edit.deleted_regions,
+                    &edit.envelope_points,
+                    &destination.display().to_string(),
+                );
+                match result {
+                    Ok(path) => ExportResult {
+                        recording_id: edit.recording_id.clone(),
+                        path: Some(path),
+                        error: None,
+                    },
+                    Err(error) => {
+                        let _ = fs::remove_file(destination);
+                        ExportResult {
+                            recording_id: edit.recording_id.clone(),
+                            path: None,
+                            error: Some(error),
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioEngine, NativeAudioEngine};
+    use super::{reserve_export_path, AudioEngine, DenoiseUpdate, ExportEdit, NativeAudioEngine};
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -666,7 +842,9 @@ mod tests {
         };
         let mut writer = hound::WavWriter::create(&source, spec).expect("create source WAV");
         for _ in 0..4_800 {
-            writer.write_sample::<i16>(1_000).expect("write source sample");
+            writer
+                .write_sample::<i16>(1_000)
+                .expect("write source sample");
         }
         writer.finalize().expect("finalize source WAV");
 
@@ -684,26 +862,164 @@ mod tests {
         assert!(fs::metadata(&destination).expect("inspect export").len() > 44);
         fs::remove_dir_all(root).expect("remove test directory");
     }
-}
 
-impl NativeAudioEngine {
-    fn media_sample_rate_for(source: &str) -> Result<u32, String> {
-        let input = ffmpeg_next::format::input(source)
-            .map_err(|error| format!("Unable to inspect recorded media: {error}"))?;
-        let stream = input
-            .streams()
-            .best(ffmpeg_next::media::Type::Audio)
-            .ok_or("The selected file does not contain an audio stream.")?;
-        let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|error| format!("Unable to read audio stream settings: {error}"))?;
-        let decoder = context
-            .decoder()
-            .audio()
-            .map_err(|error| format!("Unable to open audio stream settings: {error}"))?;
-        let sample_rate = decoder.rate();
-        if sample_rate == 0 {
-            return Err("The audio stream has no sample rate.".into());
+    #[test]
+    fn creates_non_overwriting_batch_export_paths() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-batch-path-{stamp}"));
+        fs::create_dir_all(&root).expect("create test directory");
+        fs::write(root.join("voice-edited.wav"), b"existing").expect("create existing export");
+
+        let path = reserve_export_path(&root, "voice").expect("reserve voice path");
+        let sanitized = reserve_export_path(&root, "folder/voice").expect("reserve sanitized path");
+
+        assert_eq!(path, root.join("voice-edited-2.wav"));
+        assert_eq!(sanitized, root.join("folder_voice-edited.wav"));
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn rejects_an_incomplete_clearvoice_model_directory() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-model-path-{stamp}"));
+        let incomplete = root.join("incomplete");
+        let complete = root.join("complete");
+        let model_name = "MossFormer2_SE_48K";
+        for candidate in [&incomplete, &complete] {
+            let model_dir = candidate.join("checkpoints").join(model_name);
+            fs::create_dir_all(&model_dir).expect("create model directory");
+            fs::write(model_dir.join("last_best_checkpoint"), "model.pt\n")
+                .expect("write model marker");
         }
-        Ok(sample_rate)
+        fs::write(
+            complete
+                .join("checkpoints")
+                .join(model_name)
+                .join("model.pt"),
+            b"model",
+        )
+        .expect("write complete model");
+
+        assert!(!NativeAudioEngine::has_clearvoice_model(
+            &incomplete,
+            model_name
+        ));
+        assert!(NativeAudioEngine::has_clearvoice_model(
+            &complete, model_name
+        ));
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn rejects_a_python_without_clearvoice() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-python-path-{stamp}"));
+        fs::create_dir_all(&root).expect("create test directory");
+        let engine = NativeAudioEngine::new(root.join("recordings")).expect("create audio engine");
+
+        assert!(!engine.python_has_clearvoice(Path::new("/bin/false")));
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn exports_multiple_edits_in_one_batch() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-batch-{stamp}"));
+        let source = root.join("source.wav");
+        let destination = root.join("exports");
+        fs::create_dir_all(&root).expect("create test directory");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).expect("create source WAV");
+        for _ in 0..4_800 {
+            writer
+                .write_sample::<i16>(1_000)
+                .expect("write source sample");
+        }
+        writer.finalize().expect("finalize source WAV");
+        let engine = NativeAudioEngine::new(root.join("recordings")).expect("create audio engine");
+        let edits = ["first", "second"].map(|name| ExportEdit {
+            recording_id: name.into(),
+            name: name.into(),
+            source_path: source.display().to_string(),
+            deleted_regions: Vec::new(),
+            envelope_points: Vec::new(),
+        });
+
+        let results = engine.export_edits(&edits, &destination.display().to_string());
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.error.is_none()));
+        assert!(destination.join("first-edited.wav").is_file());
+        assert!(destination.join("second-edited.wav").is_file());
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    #[ignore = "runs the installed ClearVoice model"]
+    fn denoises_with_the_real_clearvoice_runtime() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-clearvoice-{stamp}"));
+        let source = root.join("source.wav");
+        fs::create_dir_all(&root).expect("create test directory");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).expect("create source WAV");
+        for sample in 0..480_000 {
+            let frame = sample / 2;
+            let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+            writer
+                .write_sample::<i16>((phase.sin() * 4_000.0) as i16)
+                .expect("write source sample");
+        }
+        writer.finalize().expect("finalize source WAV");
+        let engine = NativeAudioEngine::new(root.join("recordings")).expect("create audio engine");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        engine
+            .start_denoise(
+                "recording".into(),
+                "real-model".into(),
+                source.display().to_string(),
+                48_000,
+                Box::new(move |update| tx.send(update).expect("send denoise update")),
+            )
+            .expect("start denoise");
+
+        let result = loop {
+            match rx.recv().expect("receive denoise update") {
+                DenoiseUpdate::Processing { .. } => {}
+                DenoiseUpdate::Complete { result } => break Ok(result),
+                DenoiseUpdate::Failed { error, .. } => break Err(error),
+            }
+        }
+        .expect("real ClearVoice denoise should complete");
+
+        assert!(Path::new(&result.path).is_file());
+        assert!(fs::metadata(&result.path).expect("inspect output").len() > 44);
+        fs::remove_dir_all(root).expect("remove test directory");
     }
 }

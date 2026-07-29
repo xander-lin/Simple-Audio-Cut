@@ -5,8 +5,11 @@ mod mock;
 mod native;
 
 pub use engine::{
-    AudioEngine, DenoiseCompletion, DenoiseResult, EnvelopePoint, RecordingInfo, Region,
+    reserve_export_path, AudioEngine, DenoiseAvailability, DenoiseCompletion, DenoiseResult,
+    DenoiseUpdate, ExportEdit, ExportResult, RecordingInfo,
 };
+#[cfg(feature = "native-audio")]
+pub use engine::{EnvelopePoint, Region};
 #[cfg(not(feature = "native-audio"))]
 pub use mock::MockAudioEngine;
 #[cfg(feature = "native-audio")]

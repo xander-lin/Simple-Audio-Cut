@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import EditorTrack from "./components/EditorTrack";
@@ -9,6 +9,7 @@ import { formatTimeStandard } from "./utils/timeUtils";
 import { dbfsToAmplitude, detectSilence } from "./utils/audioAnalysis";
 import { createEditedBuffer, getKeptRegions } from "./utils/exportUtils";
 import { appendUniqueTrack } from "./utils/trackUtils";
+import { applyDenoiseUpdate, canExportTracks, type DenoiseState } from "./utils/denoiseUtils";
 import "./App.css";
 
 interface RecordingInfo {
@@ -19,7 +20,7 @@ interface RecordingInfo {
   integratedLufs: number | null;
 }
 
-interface Recording extends RecordingInfo {
+interface Recording extends RecordingInfo, DenoiseState {
   buffer: AudioBuffer;
   pixelsPerSecond: number;
   manualDeletedRegions: Region[];
@@ -29,20 +30,45 @@ interface Recording extends RecordingInfo {
   minimumSilenceDurationMs: number;
   envelopePoints: EnvelopePoint[];
   collapsed: boolean;
-  denoiseStatus: "processing" | "complete" | "failed";
+}
+
+interface DenoiseResult {
+  recordingId: string;
+  taskId: string;
+  path: string;
+  integratedLufs: number | null;
+}
+
+interface DenoiseAvailability {
+  available: boolean;
 }
 
 interface DenoiseEvent {
-  status: "complete" | "failed";
-  result?: { recordingId: string; path: string; integratedLufs: number | null };
-  recordingId?: string;
-  error?: string;
+  status: "processing";
+  recordingId: string;
+  taskId: string;
+}
+
+interface ExportResult {
+  recordingId: string;
+  path: string | null;
+  error: string | null;
 }
 
 interface RecordingContextMenu {
   recordingId: string;
   x: number;
   y: number;
+}
+
+function createDeferred() {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 function keptDuration(regions: Region[]) {
@@ -69,6 +95,13 @@ function originalTimeAtEditedOffset(offset: number, regions: Region[]) {
   return regions.length ? regions[regions.length - 1].end : 0;
 }
 
+function denoiseLabel(recording: Recording) {
+  if (recording.denoiseStatus === "queued") return "Denoise queued";
+  if (recording.denoiseStatus === "processing") return "Denoising";
+  if (recording.denoiseStatus === "unavailable") return "No denoise";
+  return recording.denoiseStatus === "complete" ? "ClearVoice" : "Denoise failed";
+}
+
 function App() {
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [editorTracks, setEditorTracks] = useState<Recording[]>([]);
@@ -93,6 +126,13 @@ function App() {
   const animationFrameRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const recordingContextMenuRef = useRef<HTMLDivElement>(null);
+  const selectedTrackIdRef = useRef<string | null>(null);
+  const denoiseListenerReadyRef = useRef<ReturnType<typeof createDeferred> | null>(null);
+  const currentDenoiseTasksRef = useRef(new Map<string, string>());
+  const activeDenoiseRecordingsRef = useRef(new Set<string>());
+  const exportInProgressRef = useRef(false);
+  if (!denoiseListenerReadyRef.current) denoiseListenerReadyRef.current = createDeferred();
+  selectedTrackIdRef.current = selectedTrackId;
   const selectedTrack = editorTracks.find((track) => track.id === selectedTrackId) ?? null;
   const selectedDeletedRegions = selectedTrack
     ? combineRegions(selectedTrack.manualDeletedRegions, selectedTrack.silenceRegions)
@@ -171,7 +211,8 @@ function App() {
       minimumSilenceDurationMs: 200,
       envelopePoints: [],
       collapsed: false,
-      denoiseStatus: "processing" as const,
+      denoiseStatus: "queued" as const,
+      denoiseTaskId: "",
     };
   };
 
@@ -181,14 +222,81 @@ function App() {
     return recording;
   };
 
+  const completeDenoise = async (result: DenoiseResult) => {
+    if (currentDenoiseTasksRef.current.get(result.recordingId) !== result.taskId) return;
+    if (selectedTrackIdRef.current === result.recordingId) {
+      sourceNodeRef.current?.stop();
+      sourceNodeRef.current = null;
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      setIsPlaying(false);
+    }
+    const context = audioContextRef.current;
+    if (!context) throw new Error("Audio system is not ready.");
+    const response = await fetch(convertFileSrc(result.path));
+    if (!response.ok) throw new Error("Unable to load ClearVoice output.");
+    const buffer = await context.decodeAudioData(await response.arrayBuffer());
+    const replace = (recording: Recording): Recording => {
+      if (recording.id !== result.recordingId || recording.denoiseTaskId !== result.taskId) return recording;
+      return {
+        ...recording,
+        path: result.path,
+        buffer,
+        durationSeconds: buffer.duration,
+        integratedLufs: result.integratedLufs ?? recording.integratedLufs,
+        silenceRegions: recording.silenceDetectionEnabled
+          ? detectSilence(buffer, {
+            threshold: dbfsToAmplitude(recording.silenceThresholdDb),
+            minDuration: recording.minimumSilenceDurationMs / 1_000,
+          })
+          : [],
+        denoiseStatus: "complete",
+      };
+    };
+    setRecordings((current) => current.map(replace));
+    setEditorTracks((current) => current.map(replace));
+  };
+
   const queueDenoise = async (recording: Recording) => {
+    if (activeDenoiseRecordingsRef.current.has(recording.id)) return;
+    activeDenoiseRecordingsRef.current.add(recording.id);
+    const taskId = crypto.randomUUID();
+    currentDenoiseTasksRef.current.set(recording.id, taskId);
+    const markQueued = (current: Recording): Recording => current.id === recording.id
+      ? { ...current, denoiseStatus: "queued", denoiseTaskId: taskId }
+      : current;
+    setRecordings((current) => current.map(markQueued));
+    setEditorTracks((current) => current.map(markQueued));
     try {
-      await invoke("start_denoise", { recordingId: recording.id, sourcePath: recording.path });
+      const availability = await invoke<DenoiseAvailability>("denoise_availability", {
+        sampleRate: recording.buffer.sampleRate,
+      });
+      if (!availability.available) {
+        const markUnavailable = (current: Recording) => applyDenoiseUpdate(current, recording.id, taskId, {
+          denoiseStatus: "unavailable",
+        });
+        setRecordings((current) => current.map(markUnavailable));
+        setEditorTracks((current) => current.map(markUnavailable));
+        return;
+      }
+      await denoiseListenerReadyRef.current?.promise;
+      const result = await invoke<DenoiseResult>("start_denoise", {
+        recordingId: recording.id,
+        taskId,
+        sourcePath: recording.path,
+        sampleRate: recording.buffer.sampleRate,
+      });
+      await completeDenoise(result);
     } catch (error) {
-      const update = (current: Recording) => current.id === recording.id ? { ...current, denoiseStatus: "failed" as const } : current;
+      const update = (current: Recording) => applyDenoiseUpdate(current, recording.id, taskId, { denoiseStatus: "failed" });
       setRecordings((current) => current.map(update));
       setEditorTracks((current) => current.map(update));
-      setMessage(String(error));
+      if (currentDenoiseTasksRef.current.get(recording.id) === taskId) {
+        setMessage(String(error));
+      }
+    } finally {
+      if (currentDenoiseTasksRef.current.get(recording.id) === taskId) {
+        activeDenoiseRecordingsRef.current.delete(recording.id);
+      }
     }
   };
 
@@ -240,52 +348,31 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let disposed = false;
+    const listenerReady = denoiseListenerReadyRef.current;
     void listen<DenoiseEvent>("denoise-status", async ({ payload }) => {
-      if (payload.status === "failed") {
-        const markFailed = (recording: Recording) => recording.id === payload.recordingId ? { ...recording, denoiseStatus: "failed" as const } : recording;
-        setRecordings((current) => current.map(markFailed));
-        setEditorTracks((current) => current.map(markFailed));
-        setMessage(payload.error ?? "ClearVoice denoising failed.");
+      const markProcessing = (recording: Recording) => applyDenoiseUpdate(recording, payload.recordingId, payload.taskId, {
+        denoiseStatus: "processing",
+      });
+      setRecordings((current) => current.map(markProcessing));
+      setEditorTracks((current) => current.map(markProcessing));
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
         return;
       }
-      if (!payload.result) return;
-      try {
-        if (selectedTrackId === payload.result.recordingId) {
-          sourceNodeRef.current?.stop();
-          sourceNodeRef.current = null;
-          if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-          setIsPlaying(false);
-        }
-        const context = audioContextRef.current;
-        if (!context) throw new Error("Audio system is not ready.");
-        const response = await fetch(convertFileSrc(payload.result.path));
-        if (!response.ok) throw new Error("Unable to load ClearVoice output.");
-        const buffer = await context.decodeAudioData(await response.arrayBuffer());
-        const replace = (recording: Recording): Recording => {
-          if (recording.id !== payload.result?.recordingId) return recording;
-          return {
-            ...recording,
-            path: payload.result.path,
-            buffer,
-            durationSeconds: buffer.duration,
-            integratedLufs: payload.result.integratedLufs ?? recording.integratedLufs,
-            silenceRegions: recording.silenceDetectionEnabled
-              ? detectSilence(buffer, {
-                threshold: dbfsToAmplitude(recording.silenceThresholdDb),
-                minDuration: recording.minimumSilenceDurationMs / 1_000,
-              })
-              : [],
-            denoiseStatus: "complete",
-          };
-        };
-        setRecordings((current) => current.map(replace));
-        setEditorTracks((current) => current.map(replace));
-      } catch (error) {
-        setMessage(String(error));
-      }
-    }).then((dispose) => { unlisten = dispose; });
-    return () => unlisten?.();
-  }, [selectedTrackId]);
+      unlisten = dispose;
+      listenerReady?.resolve();
+    }).catch((error) => {
+      if (disposed) return;
+      listenerReady?.reject(error);
+      setMessage(`Unable to monitor denoising: ${String(error)}`);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const stopPlayback = (savePosition: boolean) => {
     if (sourceNodeRef.current) {
@@ -406,28 +493,41 @@ function App() {
     setMessage("Recording deleted from the library");
   };
 
-  const exportEdit = async () => {
-    if (!selectedTrack) return;
-    const destination = await save({
-      defaultPath: `${selectedTrack.name}-edited.wav`,
-      filters: [{ name: "WAV audio", extensions: ["wav"] }],
-    });
-    if (!destination) {
-      setMessage("Export cancelled");
-      return;
-    }
+  const exportEdits = async () => {
+    if (!editorTracks.length || exportInProgressRef.current) return;
+    exportInProgressRef.current = true;
     setIsProcessing(true);
     try {
-      const outputPath = await invoke<string>("export_edit", {
-        sourcePath: selectedTrack.path,
-        deletedRegions: selectedDeletedRegions,
-        envelopePoints: selectedTrack.envelopePoints,
-        destination,
+      const destinationDir = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose a folder for exported audio",
       });
-      setMessage(`Edited WAV exported to ${outputPath}`);
+      if (!destinationDir || Array.isArray(destinationDir)) {
+        setMessage("Export cancelled");
+        return;
+      }
+      const results = await invoke<ExportResult[]>("export_edits", {
+        destinationDir,
+        edits: editorTracks.map((track) => ({
+          recordingId: track.id,
+          name: track.name,
+          sourcePath: track.path,
+          deletedRegions: combineRegions(track.manualDeletedRegions, track.silenceRegions),
+          envelopePoints: track.envelopePoints,
+        })),
+      });
+      const failures = results.filter((result) => result.error);
+      if (failures.length) {
+        const failedTrack = editorTracks.find((track) => track.id === failures[0].recordingId);
+        setMessage(`Exported ${results.length - failures.length}/${results.length} tracks. ${failedTrack?.name ?? "A track"} failed: ${failures[0].error}`);
+      } else {
+        setMessage(`Exported ${results.length} tracks to ${destinationDir}`);
+      }
     } catch (error) {
       setMessage(String(error));
     } finally {
+      exportInProgressRef.current = false;
       setIsProcessing(false);
     }
   };
@@ -477,7 +577,7 @@ function App() {
                 });
               }}>
                 <div className="recording-details"><input aria-label="Recording name" className="recording-name" defaultValue={recording.name} onBlur={(event) => renameRecording(recording.id, event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} onDragStart={(event) => event.stopPropagation()} /><span>{formatTimeStandard(recording.durationSeconds)}</span></div>
-                <div className="recording-meta"><span className="lufs-badge">{recording.integratedLufs?.toFixed(1) ?? "--"} LUFS</span><span className={recording.denoiseStatus === "processing" ? "denoise-processing" : ""}>{recording.denoiseStatus === "processing" ? "Denoising" : recording.denoiseStatus === "complete" ? "ClearVoice" : "Denoise failed"}</span></div>
+                <div className="recording-meta"><span className="lufs-badge">{recording.integratedLufs?.toFixed(1) ?? "--"} LUFS</span><span className={recording.denoiseStatus === "queued" || recording.denoiseStatus === "processing" ? "denoise-processing" : recording.denoiseStatus === "failed" ? "denoise-failed" : ""}>{denoiseLabel(recording)}</span></div>
               </article>
             ))}
           </div>
@@ -547,14 +647,14 @@ function App() {
             <button type="button" className={selectedTrack.collapsed ? "collapse-button is-active" : "collapse-button"} onClick={() => updateSelectedTrack((track) => ({ ...track, collapsed: !track.collapsed }))} disabled={selectedDeletedRegions.length === 0}>{selectedTrack.collapsed ? "Show cuts" : "Collapse cuts"}</button>
             <button type="button" className="return-button" onClick={returnToLibrary} disabled={isProcessing}>Return</button>
             <button type="button" className="remove-track-button" onClick={removeTrack} disabled={isProcessing}>Remove</button>
-            <button type="button" className="export-button" onClick={exportEdit} disabled={isProcessing}>Export</button>
+            <button type="button" className="export-button" onClick={exportEdits} disabled={isProcessing || !canExportTracks(editorTracks)} title={!canExportTracks(editorTracks) ? "Wait for all tracks to finish denoising" : "Export all editor tracks"}>Export all ({editorTracks.length})</button>
           </div>}
         </header>
         <div className="editor-content">
           {editorTracks.length > 0 ? <div className="editor-tracks">{editorTracks.map((track) => {
             const deletedRegions = combineRegions(track.manualDeletedRegions, track.silenceRegions);
             const isSelected = track.id === selectedTrackId;
-            return <EditorTrack key={track.id} name={track.name} buffer={track.buffer} selected={isSelected} collapsed={track.collapsed} currentTime={isSelected ? currentTime : 0} pixelsPerSecond={track.pixelsPerSecond} deletedRegions={deletedRegions} envelopePoints={track.envelopePoints} silenceThresholdDb={track.silenceThresholdDb} onSelect={() => {
+            return <EditorTrack key={track.id} name={track.name} status={denoiseLabel(track)} statusKind={track.denoiseStatus} buffer={track.buffer} selected={isSelected} collapsed={track.collapsed} currentTime={isSelected ? currentTime : 0} pixelsPerSecond={track.pixelsPerSecond} deletedRegions={deletedRegions} envelopePoints={track.envelopePoints} silenceThresholdDb={track.silenceThresholdDb} onSelect={() => {
               if (track.id === selectedTrackId) return;
               stopPlayback(false);
               setSelectedTrackId(track.id);

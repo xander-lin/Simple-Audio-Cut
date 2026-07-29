@@ -81,31 +81,65 @@ makepkg -si
 simple-audio-cut
 ```
 
-### 启用 ClearVoice
+### 配置 ClearVoice
 
-主程序不把数 GB 的 Python/PyTorch 环境塞进系统包。安装后主动执行一次：
+主程序不安装 Python、PyTorch、ClearVoice 或模型。未配置降噪环境时，录音、导入、静音裁切、手动编辑和导出仍可正常使用，素材显示 `No denoise`。
 
-```bash
-simple-audio-cut-clearvoice-setup
+用户可以自行选择 CPU、CUDA 或其他 PyTorch 环境。环境中需安装 `clearvoice==0.1.2`，并在模型根目录中准备所需模型：48 kHz 音频使用 `MossFormer2_SE_48K`，较低采样率使用 `FRCRN_SE_16K`。模型根目录结构应为：
+
+```text
+/path/to/model-root/checkpoints/MossFormer2_SE_48K/last_best_checkpoint
+/path/to/model-root/checkpoints/MossFormer2_SE_48K/<checkpoint>.pt
+/path/to/model-root/checkpoints/FRCRN_SE_16K/last_best_checkpoint
+/path/to/model-root/checkpoints/FRCRN_SE_16K/<checkpoint>.pt
 ```
 
-脚本使用项目级 `uv` 环境，将 ClearVoice 安装到用户数据目录。首次安装和首次模型下载需要网络并可能耗时较长。未安装 ClearVoice 时，录音、导入、静音裁切、手动编辑和导出仍可使用，素材会显示降噪不可用。
+在用户自己选择并已安装 PyTorch 的 Python 环境中安装 ClearVoice，然后下载模型：
+
+```bash
+/path/to/python -m pip install 'clearvoice==0.1.2'
+mkdir -p /path/to/model-root
+cd /path/to/model-root
+/path/to/python - <<'PY'
+from clearvoice import ClearVoice
+
+for model in ("MossFormer2_SE_48K", "FRCRN_SE_16K"):
+    ClearVoice(task="speech_enhancement", model_names=[model])
+PY
+```
+
+ClearVoice 会把模型下载到当前目录的 `checkpoints/`。程序不会修改该 Python 环境，也不会自行下载模型。
+
+为终端启动配置环境变量：
+
+```bash
+export SIMPLE_AUDIO_CUT_CLEARVOICE_PYTHON=/path/to/python
+export SIMPLE_AUDIO_CUT_CLEARVOICE_MODEL_ROOT=/path/to/model-root
+simple-audio-cut
+```
+
+从桌面菜单启动时，可将相同变量写入 `~/.config/environment.d/simple-audio-cut.conf`，重新登录后生效：
+
+```ini
+SIMPLE_AUDIO_CUT_CLEARVOICE_PYTHON=/path/to/python
+SIMPLE_AUDIO_CUT_CLEARVOICE_MODEL_ROOT=/path/to/model-root
+```
+
+程序自带 ClearVoice 调用脚本；如需使用自定义适配器，可另设 `SIMPLE_AUDIO_CUT_CLEARVOICE_WORKER=/path/to/worker.py`。
 
 ## 从源码开发
 
 安装构建依赖：
 
 ```bash
-sudo pacman -S --needed base-devel alsa-lib ffmpeg gtk3 webkit2gtk-4.1 nodejs pnpm rustup pkgconf uv
+sudo pacman -S --needed base-devel alsa-lib ffmpeg gtk3 webkit2gtk-4.1 nodejs pnpm rustup pkgconf
 rustup default stable
 ```
 
-安装前端和可选 ClearVoice 运行时：
+安装前端依赖：
 
 ```bash
 pnpm install
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python 'clearvoice==0.1.2'
 ```
 
 启动开发版：
@@ -125,7 +159,7 @@ cargo check --manifest-path src-tauri/Cargo.toml --no-default-features
 
 ## 数据位置
 
-录音、处理结果、模型缓存和可选 ClearVoice 环境保存在用户应用数据目录：
+录音和处理结果保存在用户应用数据目录：
 
 ```text
 ~/.local/share/io.github.xander_lin.simple_audio_cut/

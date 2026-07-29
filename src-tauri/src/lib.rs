@@ -2,21 +2,16 @@ mod audio;
 
 #[cfg(feature = "native-audio")]
 use audio::NativeAudioEngine;
-use audio::{AudioEngine, DenoiseResult, EnvelopePoint, RecordingInfo, Region};
-use serde::Serialize;
+use audio::{
+    AudioEngine, DenoiseAvailability, DenoiseResult, DenoiseUpdate, ExportEdit, ExportResult,
+    RecordingInfo,
+};
 use tauri::{Emitter, Manager};
 
 #[cfg(feature = "native-audio")]
 type AppAudioEngine = NativeAudioEngine;
 #[cfg(not(feature = "native-audio"))]
 type AppAudioEngine = audio::MockAudioEngine;
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
-enum DenoiseEvent {
-    Complete { result: DenoiseResult },
-    Failed { recording_id: String, error: String },
-}
 
 #[tauri::command]
 fn start_recording(engine: tauri::State<'_, AppAudioEngine>) -> Result<(), String> {
@@ -41,45 +36,56 @@ fn import_audio(
 }
 
 #[tauri::command]
-fn start_denoise(
-    app: tauri::AppHandle,
+fn denoise_availability(
     engine: tauri::State<'_, AppAudioEngine>,
-    recording_id: String,
-    source_path: String,
-) -> Result<(), String> {
-    let event_id = recording_id.clone();
-    engine.inner().start_denoise(
-        recording_id,
-        source_path,
-        Box::new(move |outcome| {
-            let payload = match outcome {
-                Ok(result) => DenoiseEvent::Complete { result },
-                Err(error) => DenoiseEvent::Failed {
-                    recording_id: event_id,
-                    error,
-                },
-            };
-            let _ = app.emit("denoise-status", payload);
-        }),
-    )
+    sample_rate: u32,
+) -> DenoiseAvailability {
+    engine.inner().denoise_availability(sample_rate)
 }
 
 #[tauri::command]
-fn export_edit(
+async fn start_denoise(
+    app: tauri::AppHandle,
     engine: tauri::State<'_, AppAudioEngine>,
+    recording_id: String,
+    task_id: String,
     source_path: String,
-    deleted_regions: Vec<Region>,
-    envelope_points: Vec<EnvelopePoint>,
-    destination: String,
-) -> Result<String, String> {
-    engine
-        .inner()
-        .export_edit(
-            &source_path,
-            &deleted_regions,
-            &envelope_points,
-            &destination,
-        )
+    sample_rate: u32,
+) -> Result<DenoiseResult, String> {
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    engine.inner().start_denoise(
+        recording_id,
+        task_id,
+        source_path,
+        sample_rate,
+        Box::new(move |update: DenoiseUpdate| match update {
+            update @ DenoiseUpdate::Processing { .. } => {
+                let _ = app.emit("denoise-status", update);
+            }
+            DenoiseUpdate::Complete { result } => {
+                let _ = completion_tx.send(Ok(result));
+            }
+            DenoiseUpdate::Failed { error, .. } => {
+                let _ = completion_tx.send(Err(error));
+            }
+        }),
+    )?;
+    tauri::async_runtime::spawn_blocking(move || {
+        completion_rx
+            .recv()
+            .map_err(|_| "Denoising stopped without returning a result.".to_string())?
+    })
+    .await
+    .map_err(|error| format!("Unable to wait for denoising: {error}"))?
+}
+
+#[tauri::command]
+fn export_edits(
+    engine: tauri::State<'_, AppAudioEngine>,
+    edits: Vec<ExportEdit>,
+    destination_dir: String,
+) -> Vec<ExportResult> {
+    engine.inner().export_edits(&edits, &destination_dir)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -108,8 +114,9 @@ pub fn run() {
             start_recording,
             stop_recording,
             import_audio,
+            denoise_availability,
             start_denoise,
-            export_edit
+            export_edits
         ]);
     builder
         .run(tauri::generate_context!())

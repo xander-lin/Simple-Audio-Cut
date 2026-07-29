@@ -11,6 +11,8 @@ import { type EnvelopePoint, type Region } from "../utils/regionUtils";
 
 interface EditorTrackProps {
   name: string;
+  status: string;
+  statusKind: "queued" | "processing" | "complete" | "failed" | "unavailable";
   buffer: AudioBuffer;
   selected: boolean;
   collapsed: boolean;
@@ -31,6 +33,8 @@ interface EditorTrackProps {
 
 export default function EditorTrack({
   name,
+  status,
+  statusKind,
   buffer,
   selected,
   collapsed,
@@ -90,7 +94,7 @@ export default function EditorTrack({
 
   return <article className={selected ? "editor-track is-selected" : "editor-track"} onMouseDownCapture={onSelect} onContextMenu={(event) => event.preventDefault()}>
     <div ref={scaleHandleRef} className="track-scale-handle" title="Scale track" />
-    <div className="track-label"><strong>{name}</strong>{collapsed && <span>Collapsed</span>}</div>
+    <div className="track-label"><strong>{name}</strong><span className={`track-denoise-status is-${statusKind}`}>{status}</span>{collapsed && <span>Collapsed</span>}</div>
     <WaveformScore
       buffer={displayBuffer}
       pixelsPerSecond={pixelsPerSecond}
