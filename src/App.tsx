@@ -10,6 +10,7 @@ import { dbfsToAmplitude, detectSilence } from "./utils/audioAnalysis";
 import { createEditedBuffer, getKeptRegions } from "./utils/exportUtils";
 import { appendUniqueTrack } from "./utils/trackUtils";
 import { applyDenoiseUpdate, canExportTracks, type DenoiseState } from "./utils/denoiseUtils";
+import { exportSignature, getLastExportDirectory, needsExport, rememberLastExportDirectory } from "./utils/exportState";
 import "./App.css";
 
 interface RecordingInfo {
@@ -30,6 +31,7 @@ interface Recording extends RecordingInfo, DenoiseState {
   minimumSilenceDurationMs: number;
   envelopePoints: EnvelopePoint[];
   collapsed: boolean;
+  lastExportSignature: string | null;
 }
 
 interface DenoiseResult {
@@ -57,6 +59,12 @@ interface ExportResult {
 
 interface RecordingContextMenu {
   recordingId: string;
+  x: number;
+  y: number;
+}
+
+interface TrackContextMenu {
+  trackId: string;
   x: number;
   y: number;
 }
@@ -112,11 +120,12 @@ function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [message, setMessage] = useState("Ready to record");
-  const [targetLufs, setTargetLufs] = useState(-15);
+  const [targetLufs, setTargetLufs] = useState(-14);
   const [silenceControlOpen, setSilenceControlOpen] = useState(false);
   const [silenceDurationControlOpen, setSilenceDurationControlOpen] = useState(false);
   const [silencePrecision, setSilencePrecision] = useState<0 | 1 | 2>(0);
   const [recordingContextMenu, setRecordingContextMenu] = useState<RecordingContextMenu | null>(null);
+  const [trackContextMenu, setTrackContextMenu] = useState<TrackContextMenu | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
@@ -126,6 +135,7 @@ function App() {
   const animationFrameRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const recordingContextMenuRef = useRef<HTMLDivElement>(null);
+  const trackContextMenuRef = useRef<HTMLDivElement>(null);
   const selectedTrackIdRef = useRef<string | null>(null);
   const denoiseListenerReadyRef = useRef<ReturnType<typeof createDeferred> | null>(null);
   const currentDenoiseTasksRef = useRef(new Map<string, string>());
@@ -140,6 +150,7 @@ function App() {
   const selectedTrackBuffer = selectedTrack?.buffer;
   const selectedSilenceThresholdDb = selectedTrack?.silenceThresholdDb ?? -36;
   const selectedMinimumSilenceDurationMs = selectedTrack?.minimumSilenceDurationMs ?? 200;
+  const pendingExportCount = editorTracks.filter(needsExport).length;
 
   useEffect(() => {
     audioContextRef.current = new AudioContext();
@@ -173,6 +184,27 @@ function App() {
       window.removeEventListener("blur", dismissOnBlur);
     };
   }, [recordingContextMenu]);
+
+  useEffect(() => {
+    if (!trackContextMenu) return;
+    const dismiss = (event: MouseEvent) => {
+      if (!trackContextMenuRef.current?.contains(event.target as Node)) {
+        setTrackContextMenu(null);
+      }
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setTrackContextMenu(null);
+    };
+    const dismissOnBlur = () => setTrackContextMenu(null);
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", dismissOnEscape);
+    window.addEventListener("blur", dismissOnBlur);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", dismissOnEscape);
+      window.removeEventListener("blur", dismissOnBlur);
+    };
+  }, [trackContextMenu]);
 
   useEffect(() => {
     if (!isRecording) return;
@@ -211,6 +243,7 @@ function App() {
       minimumSilenceDurationMs: 200,
       envelopePoints: [],
       collapsed: false,
+      lastExportSignature: null,
       denoiseStatus: "queued" as const,
       denoiseTaskId: "",
     };
@@ -493,23 +526,25 @@ function App() {
     setMessage("Recording deleted from the library");
   };
 
-  const exportEdits = async () => {
-    if (!editorTracks.length || exportInProgressRef.current) return;
+  const exportTracks = async (tracks: Recording[], singleTrack = false) => {
+    if (!tracks.length || exportInProgressRef.current || !canExportTracks(tracks)) return;
     exportInProgressRef.current = true;
     setIsProcessing(true);
     try {
       const destinationDir = await open({
         directory: true,
         multiple: false,
+        defaultPath: getLastExportDirectory() ?? undefined,
         title: "Choose a folder for exported audio",
       });
       if (!destinationDir || Array.isArray(destinationDir)) {
         setMessage("Export cancelled");
         return;
       }
+      rememberLastExportDirectory(destinationDir);
       const results = await invoke<ExportResult[]>("export_edits", {
         destinationDir,
-        edits: editorTracks.map((track) => ({
+        edits: tracks.map((track) => ({
           recordingId: track.id,
           name: track.name,
           sourcePath: track.path,
@@ -518,11 +553,30 @@ function App() {
         })),
       });
       const failures = results.filter((result) => result.error);
+      const successfulSignatures = new Map(
+        results
+          .filter((result) => !result.error && result.path)
+          .map((result) => {
+            const track = tracks.find((candidate) => candidate.id === result.recordingId);
+            return [result.recordingId, track ? exportSignature(track) : ""] as const;
+          })
+          .filter((entry) => entry[1]),
+      );
+      if (successfulSignatures.size) {
+        const markExported = (track: Recording): Recording => {
+          const signature = successfulSignatures.get(track.id);
+          return signature ? { ...track, lastExportSignature: signature } : track;
+        };
+        setEditorTracks((current) => current.map(markExported));
+        setRecordings((current) => current.map(markExported));
+      }
       if (failures.length) {
-        const failedTrack = editorTracks.find((track) => track.id === failures[0].recordingId);
+        const failedTrack = tracks.find((track) => track.id === failures[0].recordingId);
         setMessage(`Exported ${results.length - failures.length}/${results.length} tracks. ${failedTrack?.name ?? "A track"} failed: ${failures[0].error}`);
       } else {
-        setMessage(`Exported ${results.length} tracks to ${destinationDir}`);
+        setMessage(singleTrack
+          ? `Exported ${tracks[0].name} to ${destinationDir}`
+          : `Exported ${results.length} changed tracks to ${destinationDir}`);
       }
     } catch (error) {
       setMessage(String(error));
@@ -530,6 +584,21 @@ function App() {
       exportInProgressRef.current = false;
       setIsProcessing(false);
     }
+  };
+
+  const exportChangedTracks = () => {
+    const changedTracks = editorTracks.filter(needsExport);
+    if (!changedTracks.length) {
+      setMessage("All editor tracks are already exported.");
+      return;
+    }
+    void exportTracks(changedTracks);
+  };
+
+  const exportSingleTrack = (trackId: string) => {
+    const track = editorTracks.find((candidate) => candidate.id === trackId);
+    setTrackContextMenu(null);
+    if (track) void exportTracks([track], true);
   };
 
   const markSilence = () => {
@@ -647,20 +716,26 @@ function App() {
             <button type="button" className={selectedTrack.collapsed ? "collapse-button is-active" : "collapse-button"} onClick={() => updateSelectedTrack((track) => ({ ...track, collapsed: !track.collapsed }))} disabled={selectedDeletedRegions.length === 0}>{selectedTrack.collapsed ? "Show cuts" : "Collapse cuts"}</button>
             <button type="button" className="return-button" onClick={returnToLibrary} disabled={isProcessing}>Return</button>
             <button type="button" className="remove-track-button" onClick={removeTrack} disabled={isProcessing}>Remove</button>
-            <button type="button" className="export-button" onClick={exportEdits} disabled={isProcessing || !canExportTracks(editorTracks)} title={!canExportTracks(editorTracks) ? "Wait for all tracks to finish denoising" : "Export all editor tracks"}>Export all ({editorTracks.length})</button>
+            <button type="button" className="export-button" onClick={exportChangedTracks} disabled={isProcessing || pendingExportCount === 0 || !canExportTracks(editorTracks)} title={!canExportTracks(editorTracks) ? "Wait for all tracks to finish denoising" : pendingExportCount === 0 ? "All tracks are up to date" : "Export new and changed tracks"}>Export all ({pendingExportCount})</button>
           </div>}
         </header>
         <div className="editor-content">
           {editorTracks.length > 0 ? <div className="editor-tracks">{editorTracks.map((track) => {
             const deletedRegions = combineRegions(track.manualDeletedRegions, track.silenceRegions);
             const isSelected = track.id === selectedTrackId;
-            return <EditorTrack key={track.id} name={track.name} status={denoiseLabel(track)} statusKind={track.denoiseStatus} buffer={track.buffer} selected={isSelected} collapsed={track.collapsed} currentTime={isSelected ? currentTime : 0} pixelsPerSecond={track.pixelsPerSecond} deletedRegions={deletedRegions} envelopePoints={track.envelopePoints} silenceThresholdDb={track.silenceThresholdDb} onSelect={() => {
+            return <EditorTrack key={track.id} name={track.name} status={denoiseLabel(track)} statusKind={track.denoiseStatus} exportPending={needsExport(track)} buffer={track.buffer} selected={isSelected} collapsed={track.collapsed} currentTime={isSelected ? currentTime : 0} pixelsPerSecond={track.pixelsPerSecond} deletedRegions={deletedRegions} envelopePoints={track.envelopePoints} silenceThresholdDb={track.silenceThresholdDb} onSelect={() => {
               if (track.id === selectedTrackId) return;
               stopPlayback(false);
               setSelectedTrackId(track.id);
               setCurrentTime(0);
               playbackOffsetRef.current = 0;
               editedPlaybackOffsetRef.current = 0;
+            }} onScaleContextMenu={(x, y) => {
+              setTrackContextMenu({
+                trackId: track.id,
+                x: Math.max(4, Math.min(x, window.innerWidth - 144)),
+                y: Math.max(4, Math.min(y, window.innerHeight - 44)),
+              });
             }} onScale={(deltaY) => updateTrack(track.id, (current) => ({
               ...current,
               pixelsPerSecond: Math.max(0.25, current.pixelsPerSecond * (deltaY < 0 ? 1.15 : 1 / 1.15)),
@@ -698,6 +773,9 @@ function App() {
             }} />;
           })}</div> : <div className="editor-empty">Drag completed recordings from above into this area.</div>}
         </div>
+        {trackContextMenu && <div ref={trackContextMenuRef} className="track-context-menu" role="menu" style={{ left: trackContextMenu.x, top: trackContextMenu.y }}>
+          <button type="button" role="menuitem" disabled={isProcessing || !canExportTracks(editorTracks.filter((track) => track.id === trackContextMenu.trackId))} onClick={() => exportSingleTrack(trackContextMenu.trackId)}>Export track</button>
+        </div>}
       </section>
     </main>
   );

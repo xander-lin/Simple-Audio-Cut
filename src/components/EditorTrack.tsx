@@ -13,6 +13,7 @@ interface EditorTrackProps {
   name: string;
   status: string;
   statusKind: "queued" | "processing" | "complete" | "failed" | "unavailable";
+  exportPending: boolean;
   buffer: AudioBuffer;
   selected: boolean;
   collapsed: boolean;
@@ -23,6 +24,7 @@ interface EditorTrackProps {
   silenceThresholdDb: number;
   onSelect: () => void;
   onScale: (deltaY: number) => void;
+  onScaleContextMenu: (x: number, y: number) => void;
   onSeek: (time: number) => void;
   onRegionAdd: (start: number, end: number) => void;
   onRegionRemove: (start: number, end: number) => void;
@@ -35,6 +37,7 @@ export default function EditorTrack({
   name,
   status,
   statusKind,
+  exportPending,
   buffer,
   selected,
   collapsed,
@@ -45,6 +48,7 @@ export default function EditorTrack({
   silenceThresholdDb,
   onSelect,
   onScale,
+  onScaleContextMenu,
   onSeek,
   onRegionAdd,
   onRegionRemove,
@@ -52,7 +56,7 @@ export default function EditorTrack({
   onEnvelopePointMove,
   onEnvelopePointRemove,
 }: EditorTrackProps) {
-  const scaleHandleRef = useRef<HTMLDivElement>(null);
+  const scaleHandleRef = useRef<HTMLButtonElement>(null);
   const onScaleRef = useRef(onScale);
   const onSelectRef = useRef(onSelect);
   onScaleRef.current = onScale;
@@ -93,7 +97,12 @@ export default function EditorTrack({
     : time;
 
   return <article className={selected ? "editor-track is-selected" : "editor-track"} onMouseDownCapture={onSelect} onContextMenu={(event) => event.preventDefault()}>
-    <div ref={scaleHandleRef} className="track-scale-handle" title="Scale track" />
+    <button ref={scaleHandleRef} type="button" className={`track-scale-handle ${exportPending ? "is-export-pending" : "is-exported"}`} aria-label={`${name}: ${exportPending ? "included in the next batch export" : "already exported"}`} title={exportPending ? "Included in next Export all" : "Already exported; right-click to export again"} onContextMenu={(event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onSelect();
+      onScaleContextMenu(event.clientX, event.clientY);
+    }} />
     <div className="track-label"><strong>{name}</strong><span className={`track-denoise-status is-${statusKind}`}>{status}</span>{collapsed && <span>Collapsed</span>}</div>
     <WaveformScore
       buffer={displayBuffer}

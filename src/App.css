@@ -51,6 +51,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .recording-context-menu { position: fixed; z-index: 2000; width: 132px; padding: 4px; border: 1px solid #56635f; border-radius: 5px; background: #202624; box-shadow: 0 8px 20px rgba(0, 0, 0, .42); }
 .recording-context-menu button { width: 100%; height: 32px; border: 0; padding: 0 8px; background: transparent; color: #efb7b1; line-height: 32px; text-align: left; }
 .recording-context-menu button:hover { background: #4a2927; border: 0; }
+.track-context-menu { position: fixed; z-index: 2000; width: 140px; padding: 4px; border: 1px solid #56635f; border-radius: 5px; background: #202624; box-shadow: 0 8px 20px rgba(0, 0, 0, .42); }
+.track-context-menu button { width: 100%; height: 32px; border: 0; padding: 0 8px; background: transparent; color: #dce7e2; line-height: 32px; text-align: left; }
+.track-context-menu button:hover:not(:disabled) { border: 0; background: #2e3935; }
 .editor-empty { color: #82918b; font-size: 13px; padding: 12px 0; }
 .editor-header { z-index: 20; justify-content: flex-start; background: #121615; }
 .editor-heading { min-width: 120px; max-width: 240px; overflow: hidden; }
@@ -63,10 +66,11 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .editor-tracks { display: grid; gap: 8px; }
 .editor-track { position: relative; padding-left: 14px; opacity: .78; }
 .editor-track.is-selected { opacity: 1; }
-.track-scale-handle { position: absolute; z-index: 10; top: 0; bottom: 4px; left: 0; width: 8px; border-radius: 2px; background: #43514c; cursor: ns-resize; transition: background .12s ease; }
-.track-scale-handle:hover { background: #8ccda5; }
-.editor-track.is-selected .track-scale-handle { background: #79c195; }
-.editor-track.is-selected .track-scale-handle:hover { background: #9cddb5; }
+.track-scale-handle { position: absolute; z-index: 10; top: 0; bottom: 4px; left: 0; width: 8px; height: auto; min-width: 8px; border: 0; border-radius: 2px; padding: 0; background: #43514c; cursor: ns-resize; transition: background .12s ease; }
+.track-scale-handle.is-export-pending { background: #d7bd58; }
+.track-scale-handle.is-export-pending:hover, .editor-track.is-selected .track-scale-handle.is-export-pending { background: #efd574; }
+.track-scale-handle.is-exported { background: #58a979; }
+.track-scale-handle.is-exported:hover, .editor-track.is-selected .track-scale-handle.is-exported { background: #79c195; }
 .track-label { position: absolute; z-index: 8; top: 5px; left: 20px; display: flex; max-width: calc(100% - 34px); align-items: center; gap: 7px; padding: 2px 5px; border-radius: 3px; background: rgba(7, 10, 9, .7); color: #cbd5d1; font-size: 11px; line-height: 14px; pointer-events: none; }
 .track-label strong { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .track-label span { flex-shrink: 0; color: #93a29c; font-size: 10px; }
