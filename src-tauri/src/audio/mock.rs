@@ -53,6 +53,7 @@ impl AudioEngine for MockAudioEngine {
         task_id: String,
         source: String,
         _sample_rate: u32,
+        target_lufs: f64,
         completion: DenoiseCompletion,
     ) -> Result<(), String> {
         completion(DenoiseUpdate::Processing {
@@ -64,7 +65,7 @@ impl AudioEngine for MockAudioEngine {
                 recording_id,
                 task_id,
                 path: source,
-                integrated_lufs: None,
+                integrated_lufs: Some(target_lufs),
             },
         });
         Ok(())

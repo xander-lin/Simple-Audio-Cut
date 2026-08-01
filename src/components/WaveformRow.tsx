@@ -23,6 +23,9 @@ interface WaveformRowProps {
   showSilenceThreshold: boolean;
   onRegionAdd: (start: number, end: number) => void;
   onRegionRemove: (start: number, end: number) => void;
+  onRegionDragStart: (time: number) => void;
+  onRegionDragMove: (time: number) => void;
+  onRegionDragEnd: (time: number) => void;
   onEnvelopePointAdd: (point: EnvelopePoint) => void;
   onEnvelopePointMove: (id: string, time: number, gain: number) => void;
   onEnvelopePointRemove: (id: string) => void;
@@ -174,13 +177,12 @@ const WaveformCanvas = memo(({ buffer, startTime, endTime, width, height, leadin
 });
 
 type DragState =
-  | { kind: "region"; startX: number; currentX: number }
   | { kind: "point"; point: EnvelopePoint; currentX: number; currentY: number }
   | null;
 
 const WaveformRow = ({
   buffer, startTime, endTime, width, height, leadingPadding, trailingPadding, currentTime,
-  onSeek, regions, envelopePoints, rmsFrames, silenceThresholdDb, showSilenceThreshold, onRegionAdd, onRegionRemove, onEnvelopePointAdd, onEnvelopePointMove, onEnvelopePointRemove,
+  onSeek, regions, envelopePoints, rmsFrames, silenceThresholdDb, showSilenceThreshold, onRegionDragStart, onRegionDragMove, onRegionDragEnd, onEnvelopePointAdd, onEnvelopePointMove, onEnvelopePointRemove,
 }: WaveformRowProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<DragState>(null);
@@ -191,7 +193,6 @@ const WaveformRow = ({
   const gainAtY = (y: number) => Math.max(0, Math.min(2, 2 * (1 - y / height)));
   const yAtGain = (gain: number) => height * (1 - gain / 2);
   const visiblePoints = envelopePoints.filter((point) => point.time >= startTime && point.time <= endTime);
-  const previewDirection = drag?.kind === "region" && drag.currentX - drag.startX < -6 ? "restore" : "delete";
 
   const coordinates = (event: React.MouseEvent<HTMLDivElement>) => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -214,7 +215,7 @@ const WaveformRow = ({
         onEnvelopePointRemove(hit.id);
         return;
       }
-      setDrag({ kind: "region", startX: x, currentX: x });
+      onRegionDragStart(timeAtX(x));
       return;
     }
     if (event.button === 1) {
@@ -227,34 +228,26 @@ const WaveformRow = ({
   const handleMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
     if (!drag) return;
     const { x, y } = coordinates(event);
-    if (drag.kind === "region") setDrag({ ...drag, currentX: x });
-    else {
-      setDrag({ ...drag, currentX: x, currentY: y });
-      onEnvelopePointMove(drag.point.id, timeAtX(x), gainAtY(y));
-    }
+    setDrag({ ...drag, currentX: x, currentY: y });
+    onEnvelopePointMove(drag.point.id, timeAtX(x), gainAtY(y));
   };
 
-  const commitRegion = (x: number) => {
-    if (drag?.kind !== "region") return;
-    const delta = x - drag.startX;
-    if (Math.abs(delta) > 6) {
-      const start = timeAtX(Math.min(drag.startX, x));
-      const end = timeAtX(Math.max(drag.startX, x));
-      if (delta > 0) onRegionAdd(start, end);
-      else onRegionRemove(start, end);
-    }
+  const finishDrag = () => {
+    if (!drag) return;
     setDrag(null);
   };
 
-  const finishDrag = (event?: React.MouseEvent<HTMLDivElement>) => {
-    if (!drag) return;
-    if (drag.kind === "region") commitRegion(event ? coordinates(event).x : drag.currentX);
-    else setDrag(null);
+  const moveRegionDrag = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.buttons & 2) onRegionDragMove(timeAtX(coordinates(event).x));
+  };
+
+  const finishRegionDrag = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 2) return;
+    event.stopPropagation();
+    onRegionDragEnd(timeAtX(coordinates(event).x));
   };
 
   const playhead = currentTime >= startTime && currentTime <= endTime ? xAtTime(currentTime) : null;
-  const previewLeft = drag?.kind === "region" ? Math.min(drag.startX, drag.currentX) : 0;
-  const previewWidth = drag?.kind === "region" ? Math.abs(drag.currentX - drag.startX) : 0;
   const envelopeSampleCount = Math.max(16, Math.ceil(timelineWidth / 12)) + 1;
   const envelopePath = Array.from({ length: envelopeSampleCount }, (_, index) => {
     const time = startTime + duration * index / (envelopeSampleCount - 1);
@@ -262,7 +255,7 @@ const WaveformRow = ({
     return `${index === 0 ? "M" : "L"} ${xAtTime(time)} ${yAtGain(gain)}`;
   }).join(" ");
 
-  return <div ref={containerRef} className="waveform-row-container" role="application" onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={finishDrag} onMouseLeave={() => finishDrag()} onContextMenu={(event) => event.preventDefault()} style={{ width, height }}>
+  return <div ref={containerRef} className="waveform-row-container" role="application" onMouseDown={handleMouseDown} onMouseMove={(event) => { handleMouseMove(event); moveRegionDrag(event); }} onMouseUp={(event) => { finishDrag(); finishRegionDrag(event); }} onMouseLeave={() => finishDrag()} onContextMenu={(event) => event.preventDefault()} style={{ width, height }}>
     <div className="waveform-row-clip">
       <span className="row-time-label">{formatTimeCompact(endTime)}</span>
       <WaveformCanvas buffer={buffer} startTime={startTime} endTime={endTime} width={width} height={height} leadingPadding={leadingPadding} trailingPadding={trailingPadding} rmsFrames={rmsFrames} silenceThresholdDb={silenceThresholdDb} showSilenceThreshold={showSilenceThreshold} />
@@ -272,7 +265,6 @@ const WaveformRow = ({
         return start < end ? <span key={`${region.start}-${region.end}`} className="deleted-region" style={{ left: xAtTime(start), width: xAtTime(end) - xAtTime(start) }} /> : null;
       })}
       {envelopePoints.length > 0 && <svg className="fade-envelope" role="img" aria-label="Volume envelope" viewBox={`0 0 ${width} ${height}`}><path d={envelopePath} />{visiblePoints.map((point) => <circle key={point.id} cx={xAtTime(point.time)} cy={yAtGain(point.gain)} r="5" />)}</svg>}
-      {drag?.kind === "region" && <span className={`region-preview ${previewDirection}`} style={{ left: previewLeft, width: previewWidth }} />}
       {playhead !== null && <span className="playhead" style={{ transform: `translateX(${playhead}px)` }} />}
     </div>
   </div>;

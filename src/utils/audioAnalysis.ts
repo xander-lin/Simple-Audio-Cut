@@ -143,9 +143,11 @@ function detectSilenceFromAnalysis(
 
   const finishSilence = (end: number) => {
     if (silenceStart === null) return;
-    if (end - silenceStart >= minDuration) {
-      const start = silenceStart + padding;
-      const paddedEnd = end - padding;
+    const silenceDuration = end - silenceStart;
+    if (silenceDuration > minDuration && minDuration > 0) {
+      const center = (silenceStart + end) / 2;
+      const start = center - minDuration / 2 + padding;
+      const paddedEnd = center + minDuration / 2 - padding;
       if (paddedEnd > start) regions.push({ start, end: paddedEnd });
     }
     silenceStart = null;

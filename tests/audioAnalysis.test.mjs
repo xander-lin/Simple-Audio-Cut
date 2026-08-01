@@ -29,8 +29,8 @@ test("uses the loudest channel when classifying stereo audio", () => {
   const regions = detect([left, right]);
 
   assert.equal(regions.length, 2);
-  assertRegion(regions[0], 0, 0.49);
-  assertRegion(regions[1], 1.5, 3);
+  assertRegion(regions[0], 0.145, 0.345);
+  assertRegion(regions[1], 2.15, 2.35);
 });
 
 test("protects a quiet gap shorter than the default 200 ms", () => {
@@ -49,7 +49,9 @@ test("uses the actual sample count in the final analysis window", () => {
 test("reclassifies regions when the threshold moves in either direction", () => {
   const audio = new Float32Array(1_000).fill(0.02);
 
-  assert.equal(detect([audio], { threshold: dbfsToAmplitude(-30) }).length, 1);
+  const regions = detect([audio], { threshold: dbfsToAmplitude(-30) });
+  assert.equal(regions.length, 1);
+  assertRegion(regions[0], 0.4, 0.6);
   assert.equal(detect([audio], { threshold: dbfsToAmplitude(-40) }).length, 0);
 });
 
@@ -74,7 +76,7 @@ test("detects a quiet gap without duration gating", () => {
   const regions = detect([audio]);
 
   assert.equal(regions.length, 1);
-  assertRegion(regions[0], 0.4, 0.615);
+  assertRegion(regions[0], 0.4075, 0.6075);
 });
 
 test("detects a quiet gap shorter than the former minimum duration", () => {
@@ -84,17 +86,16 @@ test("detects a quiet gap shorter than the former minimum duration", () => {
   const regions = detect([audio], { minDuration: 0.15 });
 
   assert.equal(regions.length, 1);
-  assertRegion(regions[0], 0.4, 0.59);
+  assertRegion(regions[0], 0.42, 0.57);
 });
 
-test("allows frame-precision cuts when minimum duration is zero", () => {
+test("does not create zero-duration silence cuts", () => {
   const audio = new Float32Array(1_000).fill(0.2);
   audio.fill(0, 400, 410);
 
   const regions = detect([audio], { minDuration: 0 });
 
-  assert.equal(regions.length, 1);
-  assertRegion(regions[0], 0.4, 0.41);
+  assert.deepEqual(regions, []);
 });
 
 test("does not let a short loud section hide neighboring long quiet sections", () => {
@@ -104,6 +105,6 @@ test("does not let a short loud section hide neighboring long quiet sections", (
   const regions = detect([audio]);
 
   assert.equal(regions.length, 2);
-  assertRegion(regions[0], 0, 0.495);
-  assertRegion(regions[1], 0.505, 1);
+  assertRegion(regions[0], 0.1475, 0.3475);
+  assertRegion(regions[1], 0.6525, 0.8525);
 });

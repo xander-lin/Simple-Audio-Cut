@@ -241,7 +241,7 @@ impl NativeAudioEngine {
         Ok(sample_rate)
     }
 
-    fn run_ffmpeg(&self, args: &[String]) -> Result<String, String> {
+    fn run_ffmpeg(args: &[String]) -> Result<String, String> {
         let output = Command::new("ffmpeg")
             .args(args)
             .output()
@@ -251,6 +251,48 @@ impl NativeAudioEngine {
         } else {
             Err(String::from_utf8_lossy(&output.stderr).into_owned())
         }
+    }
+
+    fn normalize_file_to_lufs(
+        source: &str,
+        target_lufs: f64,
+        output_path: &Path,
+        sample_rate: u32,
+    ) -> Result<f64, String> {
+        Self::validate_target_lufs(target_lufs)?;
+        let measurement = Self::loudnorm_measurement(source, target_lufs)?;
+        let stat = |name: &str| {
+            let value = measurement[name]
+                .as_str()
+                .ok_or_else(|| format!("FFmpeg omitted {name} from loudness statistics."))?;
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|_| format!("FFmpeg returned non-finite {name} loudness statistics."))?;
+            if parsed.is_finite() {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "FFmpeg returned non-finite {name} loudness statistics."
+                ))
+            }
+        };
+        let filter = format!(
+            "loudnorm=I={target_lufs}:TP=-1.5:LRA=11:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=false:print_format=summary",
+            stat("input_i")?, stat("input_lra")?, stat("input_tp")?, stat("input_thresh")?, stat("target_offset")?
+        );
+        Self::run_ffmpeg(&[
+            "-y".into(),
+            "-i".into(),
+            source.into(),
+            "-af".into(),
+            filter,
+            "-ar".into(),
+            sample_rate.to_string(),
+            "-c:a".into(),
+            "pcm_s24le".into(),
+            output_path.display().to_string(),
+        ])?;
+        Self::measure_lufs(&output_path.display().to_string())
     }
 
     fn run_command(
@@ -297,8 +339,8 @@ impl NativeAudioEngine {
         }
     }
 
-    fn measure_lufs(&self, source: &str) -> Result<f64, String> {
-        let report = self.run_ffmpeg(&[
+    fn measure_lufs(source: &str) -> Result<f64, String> {
+        let report = Self::run_ffmpeg(&[
             "-hide_banner".into(),
             "-i".into(),
             source.into(),
@@ -321,13 +363,9 @@ impl NativeAudioEngine {
         value.ok_or_else(|| "FFmpeg could not measure integrated loudness.".into())
     }
 
-    fn loudnorm_measurement(
-        &self,
-        source: &str,
-        target_lufs: f64,
-    ) -> Result<serde_json::Value, String> {
+    fn loudnorm_measurement(source: &str, target_lufs: f64) -> Result<serde_json::Value, String> {
         let filter = format!("loudnorm=I={target_lufs}:TP=-1.5:LRA=11:print_format=json");
-        let report = self.run_ffmpeg(&[
+        let report = Self::run_ffmpeg(&[
             "-hide_banner".into(),
             "-i".into(),
             source.into(),
@@ -465,29 +503,7 @@ impl AudioEngine for NativeAudioEngine {
         Self::validate_target_lufs(target_lufs)?;
         let output_path = self.unique_path(".wav");
         let sample_rate = self.media_sample_rate(source)?;
-        let measurement = self.loudnorm_measurement(source, target_lufs)?;
-        let stat = |name: &str| {
-            measurement[name]
-                .as_str()
-                .ok_or_else(|| format!("FFmpeg omitted {name} from loudness statistics."))
-        };
-        let filter = format!(
-            "loudnorm=I={target_lufs}:TP=-1.5:LRA=11:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=false:print_format=summary",
-            stat("input_i")?, stat("input_lra")?, stat("input_tp")?, stat("input_thresh")?, stat("target_offset")?
-        );
-        self.run_ffmpeg(&[
-            "-y".into(),
-            "-i".into(),
-            source.into(),
-            "-af".into(),
-            filter,
-            "-ar".into(),
-            sample_rate.to_string(),
-            "-c:a".into(),
-            "pcm_s24le".into(),
-            output_path.display().to_string(),
-        ])?;
-        let lufs = self.measure_lufs(&output_path.display().to_string()).ok();
+        let lufs = Self::normalize_file_to_lufs(source, target_lufs, &output_path, sample_rate)?;
         let name = output_path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -502,7 +518,7 @@ impl AudioEngine for NativeAudioEngine {
             name,
             path: output_path.display().to_string(),
             duration_seconds: 0.0,
-            integrated_lufs: lufs,
+            integrated_lufs: Some(lufs),
         })
     }
 
@@ -523,8 +539,10 @@ impl AudioEngine for NativeAudioEngine {
         task_id: String,
         source: String,
         sample_rate: u32,
+        target_lufs: f64,
         completion: DenoiseCompletion,
     ) -> Result<(), String> {
+        Self::validate_target_lufs(target_lufs)?;
         let output_dir = self.output_dir.clone();
         if sample_rate == 0 {
             return Err("The audio stream has no sample rate.".into());
@@ -541,9 +559,11 @@ impl AudioEngine for NativeAudioEngine {
                 let input = output_dir.join(format!("denoise-{task_id}-input.wav"));
                 let model_output = output_dir.join(format!("denoise-{task_id}-model.wav"));
                 let processed = output_dir.join(format!("denoise-{task_id}-processed.wav"));
+                let normalized = output_dir.join(format!("denoise-{task_id}-normalized.wav"));
                 let _ = fs::remove_file(&input);
                 let _ = fs::remove_file(&model_output);
                 let _ = fs::remove_file(&processed);
+                let _ = fs::remove_file(&normalized);
                 let outcome = (|| {
                     Self::run_command(
                         Path::new("ffmpeg"),
@@ -597,29 +617,31 @@ impl AudioEngine for NativeAudioEngine {
                 let _ = fs::remove_file(model_output);
                 if outcome.is_err() {
                     let _ = fs::remove_file(&processed);
+                    let _ = fs::remove_file(&normalized);
                 }
                 outcome?;
-                let integrated_lufs = Self::run_command(
-                    Path::new("ffmpeg"),
-                    &[
-                        "-hide_banner".into(),
-                        "-i".into(),
-                        processed.display().to_string(),
-                        "-filter_complex".into(),
-                        "ebur128=peak=true".into(),
-                        "-f".into(),
-                        "null".into(),
-                        "-".into(),
-                    ],
-                    None,
-                    "FFmpeg loudness measurement",
-                )
-                .ok()
-                .and_then(|report| Self::parse_lufs_report(&report).ok());
+                let (final_path, integrated_lufs) = match Self::normalize_file_to_lufs(
+                    &processed.display().to_string(),
+                    target_lufs,
+                    &normalized,
+                    sample_rate,
+                ) {
+                    Ok(integrated_lufs) => {
+                        let _ = fs::remove_file(processed);
+                        (normalized, Some(integrated_lufs))
+                    }
+                    Err(error) if error.contains("non-finite") => {
+                        let integrated_lufs =
+                            Self::measure_lufs(&processed.display().to_string()).ok();
+                        let _ = fs::remove_file(normalized);
+                        (processed, integrated_lufs)
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(DenoiseResult {
                     recording_id: recording_id.clone(),
                     task_id: task_id.clone(),
-                    path: processed.display().to_string(),
+                    path: final_path.display().to_string(),
                     integrated_lufs,
                 })
             };
@@ -735,7 +757,7 @@ impl AudioEngine for NativeAudioEngine {
             .ok_or("The selected export location has no parent directory.")?;
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create the export directory: {error}"))?;
-        self.run_ffmpeg(&[
+        Self::run_ffmpeg(&[
             "-y".into(),
             "-i".into(),
             source.into(),
@@ -882,6 +904,47 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_files_to_the_target_lufs() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("simple-audio-cut-normalize-{stamp}"));
+        let source = root.join("source.wav");
+        let output = root.join("output.wav");
+        fs::create_dir_all(&root).expect("create test directory");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).expect("create source WAV");
+        for sample in 0..240_000 {
+            let phase = sample as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+            writer
+                .write_sample::<i16>((phase.sin() * 1_200.0) as i16)
+                .expect("write source sample");
+        }
+        writer.finalize().expect("finalize source WAV");
+
+        let lufs = NativeAudioEngine::normalize_file_to_lufs(
+            &source.display().to_string(),
+            -14.0,
+            &output,
+            48_000,
+        )
+        .expect("normalize file");
+
+        assert!(output.is_file());
+        assert!(
+            (-15.5..=-12.5).contains(&lufs),
+            "expected final LUFS near -14, got {lufs}"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
     fn rejects_an_incomplete_clearvoice_model_directory() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1005,6 +1068,7 @@ mod tests {
                 "real-model".into(),
                 source.display().to_string(),
                 48_000,
+                -14.0,
                 Box::new(move |update| tx.send(update).expect("send denoise update")),
             )
             .expect("start denoise");

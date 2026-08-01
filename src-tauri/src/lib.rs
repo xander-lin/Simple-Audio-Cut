@@ -51,6 +51,7 @@ async fn start_denoise(
     task_id: String,
     source_path: String,
     sample_rate: u32,
+    target_lufs: f64,
 ) -> Result<DenoiseResult, String> {
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     engine.inner().start_denoise(
@@ -58,6 +59,7 @@ async fn start_denoise(
         task_id,
         source_path,
         sample_rate,
+        target_lufs,
         Box::new(move |update: DenoiseUpdate| match update {
             update @ DenoiseUpdate::Processing { .. } => {
                 let _ = app.emit("denoise-status", update);

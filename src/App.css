@@ -98,7 +98,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .silence-duration-wheel > span { position: relative; z-index: 1; display: grid; width: 82px; place-items: center; border-right: 1px solid #4d5a56; border-left: 1px solid #4d5a56; background: #202624; }
 .silence-duration-wheel > span:first-child { border-top: 1px solid #4d5a56; border-radius: 5px 5px 0 0; }
 .silence-duration-wheel > span:last-child { border-bottom: 1px solid #4d5a56; border-radius: 0 0 5px 5px; }
-.waveform-score-container { display: grid; justify-items: start; margin: 0; padding: 0 0 4px; gap: 8px; }
+.waveform-score-container { position: relative; display: grid; justify-items: start; margin: 0; padding: 0 0 4px; gap: 8px; }
 .waveform-row-container { position: relative; background: #1a211f; border: 1px solid #384540; border-radius: 4px; box-shadow: none; overflow: visible; }
 .waveform-row-clip { position: absolute; inset: 0; overflow: hidden; border-radius: inherit; }
 .waveform-canvas { position: absolute; inset: 0; display: block; pointer-events: none; }
@@ -107,6 +107,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .region-preview { position: absolute; top: 0; bottom: 0; z-index: 4; pointer-events: none; border: 1px dashed rgba(255, 255, 255, .36); }
 .region-preview.delete { background: rgba(18, 18, 18, .62); }
 .region-preview.restore { background: rgba(102, 198, 142, .22); border-color: rgba(139, 234, 175, .65); }
+.score-region-preview-layer { position: absolute; inset: 0; z-index: 6; pointer-events: none; }
+.score-region-preview-layer .region-preview { position: absolute; height: 96px; }
 .fade-envelope { position: absolute; inset: 0; z-index: 3; overflow: visible; pointer-events: none; }
 .fade-envelope path { fill: none; stroke: #e7c968; stroke-width: 2; }
 .fade-envelope circle { fill: #111315; stroke: #f0d979; stroke-width: 2; }

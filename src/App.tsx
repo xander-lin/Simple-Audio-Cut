@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import EditorTrack from "./components/EditorTrack";
@@ -11,6 +11,7 @@ import { createEditedBuffer, getKeptRegions } from "./utils/exportUtils";
 import { appendUniqueTrack } from "./utils/trackUtils";
 import { applyDenoiseUpdate, canExportTracks, type DenoiseState } from "./utils/denoiseUtils";
 import { exportSignature, getLastExportDirectory, needsExport, rememberLastExportDirectory } from "./utils/exportState";
+import { importSummary, selectedPaths } from "./utils/importUtils";
 import "./App.css";
 
 interface RecordingInfo {
@@ -141,6 +142,8 @@ function App() {
   const currentDenoiseTasksRef = useRef(new Map<string, string>());
   const activeDenoiseRecordingsRef = useRef(new Set<string>());
   const exportInProgressRef = useRef(false);
+  const closePromptOpenRef = useRef(false);
+  const hasUnsavedWorkRef = useRef(false);
   if (!denoiseListenerReadyRef.current) denoiseListenerReadyRef.current = createDeferred();
   selectedTrackIdRef.current = selectedTrackId;
   const selectedTrack = editorTracks.find((track) => track.id === selectedTrackId) ?? null;
@@ -151,6 +154,8 @@ function App() {
   const selectedSilenceThresholdDb = selectedTrack?.silenceThresholdDb ?? -36;
   const selectedMinimumSilenceDurationMs = selectedTrack?.minimumSilenceDurationMs ?? 200;
   const pendingExportCount = editorTracks.filter(needsExport).length;
+  const hasUnsavedWork = isRecording || isProcessing || recordings.length > 0 || pendingExportCount > 0;
+  hasUnsavedWorkRef.current = hasUnsavedWork;
 
   useEffect(() => {
     audioContextRef.current = new AudioContext();
@@ -161,6 +166,33 @@ function App() {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       sourceNodeRef.current?.stop();
       void audioContextRef.current?.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow().onCloseRequested(async (event) => {
+      if (!hasUnsavedWorkRef.current) return;
+      event.preventDefault();
+      if (closePromptOpenRef.current) return;
+      closePromptOpenRef.current = true;
+      try {
+        const confirmed = await confirmDialog("There are recordings or export changes that have not been saved. Quit anyway?", {
+          title: "Quit Simple Audio Cut?",
+          kind: "warning",
+        });
+        if (confirmed) await getCurrentWindow().destroy();
+      } finally {
+        closePromptOpenRef.current = false;
+      }
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, []);
 
@@ -317,6 +349,7 @@ function App() {
         taskId,
         sourcePath: recording.path,
         sampleRate: recording.buffer.sampleRate,
+        targetLufs,
       });
       await completeDenoise(result);
     } catch (error) {
@@ -361,17 +394,31 @@ function App() {
   };
 
   const importAudio = async () => {
-    const sourcePath = await open({
-      multiple: false,
-      filters: [{ name: "Audio", extensions: ["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "aiff"] }],
+    const selection = await open({
+      multiple: true,
+      filters: [{ name: "Audio or video", extensions: ["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "aiff", "mp4", "mov", "mkv", "webm", "m4v", "avi"] }],
     });
-    if (!sourcePath || Array.isArray(sourcePath)) return;
+    const paths = selectedPaths(selection);
+    if (!paths.length) return;
     setIsProcessing(true);
-    setMessage(`Importing and normalizing audio to ${targetLufs} LUFS`);
+    setMessage(paths.length === 1
+      ? `Importing and normalizing audio to ${targetLufs} LUFS`
+      : `Importing and normalizing ${paths.length} files to ${targetLufs} LUFS`);
     try {
-      const recording = await loadRecording(await invoke<RecordingInfo>("import_audio", { sourcePath, targetLufs }));
-      void queueDenoise(recording);
-      setMessage("Imported audio is ready. Drag it into the editor.");
+      let imported = 0;
+      let failed = 0;
+      let firstFailure: { path: string; error: string } | undefined;
+      for (const sourcePath of paths) {
+        try {
+          const recording = await loadRecording(await invoke<RecordingInfo>("import_audio", { sourcePath, targetLufs }));
+          imported += 1;
+          void queueDenoise(recording);
+        } catch (error) {
+          failed += 1;
+          firstFailure ??= { path: sourcePath, error: String(error) };
+        }
+      }
+      setMessage(importSummary(imported, failed, firstFailure));
     } catch (error) {
       setMessage(String(error));
     } finally {
@@ -716,7 +763,7 @@ function App() {
             <button type="button" className={selectedTrack.collapsed ? "collapse-button is-active" : "collapse-button"} onClick={() => updateSelectedTrack((track) => ({ ...track, collapsed: !track.collapsed }))} disabled={selectedDeletedRegions.length === 0}>{selectedTrack.collapsed ? "Show cuts" : "Collapse cuts"}</button>
             <button type="button" className="return-button" onClick={returnToLibrary} disabled={isProcessing}>Return</button>
             <button type="button" className="remove-track-button" onClick={removeTrack} disabled={isProcessing}>Remove</button>
-            <button type="button" className="export-button" onClick={exportChangedTracks} disabled={isProcessing || pendingExportCount === 0 || !canExportTracks(editorTracks)} title={!canExportTracks(editorTracks) ? "Wait for all tracks to finish denoising" : pendingExportCount === 0 ? "All tracks are up to date" : "Export new and changed tracks"}>Export all ({pendingExportCount})</button>
+            <button type="button" className="export-button" onClick={exportChangedTracks} disabled={isProcessing || pendingExportCount === 0 || !canExportTracks(editorTracks)} title={pendingExportCount === 0 ? "All tracks are up to date" : "Export new and changed tracks"}>Export all ({pendingExportCount})</button>
           </div>}
         </header>
         <div className="editor-content">

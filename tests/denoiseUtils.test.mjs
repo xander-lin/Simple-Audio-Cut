@@ -24,10 +24,11 @@ test("ignores a late result from an obsolete denoise task", () => {
   assert.strictEqual(updated, recording);
 });
 
-test("allows export after denoise failure but not while work is active", () => {
+test("allows export once a normalized source exists regardless of denoise state", () => {
   assert.equal(canExportTracks([{ ...recording, denoiseStatus: "failed" }]), true);
   assert.equal(canExportTracks([{ ...recording, denoiseStatus: "unavailable" }]), true);
   assert.equal(canExportTracks([{ ...recording, denoiseStatus: "complete" }]), true);
-  assert.equal(canExportTracks([{ ...recording, denoiseStatus: "processing" }]), false);
-  assert.equal(canExportTracks([{ ...recording, denoiseStatus: "queued" }]), false);
+  assert.equal(canExportTracks([{ ...recording, denoiseStatus: "processing" }]), true);
+  assert.equal(canExportTracks([{ ...recording, denoiseStatus: "queued" }]), true);
+  assert.equal(canExportTracks([]), false);
 });

@@ -98,6 +98,7 @@ pub trait AudioEngine: Send + Sync {
         task_id: String,
         source: String,
         sample_rate: u32,
+        target_lufs: f64,
         completion: DenoiseCompletion,
     ) -> Result<(), String>;
     fn export_edit(
