@@ -142,7 +142,6 @@ function App() {
   const currentDenoiseTasksRef = useRef(new Map<string, string>());
   const activeDenoiseRecordingsRef = useRef(new Set<string>());
   const exportInProgressRef = useRef(false);
-  const allowCloseRef = useRef(false);
   const closePromptOpenRef = useRef(false);
   const hasUnsavedWorkRef = useRef(false);
   if (!denoiseListenerReadyRef.current) denoiseListenerReadyRef.current = createDeferred();
@@ -174,20 +173,16 @@ function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onCloseRequested(async (event) => {
-      if (allowCloseRef.current) return;
       if (!hasUnsavedWorkRef.current) return;
       event.preventDefault();
       if (closePromptOpenRef.current) return;
       closePromptOpenRef.current = true;
       try {
-        const confirmed = await confirmDialog("There are recordings or export changes that have not been saved. Quit anyway?", {
+        const confirmed = await confirmDialog("There are recording or export changes that have not been saved. Quit anyway?", {
           title: "Quit Simple Audio Cut?",
           kind: "warning",
         });
-        if (confirmed) {
-          allowCloseRef.current = true;
-          await getCurrentWindow().close();
-        }
+        if (confirmed) await getCurrentWindow().destroy();
       } finally {
         closePromptOpenRef.current = false;
       }
