@@ -168,7 +168,7 @@ cargo check --manifest-path src-tauri/Cargo.toml --no-default-features
 ~/.local/share/io.github.xander_lin.simple_audio_cut/
 ```
 
-编辑操作是非破坏性的，但当前编辑会话尚未持久化；存在素材、正在处理或有未导出改动时，关闭应用会弹出二次确认。关闭前仍建议完成需要的导出。
+编辑操作是非破坏性的，但当前编辑会话尚未持久化；正在录音、正在处理或有未导出改动时，关闭应用会弹出二次确认。关闭前仍建议完成需要的导出。
 
 ## 许可证与来源
 
