@@ -18,6 +18,7 @@ packaging/arch/src/
 packaging/arch/*.pkg.tar.*
 packaging/arch/*.tar.gz
 packaging/arch/simple-audio-cut/
+.cortexkit/
 
 # Editor directories and files
 .vscode/*

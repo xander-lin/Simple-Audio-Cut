@@ -1,4 +1,4 @@
-import { envelopeGainAtTime, type EnvelopePoint, type Region } from "./regionUtils";
+import { envelopeGainAtTime, type EnvelopePoint, type Region } from "./regionUtils.ts";
 export function getKeptRegions(deletedRegions: Region[], totalDuration: number): Region[] {
   const sorted = [...deletedRegions].sort((a, b) => a.start - b.start);
   const kept: Region[] = [];

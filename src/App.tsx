@@ -7,11 +7,13 @@ import EditorTrack from "./components/EditorTrack";
 import { combineRegions, mergeRegions, subtractRegion, type EnvelopePoint, type Region } from "./utils/regionUtils";
 import { formatTimeStandard } from "./utils/timeUtils";
 import { dbfsToAmplitude, detectSilence } from "./utils/audioAnalysis";
-import { createEditedBuffer, getKeptRegions } from "./utils/exportUtils";
+import { createEditedBuffer, editedOffsetAtOriginalTime, getKeptRegions, originalTimeAtEditedOffset } from "./utils/exportUtils";
 import { appendUniqueTrack } from "./utils/trackUtils";
 import { applyDenoiseUpdate, canExportTracks, type DenoiseState } from "./utils/denoiseUtils";
 import { exportSignature, getLastExportDirectory, needsExport, rememberLastExportDirectory } from "./utils/exportState";
 import { importSummary, selectedPaths } from "./utils/importUtils";
+import { AudioContextManager, BrowserAudioContextFactory } from "./audio/audioContextManager";
+import { savedPlaybackPosition } from "./utils/playbackUtils";
 import "./App.css";
 
 interface RecordingInfo {
@@ -80,30 +82,6 @@ function createDeferred() {
   return { promise, resolve, reject };
 }
 
-function keptDuration(regions: Region[]) {
-  return regions.reduce((duration, region) => duration + region.end - region.start, 0);
-}
-
-function editedOffsetAtOriginalTime(time: number, regions: Region[]) {
-  let editedOffset = 0;
-  for (const region of regions) {
-    if (time <= region.start) return editedOffset;
-    if (time < region.end) return editedOffset + time - region.start;
-    editedOffset += region.end - region.start;
-  }
-  return editedOffset;
-}
-
-function originalTimeAtEditedOffset(offset: number, regions: Region[]) {
-  let remaining = offset;
-  for (const region of regions) {
-    const duration = region.end - region.start;
-    if (remaining <= duration) return region.start + remaining;
-    remaining -= duration;
-  }
-  return regions.length ? regions[regions.length - 1].end : 0;
-}
-
 function denoiseLabel(recording: Recording) {
   if (recording.denoiseStatus === "queued") return "Denoise queued";
   if (recording.denoiseStatus === "processing") return "Denoising";
@@ -128,12 +106,14 @@ function App() {
   const [recordingContextMenu, setRecordingContextMenu] = useState<RecordingContextMenu | null>(null);
   const [trackContextMenu, setTrackContextMenu] = useState<TrackContextMenu | null>(null);
 
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const audioContextNeedsResetRef = useRef(false);
+  const audioContextManagerRef = useRef<AudioContextManager<AudioContext> | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
   const startedAtRef = useRef(0);
   const playbackOffsetRef = useRef(0);
   const editedPlaybackOffsetRef = useRef(0);
+  const playbackKeptRegionsRef = useRef<Region[]>([]);
+  const playbackRequestRef = useRef(0);
   const animationFrameRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const recordingContextMenuRef = useRef<HTMLDivElement>(null);
@@ -157,35 +137,43 @@ function App() {
   const pendingExportCount = editorTracks.filter(needsExport).length;
   const hasUnsavedWork = isRecording || isProcessing || pendingExportCount > 0;
   hasUnsavedWorkRef.current = hasUnsavedWork;
+  if (!audioContextManagerRef.current) {
+    audioContextManagerRef.current = new AudioContextManager(new BrowserAudioContextFactory());
+  }
 
   useEffect(() => {
-    audioContextRef.current = new AudioContext();
+    const manager = audioContextManagerRef.current
+      ?? new AudioContextManager(new BrowserAudioContextFactory());
+    audioContextManagerRef.current = manager;
     const suppressWebViewContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", suppressWebViewContextMenu, true);
     return () => {
       document.removeEventListener("contextmenu", suppressWebViewContextMenu, true);
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      sourceNodeRef.current?.stop();
-      void audioContextRef.current?.close();
-    };
-  }, []);
-
-  const getAudioContext = () => {
-    let context = audioContextRef.current;
-    if (!context || context.state === "closed" || audioContextNeedsResetRef.current) {
+      playbackRequestRef.current += 1;
+      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
       if (sourceNodeRef.current) {
         sourceNodeRef.current.onended = null;
         try { sourceNodeRef.current.stop(); } catch { /* Already stopped. */ }
-        sourceNodeRef.current = null;
       }
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      setIsPlaying(false);
-      if (context && context.state !== "closed") void context.close().catch(() => undefined);
-      context = new AudioContext();
-      audioContextRef.current = context;
-      audioContextNeedsResetRef.current = false;
-    }
-    return context;
+      sourceNodeRef.current = null;
+      playbackContextRef.current = null;
+      playbackKeptRegionsRef.current = [];
+      if (audioContextManagerRef.current === manager) audioContextManagerRef.current = null;
+      void manager.close().catch(() => undefined);
+    };
+  }, []);
+
+  const getAudioContext = async () => {
+    const manager = audioContextManagerRef.current;
+    if (!manager) throw new Error("Audio context is unavailable.");
+    return manager.get();
+  };
+
+  const decodeAudioData = (audioData: ArrayBuffer) => {
+    const manager = audioContextManagerRef.current;
+    if (!manager) throw new Error("Audio context is unavailable.");
+    return manager.run((context) => context.decodeAudioData(audioData));
   };
 
   useEffect(() => {
@@ -276,11 +264,43 @@ function App() {
       : track));
   }, [silenceControlOpen, silenceDurationControlOpen, selectedSilenceThresholdDb, selectedMinimumSilenceDurationMs, selectedTrackId, selectedTrackBuffer]);
 
+  const stopPlayback = (savePosition: boolean) => {
+    playbackRequestRef.current += 1;
+    const source = sourceNodeRef.current;
+    if (source) {
+      source.onended = null;
+      try { source.stop(); } catch { /* Already stopped. */ }
+      sourceNodeRef.current = null;
+    }
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    const context = playbackContextRef.current;
+    const position = context
+      ? savedPlaybackPosition(Boolean(source) && savePosition, {
+        contextTime: context.currentTime,
+        startedAt: startedAtRef.current,
+        editedOffset: editedPlaybackOffsetRef.current,
+        keptRegions: playbackKeptRegionsRef.current,
+      })
+      : null;
+    if (position !== null) {
+      playbackOffsetRef.current = position;
+      setCurrentTime(position);
+    }
+    playbackContextRef.current = null;
+    playbackKeptRegionsRef.current = [];
+    startedAtRef.current = 0;
+    editedPlaybackOffsetRef.current = 0;
+    setIsPlaying(false);
+  };
+
   const decodeRecording = async (info: RecordingInfo) => {
-    const context = getAudioContext();
     const response = await fetch(convertFileSrc(info.path));
     if (!response.ok) throw new Error("Unable to load the completed recording.");
-    const buffer = await context.decodeAudioData(await response.arrayBuffer());
+    const audioData = await response.arrayBuffer();
+    const buffer = await decodeAudioData(audioData);
     return {
       ...info,
       buffer,
@@ -308,15 +328,12 @@ function App() {
   const completeDenoise = async (result: DenoiseResult) => {
     if (currentDenoiseTasksRef.current.get(result.recordingId) !== result.taskId) return;
     if (selectedTrackIdRef.current === result.recordingId) {
-      sourceNodeRef.current?.stop();
-      sourceNodeRef.current = null;
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      setIsPlaying(false);
+      stopPlayback(true);
     }
-    const context = getAudioContext();
     const response = await fetch(convertFileSrc(result.path));
     if (!response.ok) throw new Error("Unable to load ClearVoice output.");
-    const buffer = await context.decodeAudioData(await response.arrayBuffer());
+    const audioData = await response.arrayBuffer();
+    const buffer = await decodeAudioData(audioData);
     const replace = (recording: Recording): Recording => {
       if (recording.id !== result.recordingId || recording.denoiseTaskId !== result.taskId) return recording;
       return {
@@ -411,11 +428,19 @@ function App() {
   };
 
   const importAudio = async () => {
-    const selection = await open({
-      multiple: true,
-      filters: [{ name: "Audio or video", extensions: ["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "aiff", "mp4", "mov", "mkv", "webm", "m4v", "avi"] }],
-    });
-    audioContextNeedsResetRef.current = true;
+    stopPlayback(true);
+    let selection: string | string[] | null;
+    try {
+      selection = await open({
+        multiple: true,
+        filters: [{ name: "Audio or video", extensions: ["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "aiff", "mp4", "mov", "mkv", "webm", "m4v", "avi"] }],
+      });
+    } catch (error) {
+      setMessage(String(error));
+      return;
+    } finally {
+      audioContextManagerRef.current?.requestReset();
+    }
     const paths = selectedPaths(selection);
     if (!paths.length) return;
     setIsProcessing(true);
@@ -472,31 +497,15 @@ function App() {
     };
   }, []);
 
-  const stopPlayback = (savePosition: boolean) => {
-    if (sourceNodeRef.current) {
-      sourceNodeRef.current.onended = null;
-      try { sourceNodeRef.current.stop(); } catch { /* Already stopped. */ }
-      sourceNodeRef.current = null;
-    }
-    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-    if (savePosition && audioContextRef.current && selectedTrack) {
-      const keptRegions = getKeptRegions(selectedDeletedRegions, selectedTrack.buffer.duration);
-      const editedTime = editedPlaybackOffsetRef.current + audioContextRef.current.currentTime - startedAtRef.current;
-      playbackOffsetRef.current = originalTimeAtEditedOffset(
-        Math.min(editedTime, keptDuration(keptRegions)),
-        keptRegions,
-      );
-      setCurrentTime(playbackOffsetRef.current);
-    }
-    setIsPlaying(false);
-  };
-
   const startPlayback = async (offset: number) => {
     if (!selectedTrack) return;
+    stopPlayback(false);
+    const playbackRequest = playbackRequestRef.current;
     try {
-      const context = getAudioContext();
+      const context = await getAudioContext();
+      if (playbackRequest !== playbackRequestRef.current) return;
       if (context.state === "suspended") await context.resume();
-      stopPlayback(false);
+      if (playbackRequest !== playbackRequestRef.current) return;
       const keptRegions = getKeptRegions(selectedDeletedRegions, selectedTrack.buffer.duration);
       const editedBuffer = createEditedBuffer(selectedTrack.buffer, selectedDeletedRegions, selectedTrack.envelopePoints);
       if (editedBuffer.duration === 0) {
@@ -510,6 +519,16 @@ function App() {
       source.buffer = editedBuffer;
       source.connect(context.destination);
       source.onended = () => {
+        if (sourceNodeRef.current !== source || playbackRequest !== playbackRequestRef.current) return;
+        sourceNodeRef.current = null;
+        if (animationFrameRef.current !== null) {
+          cancelAnimationFrame(animationFrameRef.current);
+          animationFrameRef.current = null;
+        }
+        startedAtRef.current = 0;
+        editedPlaybackOffsetRef.current = 0;
+        playbackContextRef.current = null;
+        playbackKeptRegionsRef.current = [];
         setIsPlaying(false);
         playbackOffsetRef.current = 0;
         setCurrentTime(0);
@@ -519,8 +538,11 @@ function App() {
       editedPlaybackOffsetRef.current = editedOffset;
       source.start(0, editedOffset);
       sourceNodeRef.current = source;
+      playbackContextRef.current = context;
+      playbackKeptRegionsRef.current = keptRegions;
       setIsPlaying(true);
       const tick = () => {
+        if (sourceNodeRef.current !== source || playbackRequest !== playbackRequestRef.current) return;
         const editedTime = editedPlaybackOffsetRef.current + context.currentTime - startedAtRef.current;
         if (editedTime < editedBuffer.duration) {
           setCurrentTime(originalTimeAtEditedOffset(editedTime, keptRegions));
@@ -529,7 +551,8 @@ function App() {
       };
       animationFrameRef.current = requestAnimationFrame(tick);
     } catch (error) {
-      setIsPlaying(false);
+      if (playbackRequest !== playbackRequestRef.current) return;
+      stopPlayback(false);
       setMessage(`Unable to play audio: ${String(error)}`);
     }
   };
@@ -604,13 +627,17 @@ function App() {
     setIsProcessing(true);
     stopPlayback(true);
     try {
-      const destinationDir = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: getLastExportDirectory() ?? undefined,
-        title: "Choose a folder for exported audio",
-      });
-      audioContextNeedsResetRef.current = true;
+      let destinationDir: string | string[] | null;
+      try {
+        destinationDir = await open({
+          directory: true,
+          multiple: false,
+          defaultPath: getLastExportDirectory() ?? undefined,
+          title: "Choose a folder for exported audio",
+        });
+      } finally {
+        audioContextManagerRef.current?.requestReset();
+      }
       if (!destinationDir || Array.isArray(destinationDir)) {
         setMessage("Export cancelled");
         return;
