@@ -25,6 +25,17 @@ pub struct NativeAudioEngine {
 }
 
 impl NativeAudioEngine {
+    pub fn new_in_temp() -> Result<Self, String> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        Self::new(std::env::temp_dir().join(format!(
+            "simple-audio-cut-recordings-{stamp}-{}",
+            std::process::id()
+        )))
+    }
+
     pub fn new(output_dir: PathBuf) -> Result<Self, String> {
         ffmpeg_next::init().map_err(|error| format!("Unable to initialize FFmpeg: {error}"))?;
         fs::create_dir_all(&output_dir)
@@ -393,6 +404,12 @@ impl NativeAudioEngine {
         } else {
             Err("Loudness target must be between -70 and -5 LUFS.".into())
         }
+    }
+}
+
+impl Drop for NativeAudioEngine {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.output_dir);
     }
 }
 
@@ -843,6 +860,23 @@ mod tests {
         assert!(NativeAudioEngine::validate_target_lufs(-70.1).is_err());
         assert!(NativeAudioEngine::validate_target_lufs(-4.9).is_err());
         assert!(NativeAudioEngine::validate_target_lufs(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn creates_session_recordings_under_system_temp_and_removes_them_on_drop() {
+        let engine = NativeAudioEngine::new_in_temp().expect("create temp audio engine");
+        let output_dir = engine.output_dir.clone();
+
+        assert!(output_dir.starts_with(std::env::temp_dir()));
+        assert!(output_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("simple-audio-cut-recordings-")));
+        assert!(output_dir.is_dir());
+
+        drop(engine);
+
+        assert!(!output_dir.exists());
     }
 
     #[test]

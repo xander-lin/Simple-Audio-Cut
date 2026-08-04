@@ -95,19 +95,23 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let recording_dir = app
+            let legacy_recording_dir = app
                 .path()
                 .app_data_dir()
-                .map_err(|error| format!("Unable to locate application data directory: {error}"))?
-                .join("recordings");
+                .map(|path| path.join("recordings"));
             #[cfg(feature = "native-audio")]
-            app.manage(
-                NativeAudioEngine::new(recording_dir)
-                    .map_err(|error| format!("Unable to initialize audio engine: {error}"))?,
-            );
+            {
+                if let Ok(legacy_recording_dir) = legacy_recording_dir {
+                    let _ = std::fs::remove_dir_all(legacy_recording_dir);
+                }
+                app.manage(
+                    NativeAudioEngine::new_in_temp()
+                        .map_err(|error| format!("Unable to initialize audio engine: {error}"))?,
+                );
+            }
             #[cfg(not(feature = "native-audio"))]
             {
-                let _ = recording_dir;
+                let _ = legacy_recording_dir;
                 app.manage(audio::MockAudioEngine::new());
             }
             Ok(())

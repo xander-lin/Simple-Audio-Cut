@@ -9,7 +9,7 @@ options=('!debug')
 depends=('alsa-lib' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1')
 makedepends=('cargo' 'git' 'nodejs' 'pnpm' 'pkgconf')
 if [[ -n ${SIMPLE_AUDIO_CUT_SOURCE_URL:-} ]]; then
-  source=("$pkgname-$pkgver-local-r26.tar.gz::$SIMPLE_AUDIO_CUT_SOURCE_URL")
+  source=("$pkgname-$pkgver-local-r27.tar.gz::$SIMPLE_AUDIO_CUT_SOURCE_URL")
   _source_root="Simple-Audio-Cut-$pkgver"
 else
   source=("$pkgname::git+$url.git#tag=v$pkgver")
