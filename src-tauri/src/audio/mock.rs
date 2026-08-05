@@ -1,13 +1,17 @@
 use super::{
-    reserve_export_path, AudioEngine, DenoiseAvailability, DenoiseCompletion, DenoiseResult,
-    DenoiseUpdate, ExportEdit, ExportResult, RecordingInfo,
+    reserve_export_path, AudioEngine, DenoiseCompletion, DenoiseResult, DenoiseUpdate, ExportEdit,
+    ExportResult, ImportCompletion, ImportUpdate, RecordingInfo,
 };
+use crate::denoise::{DenoiseAvailability, DenoiseProvider};
+use std::sync::Arc;
 
-pub struct MockAudioEngine;
+pub struct MockAudioEngine {
+    denoise_provider: Arc<dyn DenoiseProvider>,
+}
 
 impl MockAudioEngine {
-    pub fn new() -> Self {
-        Self
+    pub fn new(denoise_provider: Arc<dyn DenoiseProvider>) -> Self {
+        Self { denoise_provider }
     }
 }
 
@@ -29,8 +33,28 @@ impl AudioEngine for MockAudioEngine {
         })
     }
 
-    fn import_audio(&self, source: &str, target_lufs: f64) -> Result<RecordingInfo, String> {
-        self.normalize_to_lufs(source, target_lufs)
+    fn start_import_audio(
+        &self,
+        recording_id: String,
+        source: String,
+        target_lufs: f64,
+        completion: ImportCompletion,
+    ) -> Result<(), String> {
+        completion(ImportUpdate::Normalizing {
+            recording_id: recording_id.clone(),
+        });
+        match self.normalize_to_lufs(&source, target_lufs) {
+            Ok(mut info) => {
+                info.id = recording_id;
+                completion(ImportUpdate::Complete { info });
+            }
+            Err(error) => completion(ImportUpdate::Failed {
+                recording_id,
+                source_path: source,
+                error,
+            }),
+        }
+        Ok(())
     }
 
     fn normalize_to_lufs(&self, source: &str, target_lufs: f64) -> Result<RecordingInfo, String> {
@@ -43,8 +67,8 @@ impl AudioEngine for MockAudioEngine {
         })
     }
 
-    fn denoise_availability(&self, _sample_rate: u32) -> DenoiseAvailability {
-        DenoiseAvailability { available: true }
+    fn denoise_availability(&self, sample_rate: u32) -> DenoiseAvailability {
+        self.denoise_provider.availability(sample_rate)
     }
 
     fn start_denoise(
@@ -52,21 +76,35 @@ impl AudioEngine for MockAudioEngine {
         recording_id: String,
         task_id: String,
         source: String,
-        _sample_rate: u32,
+        sample_rate: u32,
         target_lufs: f64,
         completion: DenoiseCompletion,
     ) -> Result<(), String> {
+        let session = self.denoise_provider.prepare(sample_rate)?;
         completion(DenoiseUpdate::Processing {
             recording_id: recording_id.clone(),
             task_id: task_id.clone(),
         });
-        completion(DenoiseUpdate::Complete {
-            result: DenoiseResult {
-                recording_id,
-                task_id,
-                path: source,
-                integrated_lufs: Some(target_lufs),
-            },
+        std::thread::spawn(move || {
+            let output = std::path::Path::new(&source)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(format!("simple-audio-cut-{task_id}-mock-denoise.wav"));
+            match session.enhance(std::path::Path::new(&source), &output) {
+                Ok(()) => completion(DenoiseUpdate::Complete {
+                    result: DenoiseResult {
+                        recording_id,
+                        task_id,
+                        path: output.display().to_string(),
+                        integrated_lufs: Some(target_lufs),
+                    },
+                }),
+                Err(error) => completion(DenoiseUpdate::Failed {
+                    recording_id,
+                    task_id,
+                    error,
+                }),
+            }
         });
         Ok(())
     }
@@ -75,6 +113,7 @@ impl AudioEngine for MockAudioEngine {
         &self,
         source: &str,
         _deleted_regions: &[super::engine::Region],
+        _muted_regions: &[super::engine::Region],
         _envelope_points: &[super::engine::EnvelopePoint],
         destination: &str,
     ) -> Result<String, String> {
@@ -111,6 +150,7 @@ impl AudioEngine for MockAudioEngine {
                 let result = self.export_edit(
                     &edit.source_path,
                     &edit.deleted_regions,
+                    &edit.muted_regions,
                     &edit.envelope_points,
                     &destination.display().to_string(),
                 );

@@ -1,6 +1,14 @@
 import { envelopeGainAtTime, type EnvelopePoint, type Region } from "./regionUtils.ts";
 export function getKeptRegions(deletedRegions: Region[], totalDuration: number): Region[] {
-  const sorted = [...deletedRegions].sort((a, b) => a.start - b.start);
+  if (!Number.isFinite(totalDuration) || totalDuration <= 0) return [];
+  const sorted = deletedRegions
+    .filter((region) => Number.isFinite(region.start) && Number.isFinite(region.end))
+    .map((region) => ({
+      start: Math.max(0, Math.min(totalDuration, region.start)),
+      end: Math.max(0, Math.min(totalDuration, region.end)),
+    }))
+    .filter((region) => region.end > region.start)
+    .sort((left, right) => left.start - right.start);
   const kept: Region[] = [];
   let currentTime = 0;
 
@@ -42,24 +50,20 @@ export function createEditedBuffer(
   buffer: AudioBuffer,
   deletedRegions: Region[],
   envelopePoints: EnvelopePoint[] = [],
+  mutedRegions: Region[] = [],
 ): AudioBuffer {
   const keptRegions = getKeptRegions(deletedRegions, buffer.duration);
   const sampleRate = buffer.sampleRate;
   const numberOfChannels = buffer.numberOfChannels;
-
-  // Calculate total duration in samples consistently
-  let totalSamples = 0;
-  for (const region of keptRegions) {
-    const startSample = Math.floor(region.start * sampleRate);
-    const endSample = Math.floor(region.end * sampleRate);
-    totalSamples += (endSample - startSample);
-  }
-
-  // Create new buffer data
+  const sampleRanges = keptRegions.map((region) => ({
+    start: Math.max(0, Math.min(buffer.length, Math.floor(region.start * sampleRate))),
+    end: Math.max(0, Math.min(buffer.length, Math.floor(region.end * sampleRate))),
+  }));
+  const totalSamples = sampleRanges.reduce((total, region) => total + Math.max(0, region.end - region.start), 0);
   const outputBuffer = new AudioBuffer({
     length: totalSamples,
-    numberOfChannels: numberOfChannels,
-    sampleRate: sampleRate,
+    numberOfChannels,
+    sampleRate,
   });
 
   for (let channel = 0; channel < numberOfChannels; channel++) {
@@ -67,35 +71,34 @@ export function createEditedBuffer(
     const inputData = buffer.getChannelData(channel);
     let offset = 0;
 
-    for (const region of keptRegions) {
-      const startSample = Math.floor(region.start * sampleRate);
-      const endSample = Math.floor(region.end * sampleRate);
-      const length = endSample - startSample;
-      
-      // Safety check boundaries
-      if (startSample < inputData.length) {
-          // slice handles end > length automatically, but we want exact length match with offset logic
-          // However, if inputData is shorter than expected endSample, we might have issues.
-          // But startSample/endSample are derived from region which is constrained by duration.
-          
-      const chunk = inputData.slice(startSample, startSample + length);
-      applyEnvelope(chunk, startSample, sampleRate, buffer.duration, envelopePoints);
-          
-          // Double check target fit
-          if (offset + chunk.length <= outputData.length) {
+    for (const region of sampleRanges) {
+      const chunk = inputData.slice(region.start, region.end);
+      applyEnvelope(chunk, region.start, sampleRate, buffer.duration, envelopePoints);
+      applyMutedRegions(chunk, region.start, sampleRate, buffer.duration, mutedRegions);
       outputData.set(chunk, offset);
-          } else {
-             // If rounding error caused overflow, truncate
-             // This effectively solves the RangeError
-      const fitLength = outputData.length - offset;
-      outputData.set(chunk.slice(0, fitLength), offset);
-          }
       offset += chunk.length;
-      }
     }
   }
 
   return outputBuffer;
+}
+
+function applyMutedRegions(
+  samples: Float32Array,
+  sourceStartSample: number,
+  sampleRate: number,
+  duration: number,
+  regions: Region[],
+) {
+  for (const region of regions) {
+    if (!Number.isFinite(region.start) || !Number.isFinite(region.end)) continue;
+    const start = Math.max(0, Math.min(duration, region.start));
+    const end = Math.max(0, Math.min(duration, region.end));
+    if (end <= start) continue;
+    const localStart = Math.max(0, Math.floor(start * sampleRate) - sourceStartSample);
+    const localEnd = Math.min(samples.length, Math.ceil(end * sampleRate) - sourceStartSample);
+    if (localEnd > localStart) samples.fill(0, localStart, localEnd);
+  }
 }
 
 function applyEnvelope(

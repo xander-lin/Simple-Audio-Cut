@@ -7,6 +7,7 @@ const track = {
   path: "/tmp/voice.wav",
   manualDeletedRegions: [{ start: 1, end: 2 }],
   silenceRegions: [],
+  mutedRegions: [],
   envelopePoints: [{ id: "point-1", time: 3, gain: 0.5 }],
   lastExportSignature: null,
 };
@@ -22,6 +23,27 @@ test("only tracks changed since their successful export need batch export", () =
     manualDeletedRegions: [...track.manualDeletedRegions, { start: 4, end: 5 }],
     lastExportSignature: signature,
   }), true);
+});
+
+test("muted ranges are output-affecting edits", () => {
+  const signature = exportSignature(track);
+
+  assert.equal(needsExport({
+    ...track,
+    mutedRegions: [{ start: 3, end: 4 }],
+    lastExportSignature: signature,
+  }), true);
+});
+
+test("equivalent muted ranges do not create false changes", () => {
+  const withMute = { ...track, mutedRegions: [{ start: 3, end: 5 }] };
+  const signature = exportSignature(withMute);
+
+  assert.equal(needsExport({
+    ...withMute,
+    mutedRegions: [{ start: 4, end: 5 }, { start: 3, end: 4 }],
+    lastExportSignature: signature,
+  }), false);
 });
 
 test("envelope point identity and ordering do not create false changes", () => {

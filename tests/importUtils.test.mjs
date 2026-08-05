@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fileBasename, importSummary, selectedPaths } from "../src/utils/importUtils.ts";
+import { fileBasename, fileStem, importQueuedSummary, importSummary, selectedPaths } from "../src/utils/importUtils.ts";
 
 test("normalizes file picker selections", () => {
   assert.deepEqual(selectedPaths(null), []);
@@ -19,4 +19,11 @@ test("summarizes multi-file import results", () => {
 test("extracts display names from selected paths", () => {
   assert.equal(fileBasename("/tmp/video.mov"), "video.mov");
   assert.equal(fileBasename("C:\\Users\\me\\audio.wav"), "audio.wav");
+  assert.equal(fileStem("/tmp/video.mov"), "video");
+  assert.equal(fileStem("/tmp/.hidden"), ".hidden");
+});
+
+test("summarizes queued imports", () => {
+  assert.equal(importQueuedSummary(1), "Import queued. Normalizing loudness before editing.");
+  assert.equal(importQueuedSummary(3), "Queued 3 imports. Normalizing loudness before editing.");
 });

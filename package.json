@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "node --experimental-strip-types --experimental-specifier-resolution=node --test tests/*.test.mjs",
+    "test": "node --experimental-strip-types --experimental-specifier-resolution=node --test tests/*.test.mjs && vitest run",
+    "test:clearvoice-worker": "python -m unittest discover -s tests -p clearvoice_worker_test.py",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -21,10 +22,14 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.2",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "happy-dom": "20.11.1",
     "typescript": "^5.6.2",
-    "vite": "^5.4.3"
+    "vite": "^5.4.3",
+    "vitest": "2.1.9"
   }
 }

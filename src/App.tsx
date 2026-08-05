@@ -4,17 +4,22 @@ import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import EditorTrack from "./components/EditorTrack";
-import { combineRegions, mergeRegions, subtractRegion, type EnvelopePoint, type Region } from "./utils/regionUtils";
+import DenoiseSettings, { type DenoiseProviderStatus } from "./components/DenoiseSettings";
+import Icon from "./components/Icon";
+import { combineRegions, mergeRegions, regionIsCovered, subtractRegion, type EnvelopePoint, type Region } from "./utils/regionUtils";
 import { formatTimeStandard } from "./utils/timeUtils";
 import { dbfsToAmplitude, detectSilence } from "./utils/audioAnalysis";
 import { createEditedBuffer, editedOffsetAtOriginalTime, getKeptRegions, originalTimeAtEditedOffset } from "./utils/exportUtils";
 import { appendUniqueTrack } from "./utils/trackUtils";
 import { applyDenoiseUpdate, canExportTracks, type DenoiseState } from "./utils/denoiseUtils";
 import { exportSignature, getLastExportDirectory, needsExport, rememberLastExportDirectory } from "./utils/exportState";
-import { importSummary, selectedPaths } from "./utils/importUtils";
+import { fileBasename, fileStem, importQueuedSummary, selectedPaths } from "./utils/importUtils";
 import { AudioContextManager, BrowserAudioContextFactory } from "./audio/audioContextManager";
 import { savedPlaybackPosition } from "./utils/playbackUtils";
+import { addEditPoint } from "./utils/directEdit";
 import "./App.css";
+
+const APP_ICON_URL = new URL("../src-tauri/icons/icon.png", import.meta.url).href;
 
 interface RecordingInfo {
   id: string;
@@ -24,18 +29,28 @@ interface RecordingInfo {
   integratedLufs: number | null;
 }
 
+type ImportStatus = "normalizing" | "ready" | "failed";
+
 interface Recording extends RecordingInfo, DenoiseState {
-  buffer: AudioBuffer;
+  buffer: AudioBuffer | null;
+  importStatus: ImportStatus;
+  importError: string | null;
+  sourcePath: string | null;
   pixelsPerSecond: number;
   manualDeletedRegions: Region[];
   silenceRegions: Region[];
+  mutedRegions: Region[];
   silenceDetectionEnabled: boolean;
   silenceThresholdDb: number;
   minimumSilenceDurationMs: number;
   envelopePoints: EnvelopePoint[];
+  editPoints: number[];
+  selectedRange: Region | null;
   collapsed: boolean;
   lastExportSignature: string | null;
 }
+
+type ReadyRecording = Recording & { buffer: AudioBuffer; importStatus: "ready"; importError: null };
 
 interface DenoiseResult {
   recordingId: string;
@@ -46,7 +61,15 @@ interface DenoiseResult {
 
 interface DenoiseAvailability {
   available: boolean;
+  providerName: string;
+  modelName: string | null;
+  reason: string | null;
 }
+
+type ImportEvent =
+  | { status: "normalizing"; recordingId: string }
+  | { status: "complete"; info: RecordingInfo }
+  | { status: "failed"; recordingId: string; sourcePath: string; error: string };
 
 interface DenoiseEvent {
   status: "processing";
@@ -60,16 +83,11 @@ interface ExportResult {
   error: string | null;
 }
 
-interface RecordingContextMenu {
-  recordingId: string;
-  x: number;
-  y: number;
-}
-
 interface TrackContextMenu {
   trackId: string;
   x: number;
   y: number;
+  kind: "export" | "actions";
 }
 
 function createDeferred() {
@@ -83,32 +101,76 @@ function createDeferred() {
 }
 
 function denoiseLabel(recording: Recording) {
+  if (recording.importStatus === "normalizing") return "Normalizing";
+  if (recording.importStatus === "failed") return "Import failed";
   if (recording.denoiseStatus === "queued") return "Denoise queued";
   if (recording.denoiseStatus === "processing") return "Denoising";
   if (recording.denoiseStatus === "unavailable") return "No denoise";
   return recording.denoiseStatus === "complete" ? "ClearVoice" : "Denoise failed";
 }
 
+function recordingStatusClass(recording: Recording) {
+  if (recording.importStatus === "normalizing") return "denoise-processing";
+  if (recording.importStatus === "failed" || recording.denoiseStatus === "failed") return "denoise-failed";
+  return recording.denoiseStatus === "queued" || recording.denoiseStatus === "processing" ? "denoise-processing" : "";
+}
+
+function isRecordingReady(recording: Recording): recording is ReadyRecording {
+  return recording.importStatus === "ready" && recording.buffer !== null;
+}
+
+function createImportPlaceholder(sourcePath: string, recordingId: string): Recording {
+  return {
+    id: recordingId,
+    name: fileStem(sourcePath) || fileBasename(sourcePath),
+    path: sourcePath,
+    durationSeconds: 0,
+    integratedLufs: null,
+    buffer: null,
+    importStatus: "normalizing",
+    importError: null,
+    sourcePath,
+    pixelsPerSecond: 48,
+    manualDeletedRegions: [],
+    silenceRegions: [],
+    mutedRegions: [],
+    silenceDetectionEnabled: false,
+    silenceThresholdDb: -36,
+    minimumSilenceDurationMs: 200,
+    envelopePoints: [],
+    editPoints: [],
+    selectedRange: null,
+    collapsed: false,
+    lastExportSignature: null,
+    denoiseStatus: "unavailable",
+    denoiseTaskId: "",
+  };
+}
+
 function App() {
   const [recordings, setRecordings] = useState<Recording[]>([]);
-  const [editorTracks, setEditorTracks] = useState<Recording[]>([]);
+  const [editorTracks, setEditorTracks] = useState<ReadyRecording[]>([]);
   const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+  const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [isRecordingTransitioning, setIsRecordingTransitioning] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [message, setMessage] = useState("Ready to record");
   const [targetLufs, setTargetLufs] = useState(-14);
-  const [silenceControlOpen, setSilenceControlOpen] = useState(false);
-  const [silenceDurationControlOpen, setSilenceDurationControlOpen] = useState(false);
-  const [silencePrecision, setSilencePrecision] = useState<0 | 1 | 2>(0);
-  const [recordingContextMenu, setRecordingContextMenu] = useState<RecordingContextMenu | null>(null);
+  const [bladeActive, setBladeActive] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [denoiseProviderStatus, setDenoiseProviderStatus] = useState<DenoiseProviderStatus | null>(null);
+  const [exportingTrackIds, setExportingTrackIds] = useState<string[]>([]);
+  const [failedExportTrackIds, setFailedExportTrackIds] = useState<string[]>([]);
   const [trackContextMenu, setTrackContextMenu] = useState<TrackContextMenu | null>(null);
 
   const audioContextManagerRef = useRef<AudioContextManager<AudioContext> | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const recordingTransitionRef = useRef(false);
   const startedAtRef = useRef(0);
   const playbackOffsetRef = useRef(0);
   const editedPlaybackOffsetRef = useRef(0);
@@ -116,26 +178,35 @@ function App() {
   const playbackRequestRef = useRef(0);
   const animationFrameRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
-  const recordingContextMenuRef = useRef<HTMLDivElement>(null);
   const trackContextMenuRef = useRef<HTMLDivElement>(null);
+  const editorTracksRef = useRef<ReadyRecording[]>([]);
+  const completeImportRef = useRef<((info: RecordingInfo) => Promise<void>) | null>(null);
   const selectedTrackIdRef = useRef<string | null>(null);
+  const importListenerReadyRef = useRef<ReturnType<typeof createDeferred> | null>(null);
   const denoiseListenerReadyRef = useRef<ReturnType<typeof createDeferred> | null>(null);
   const currentDenoiseTasksRef = useRef(new Map<string, string>());
   const activeDenoiseRecordingsRef = useRef(new Set<string>());
+  const removedRecordingIdsRef = useRef(new Set<string>());
   const exportInProgressRef = useRef(false);
   const closePromptOpenRef = useRef(false);
   const hasUnsavedWorkRef = useRef(false);
+  if (!importListenerReadyRef.current) importListenerReadyRef.current = createDeferred();
   if (!denoiseListenerReadyRef.current) denoiseListenerReadyRef.current = createDeferred();
+  editorTracksRef.current = editorTracks;
   selectedTrackIdRef.current = selectedTrackId;
   const selectedTrack = editorTracks.find((track) => track.id === selectedTrackId) ?? null;
+  const selectedSource = recordings.find((recording) => recording.id === selectedSourceId) ?? null;
   const selectedDeletedRegions = selectedTrack
     ? combineRegions(selectedTrack.manualDeletedRegions, selectedTrack.silenceRegions)
     : [];
-  const selectedTrackBuffer = selectedTrack?.buffer;
   const selectedSilenceThresholdDb = selectedTrack?.silenceThresholdDb ?? -36;
   const selectedMinimumSilenceDurationMs = selectedTrack?.minimumSilenceDurationMs ?? 200;
+  const pendingImportCount = recordings.filter((recording) => recording.importStatus === "normalizing").length;
+  const pendingDenoiseCount = [...recordings, ...editorTracks].filter((recording) => recording.denoiseStatus === "queued" || recording.denoiseStatus === "processing").length;
   const pendingExportCount = editorTracks.filter(needsExport).length;
-  const hasUnsavedWork = isRecording || isProcessing || pendingExportCount > 0;
+  const unexportedSessionCount = [...recordings, ...editorTracks].filter(isRecordingReady).filter(needsExport).length;
+  const activeTaskCount = pendingImportCount + pendingDenoiseCount + (isRecording || isRecordingTransitioning ? 1 : 0) + (isProcessing ? 1 : 0);
+  const hasUnsavedWork = activeTaskCount > 0 || isRecordingTransitioning || unexportedSessionCount > 0;
   hasUnsavedWorkRef.current = hasUnsavedWork;
   if (!audioContextManagerRef.current) {
     audioContextManagerRef.current = new AudioContextManager(new BrowserAudioContextFactory());
@@ -185,7 +256,7 @@ function App() {
       if (closePromptOpenRef.current) return;
       closePromptOpenRef.current = true;
       try {
-        const confirmed = await confirmDialog("There are recording or export changes that have not been saved. Quit anyway?", {
+        const confirmed = await confirmDialog("Recording, processing, or unexported changes are still active. Quit anyway?", {
           title: "Quit Simple Audio Cut?",
           kind: "warning",
         });
@@ -202,27 +273,6 @@ function App() {
       unlisten?.();
     };
   }, []);
-
-  useEffect(() => {
-    if (!recordingContextMenu) return;
-    const dismiss = (event: MouseEvent) => {
-      if (!recordingContextMenuRef.current?.contains(event.target as Node)) {
-        setRecordingContextMenu(null);
-      }
-    };
-    const dismissOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setRecordingContextMenu(null);
-    };
-    const dismissOnBlur = () => setRecordingContextMenu(null);
-    window.addEventListener("mousedown", dismiss);
-    window.addEventListener("keydown", dismissOnEscape);
-    window.addEventListener("blur", dismissOnBlur);
-    return () => {
-      window.removeEventListener("mousedown", dismiss);
-      window.removeEventListener("keydown", dismissOnEscape);
-      window.removeEventListener("blur", dismissOnBlur);
-    };
-  }, [recordingContextMenu]);
 
   useEffect(() => {
     if (!trackContextMenu) return;
@@ -254,15 +304,14 @@ function App() {
   }, [isRecording]);
 
   useEffect(() => {
-    if ((!silenceControlOpen && !silenceDurationControlOpen) || !selectedTrackId || !selectedTrackBuffer) return;
-    const silenceRegions = detectSilence(selectedTrackBuffer, {
-      threshold: dbfsToAmplitude(selectedSilenceThresholdDb),
-      minDuration: selectedMinimumSilenceDurationMs / 1_000,
-    });
-    setEditorTracks((current) => current.map((track) => track.id === selectedTrackId
-      ? { ...track, silenceRegions, silenceDetectionEnabled: true }
-      : track));
-  }, [silenceControlOpen, silenceDurationControlOpen, selectedSilenceThresholdDb, selectedMinimumSilenceDurationMs, selectedTrackId, selectedTrackBuffer]);
+    let disposed = false;
+    void invoke<DenoiseProviderStatus>("denoise_provider_status")
+      .then((status) => {
+        if (!disposed) setDenoiseProviderStatus(status);
+      })
+      .catch(() => undefined);
+    return () => { disposed = true; };
+  }, []);
 
   const stopPlayback = (savePosition: boolean) => {
     playbackRequestRef.current += 1;
@@ -296,7 +345,7 @@ function App() {
     setIsPlaying(false);
   };
 
-  const decodeRecording = async (info: RecordingInfo) => {
+  const decodeRecording = async (info: RecordingInfo): Promise<ReadyRecording> => {
     const response = await fetch(convertFileSrc(info.path));
     if (!response.ok) throw new Error("Unable to load the completed recording.");
     const audioData = await response.arrayBuffer();
@@ -304,14 +353,20 @@ function App() {
     return {
       ...info,
       buffer,
+      importStatus: "ready" as const,
+      importError: null,
+      sourcePath: null,
       pixelsPerSecond: 48,
       durationSeconds: info.durationSeconds || buffer.duration,
       manualDeletedRegions: [],
       silenceRegions: [],
+      mutedRegions: [],
       silenceDetectionEnabled: false,
       silenceThresholdDb: -36,
       minimumSilenceDurationMs: 200,
       envelopePoints: [],
+      editPoints: [],
+      selectedRange: null,
       collapsed: false,
       lastExportSignature: null,
       denoiseStatus: "queued" as const,
@@ -319,13 +374,33 @@ function App() {
     };
   };
 
-  const loadRecording = async (info: RecordingInfo) => {
+  const completeImport = async (info: RecordingInfo) => {
+    if (removedRecordingIdsRef.current.has(info.id)) return;
     const recording = await decodeRecording(info);
-    setRecordings((current) => [...current, recording]);
-    return recording;
+    if (removedRecordingIdsRef.current.has(info.id)) return;
+    const mergeReady = (current: Recording): Recording => current.id === recording.id
+      ? {
+        ...current,
+        ...recording,
+        name: current.name.trim() || recording.name,
+        sourcePath: current.sourcePath,
+      }
+      : current;
+    setRecordings((current) => current.map(mergeReady));
+    if (editorTracksRef.current.some((track) => track.id === recording.id)) {
+      const nextTracks = editorTracksRef.current.map((track) => track.id === recording.id
+        ? { ...track, ...recording, name: track.name.trim() || recording.name }
+        : track);
+      editorTracksRef.current = nextTracks;
+      setEditorTracks(nextTracks);
+    }
+    void queueDenoise(recording);
+    setMessage(`${recording.name} is ready in the media pool.`);
   };
+  completeImportRef.current = completeImport;
 
   const completeDenoise = async (result: DenoiseResult) => {
+    if (removedRecordingIdsRef.current.has(result.recordingId)) return;
     if (currentDenoiseTasksRef.current.get(result.recordingId) !== result.taskId) return;
     if (selectedTrackIdRef.current === result.recordingId) {
       stopPlayback(true);
@@ -352,10 +427,13 @@ function App() {
       };
     };
     setRecordings((current) => current.map(replace));
-    setEditorTracks((current) => current.map(replace));
+    const nextTracks = editorTracksRef.current.map((recording) => replace(recording) as ReadyRecording);
+    editorTracksRef.current = nextTracks;
+    setEditorTracks(nextTracks);
   };
 
-  const queueDenoise = async (recording: Recording) => {
+  const queueDenoise = async (recording: ReadyRecording) => {
+    if (removedRecordingIdsRef.current.has(recording.id)) return;
     if (activeDenoiseRecordingsRef.current.has(recording.id)) return;
     activeDenoiseRecordingsRef.current.add(recording.id);
     const taskId = crypto.randomUUID();
@@ -364,7 +442,9 @@ function App() {
       ? { ...current, denoiseStatus: "queued", denoiseTaskId: taskId }
       : current;
     setRecordings((current) => current.map(markQueued));
-    setEditorTracks((current) => current.map(markQueued));
+    const queuedTracks = editorTracksRef.current.map((track) => markQueued(track) as ReadyRecording);
+    editorTracksRef.current = queuedTracks;
+    setEditorTracks(queuedTracks);
     try {
       const availability = await invoke<DenoiseAvailability>("denoise_availability", {
         sampleRate: recording.buffer.sampleRate,
@@ -374,7 +454,14 @@ function App() {
           denoiseStatus: "unavailable",
         });
         setRecordings((current) => current.map(markUnavailable));
-        setEditorTracks((current) => current.map(markUnavailable));
+        const unavailableTracks = editorTracksRef.current.map((track) => markUnavailable(track) as ReadyRecording);
+        editorTracksRef.current = unavailableTracks;
+        setEditorTracks(unavailableTracks);
+        if (currentDenoiseTasksRef.current.get(recording.id) === taskId) {
+          setMessage(availability.reason
+            ? `${recording.name}: ${availability.reason}`
+            : `${recording.name} will use normalized source audio.`);
+        }
         return;
       }
       await denoiseListenerReadyRef.current?.promise;
@@ -386,10 +473,15 @@ function App() {
         targetLufs,
       });
       await completeDenoise(result);
+      if (currentDenoiseTasksRef.current.get(recording.id) === taskId) {
+        setMessage(`${recording.name}: denoising complete.`);
+      }
     } catch (error) {
       const update = (current: Recording) => applyDenoiseUpdate(current, recording.id, taskId, { denoiseStatus: "failed" });
       setRecordings((current) => current.map(update));
-      setEditorTracks((current) => current.map(update));
+      const failedTracks = editorTracksRef.current.map((track) => update(track) as ReadyRecording);
+      editorTracksRef.current = failedTracks;
+      setEditorTracks(failedTracks);
       if (currentDenoiseTasksRef.current.get(recording.id) === taskId) {
         setMessage(String(error));
       }
@@ -401,6 +493,9 @@ function App() {
   };
 
   const startRecording = async () => {
+    if (isRecording || recordingTransitionRef.current) return;
+    recordingTransitionRef.current = true;
+    setIsRecordingTransitioning(true);
     try {
       await invoke("start_recording");
       recordingStartedAtRef.current = Date.now();
@@ -409,21 +504,52 @@ function App() {
       setMessage("Recording from the default microphone");
     } catch (error) {
       setMessage(String(error));
+    } finally {
+      recordingTransitionRef.current = false;
+      setIsRecordingTransitioning(false);
     }
   };
 
   const stopRecording = async () => {
+    if (!isRecording || recordingTransitionRef.current) return;
+    recordingTransitionRef.current = true;
+    setIsRecordingTransitioning(true);
     setIsRecording(false);
-    setIsProcessing(true);
+    const placeholderId = crypto.randomUUID();
+    const placeholder: Recording = {
+      ...createImportPlaceholder("recording.wav", placeholderId),
+      name: `Recording ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+      sourcePath: null,
+    };
+    setRecordings((current) => [...current, placeholder]);
     setMessage(`Measuring loudness and normalizing to ${targetLufs} LUFS`);
     try {
-      const recording = await loadRecording(await invoke<RecordingInfo>("stop_recording", { targetLufs }));
+      const recording = await decodeRecording(await invoke<RecordingInfo>("stop_recording", { targetLufs }));
+      setRecordings((current) => current.map((item) => item.id === placeholderId ? recording : item));
       void queueDenoise(recording);
-      setMessage("Recording is ready. Drag it into the editor.");
+      setMessage("Recording is ready in the media pool.");
     } catch (error) {
-      setMessage(String(error));
+      const failure = String(error);
+      setRecordings((current) => current.map((item) => item.id === placeholderId
+        ? { ...item, importStatus: "failed", importError: failure, denoiseStatus: "failed" }
+        : item));
+      setMessage(failure);
     } finally {
-      setIsProcessing(false);
+      recordingTransitionRef.current = false;
+      setIsRecordingTransitioning(false);
+    }
+  };
+
+  const startImportJob = async (recordingId: string, sourcePath: string) => {
+    try {
+      await importListenerReadyRef.current?.promise;
+      await invoke("start_import_audio", { recordingId, sourcePath, targetLufs });
+    } catch (error) {
+      const failure = String(error);
+      setRecordings((current) => current.map((recording) => recording.id === recordingId
+        ? { ...recording, importStatus: "failed", importError: failure, denoiseStatus: "failed" }
+        : recording));
+      setMessage(`Import failed for ${fileBasename(sourcePath)}: ${failure}`);
     }
   };
 
@@ -443,31 +569,77 @@ function App() {
     }
     const paths = selectedPaths(selection);
     if (!paths.length) return;
-    setIsProcessing(true);
-    setMessage(paths.length === 1
-      ? `Importing and normalizing audio to ${targetLufs} LUFS`
-      : `Importing and normalizing ${paths.length} files to ${targetLufs} LUFS`);
-    try {
-      let imported = 0;
-      let failed = 0;
-      let firstFailure: { path: string; error: string } | undefined;
-      for (const sourcePath of paths) {
-        try {
-          const recording = await loadRecording(await invoke<RecordingInfo>("import_audio", { sourcePath, targetLufs }));
-          imported += 1;
-          void queueDenoise(recording);
-        } catch (error) {
-          failed += 1;
-          firstFailure ??= { path: sourcePath, error: String(error) };
-        }
-      }
-      setMessage(importSummary(imported, failed, firstFailure));
-    } catch (error) {
-      setMessage(String(error));
-    } finally {
-      setIsProcessing(false);
+    const imports = paths.map((sourcePath) => ({ sourcePath, recordingId: crypto.randomUUID() }));
+    setRecordings((current) => [...current, ...imports.map(({ sourcePath, recordingId }) => createImportPlaceholder(sourcePath, recordingId))]);
+    setMessage(importQueuedSummary(imports.length));
+    for (const { sourcePath, recordingId } of imports) {
+      void startImportJob(recordingId, sourcePath);
     }
   };
+
+  useEffect(() => {
+    const importShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "i" || settingsOpen || isRecording) return;
+      event.preventDefault();
+      void importAudio();
+    };
+    window.addEventListener("keydown", importShortcut);
+    return () => window.removeEventListener("keydown", importShortcut);
+  });
+
+  const retryImport = (recording: Recording) => {
+    if (!recording.sourcePath) return;
+    setRecordings((current) => current.map((item) => item.id === recording.id
+      ? { ...item, importStatus: "normalizing", importError: null, denoiseStatus: "unavailable" }
+      : item));
+    setMessage(`Retrying ${recording.name}`);
+    void startImportJob(recording.id, recording.sourcePath);
+  };
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    const listenerReady = importListenerReadyRef.current;
+    void listen<ImportEvent>("import-status", async ({ payload }) => {
+      if (payload.status === "normalizing") {
+        setRecordings((current) => current.map((recording) => recording.id === payload.recordingId
+          ? { ...recording, importStatus: "normalizing", importError: null }
+          : recording));
+        return;
+      }
+      if (payload.status === "failed") {
+        setRecordings((current) => current.map((recording) => recording.id === payload.recordingId
+          ? { ...recording, importStatus: "failed", importError: payload.error, denoiseStatus: "failed" }
+          : recording));
+        setMessage(`Import failed for ${fileBasename(payload.sourcePath)}: ${payload.error}`);
+        return;
+      }
+      try {
+        await completeImportRef.current?.(payload.info);
+      } catch (error) {
+        const failure = String(error);
+        setRecordings((current) => current.map((recording) => recording.id === payload.info.id
+          ? { ...recording, importStatus: "failed", importError: failure, denoiseStatus: "failed" }
+          : recording));
+        setMessage(`Imported file could not be decoded: ${failure}`);
+      }
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+      listenerReady?.resolve();
+    }).catch((error) => {
+      if (disposed) return;
+      listenerReady?.reject(error);
+      setMessage(`Unable to monitor imports: ${String(error)}`);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -478,7 +650,9 @@ function App() {
         denoiseStatus: "processing",
       });
       setRecordings((current) => current.map(markProcessing));
-      setEditorTracks((current) => current.map(markProcessing));
+      const processingTracks = editorTracksRef.current.map((recording) => markProcessing(recording) as ReadyRecording);
+      editorTracksRef.current = processingTracks;
+      setEditorTracks(processingTracks);
     }).then((dispose) => {
       if (disposed) {
         dispose();
@@ -507,7 +681,7 @@ function App() {
       if (context.state === "suspended") await context.resume();
       if (playbackRequest !== playbackRequestRef.current) return;
       const keptRegions = getKeptRegions(selectedDeletedRegions, selectedTrack.buffer.duration);
-      const editedBuffer = createEditedBuffer(selectedTrack.buffer, selectedDeletedRegions, selectedTrack.envelopePoints);
+      const editedBuffer = createEditedBuffer(selectedTrack.buffer, selectedDeletedRegions, selectedTrack.envelopePoints, selectedTrack.mutedRegions);
       if (editedBuffer.duration === 0) {
         setMessage("All audio has been removed from this recording.");
         return;
@@ -557,21 +731,101 @@ function App() {
     }
   };
 
-  const updateSelectedTrack = (update: (track: Recording) => Recording) => {
+  const updateSelectedTrack = (update: (track: ReadyRecording) => ReadyRecording) => {
     if (!selectedTrackId) return;
-    setEditorTracks((current) => current.map((track) => track.id === selectedTrackId ? update(track) : track));
+    const next = editorTracksRef.current.map((track) => track.id === selectedTrackId ? update(track) : track);
+    editorTracksRef.current = next;
+    setEditorTracks(next);
   };
 
-  const updateTrack = (id: string, update: (track: Recording) => Recording) => {
-    setEditorTracks((current) => current.map((track) => track.id === id ? update(track) : track));
+  const updateTrack = (id: string, update: (track: ReadyRecording) => ReadyRecording) => {
+    const next = editorTracksRef.current.map((track) => track.id === id ? update(track) : track);
+    editorTracksRef.current = next;
+    setEditorTracks(next);
+  };
+
+  const commitTrackEdit = (
+    id: string,
+    _action: string,
+    update: (track: ReadyRecording) => ReadyRecording,
+    _coalesce = false,
+  ) => {
+    const track = editorTracksRef.current.find((candidate) => candidate.id === id);
+    if (!track) return;
+    const next = update(track);
+    if (next === track) return;
+    const nextTracks = editorTracksRef.current.map((candidate) => candidate.id === id ? next : candidate);
+    editorTracksRef.current = nextTracks;
+    setEditorTracks(nextTracks);
+  };
+
+  const toggleSelectedRangeMute = () => {
+    if (!selectedTrack?.selectedRange || selectedTrack.collapsed) return;
+    const range = selectedTrack.selectedRange;
+    stopPlayback(false);
+    const unmute = regionIsCovered(selectedTrack.mutedRegions, range);
+    commitTrackEdit(selectedTrack.id, unmute ? "unmute range" : "mute range", (track) => ({
+      ...track,
+      mutedRegions: unmute
+        ? subtractRegion(track.mutedRegions, range)
+        : mergeRegions(track.mutedRegions, range),
+      selectedRange: null,
+    }));
+    setMessage(`${unmute ? "Restored sound to" : "Muted"} ${formatTimeStandard(range.end - range.start)}`);
+  };
+
+  const toggleTrackRangeMute = (trackId: string) => {
+    const track = editorTracksRef.current.find((candidate) => candidate.id === trackId);
+    if (!track?.selectedRange || track.collapsed) return;
+    const range = track.selectedRange;
+    stopPlayback(false);
+    const unmute = regionIsCovered(track.mutedRegions, range);
+    commitTrackEdit(trackId, unmute ? "unmute range" : "mute range", (current) => ({
+      ...current,
+      mutedRegions: unmute
+        ? subtractRegion(current.mutedRegions, range)
+        : mergeRegions(current.mutedRegions, range),
+      selectedRange: null,
+    }));
+    setMessage(`${unmute ? "Restored sound to" : "Muted"} ${formatTimeStandard(range.end - range.start)}`);
+  };
+
+  const directEditTrackRange = (trackId: string, start: number, end: number, operation: "delete" | "restore") => {
+    const track = editorTracksRef.current.find((candidate) => candidate.id === trackId);
+    if (!track || track.collapsed || end - start <= 0.01) return;
+    const range = { start, end };
+    stopPlayback(false);
+    commitTrackEdit(trackId, operation === "delete" ? "delete audio" : "restore audio", (current) => operation === "delete"
+      ? {
+        ...current,
+        manualDeletedRegions: mergeRegions(current.manualDeletedRegions, range),
+        selectedRange: null,
+      }
+      : {
+        ...current,
+        manualDeletedRegions: subtractRegion(current.manualDeletedRegions, range),
+        silenceRegions: subtractRegion(current.silenceRegions, range),
+        selectedRange: null,
+      });
+    setMessage(`${operation === "delete" ? "Deleted" : "Restored"} ${formatTimeStandard(end - start)} with right-drag`);
   };
 
   const moveToEditor = (id: string) => {
     const recording = recordings.find((item) => item.id === id);
     if (!recording) return;
+    if (!isRecordingReady(recording)) {
+      setMessage(recording.importStatus === "failed"
+        ? `${recording.name} failed to import.`
+        : `${recording.name} is still normalizing.`);
+      return;
+    }
     stopPlayback(false);
-    setEditorTracks((current) => appendUniqueTrack(current, recording));
+    const nextTracks = appendUniqueTrack(editorTracksRef.current, recording);
+    editorTracksRef.current = nextTracks;
+    setEditorTracks(nextTracks);
     setSelectedTrackId(recording.id);
+    selectedTrackIdRef.current = recording.id;
+    setSelectedSourceId(null);
     setRecordings((current) => current.filter((item) => item.id !== id));
     setCurrentTime(0);
     playbackOffsetRef.current = 0;
@@ -579,10 +833,13 @@ function App() {
     setMessage("Editing selected recording");
   };
 
-  const selectAfterTrackRemoval = (removedId: string) => {
-    const nextTrack = editorTracks.find((track) => track.id !== removedId) ?? null;
-    setEditorTracks((current) => current.filter((track) => track.id !== removedId));
+  const selectAfterTrackRemoval = (removedId: string, selectNext = true) => {
+    const nextTracks = editorTracksRef.current.filter((track) => track.id !== removedId);
+    const nextTrack = selectNext ? nextTracks[0] ?? null : null;
+    editorTracksRef.current = nextTracks;
+    setEditorTracks(nextTracks);
     setSelectedTrackId(nextTrack?.id ?? null);
+    selectedTrackIdRef.current = nextTrack?.id ?? null;
     setCurrentTime(0);
     playbackOffsetRef.current = 0;
     editedPlaybackOffsetRef.current = 0;
@@ -592,15 +849,24 @@ function App() {
     if (!selectedTrack) return;
     stopPlayback(false);
     setRecordings((current) => appendUniqueTrack(current, selectedTrack));
-    selectAfterTrackRemoval(selectedTrack.id);
+    setSelectedSourceId(selectedTrack.id);
+    selectAfterTrackRemoval(selectedTrack.id, false);
     setMessage("Recording returned to the library");
   };
 
-  const removeTrack = () => {
-    if (!selectedTrack) return;
+  const invalidateRemovedRecording = (id: string) => {
+    removedRecordingIdsRef.current.add(id);
+    currentDenoiseTasksRef.current.delete(id);
+    activeDenoiseRecordingsRef.current.delete(id);
+  };
+
+  const removeTrack = (trackId: string) => {
+    const track = editorTracksRef.current.find((candidate) => candidate.id === trackId);
+    if (!track) return;
     stopPlayback(false);
-    selectAfterTrackRemoval(selectedTrack.id);
-    setMessage("Track removed from the editor");
+    invalidateRemovedRecording(track.id);
+    selectAfterTrackRemoval(track.id);
+    setMessage(`${track.name} deleted from the timeline`);
   };
 
   const handleDrop = (event: React.DragEvent<HTMLElement>) => {
@@ -616,15 +882,28 @@ function App() {
   };
 
   const removeRecording = (id: string) => {
+    const recording = recordings.find((item) => item.id === id);
+    if (!recording) return;
+    invalidateRemovedRecording(recording.id);
     setRecordings((current) => current.filter((recording) => recording.id !== id));
-    setRecordingContextMenu(null);
-    setMessage("Recording deleted from the library");
+    setSelectedSourceId(null);
+    setMessage(`${recording.name} deleted from the source shelf`);
+  };
+
+  const deleteSelectedItem = () => {
+    if (selectedSource) {
+      removeRecording(selectedSource.id);
+      return;
+    }
+    if (selectedTrack) removeTrack(selectedTrack.id);
   };
 
   const exportTracks = async (tracks: Recording[], singleTrack = false) => {
     if (!tracks.length || exportInProgressRef.current || !canExportTracks(tracks)) return;
     exportInProgressRef.current = true;
     setIsProcessing(true);
+    setExportingTrackIds(tracks.map((track) => track.id));
+    setFailedExportTrackIds((current) => current.filter((id) => !tracks.some((track) => track.id === id)));
     stopPlayback(true);
     try {
       let destinationDir: string | string[] | null;
@@ -650,10 +929,12 @@ function App() {
           name: track.name,
           sourcePath: track.path,
           deletedRegions: combineRegions(track.manualDeletedRegions, track.silenceRegions),
+          mutedRegions: track.mutedRegions,
           envelopePoints: track.envelopePoints,
         })),
       });
       const failures = results.filter((result) => result.error);
+      setFailedExportTrackIds(failures.map((result) => result.recordingId));
       const successfulSignatures = new Map(
         results
           .filter((result) => !result.error && result.path)
@@ -668,7 +949,9 @@ function App() {
           const signature = successfulSignatures.get(track.id);
           return signature ? { ...track, lastExportSignature: signature } : track;
         };
-        setEditorTracks((current) => current.map(markExported));
+        const exportedTracks = editorTracksRef.current.map((track) => markExported(track) as ReadyRecording);
+        editorTracksRef.current = exportedTracks;
+        setEditorTracks(exportedTracks);
         setRecordings((current) => current.map(markExported));
       }
       if (failures.length) {
@@ -677,13 +960,15 @@ function App() {
       } else {
         setMessage(singleTrack
           ? `Exported ${tracks[0].name} to ${destinationDir}`
-          : `Exported ${results.length} changed tracks to ${destinationDir}`);
+          : `Exported ${results.length} changed timeline tracks to ${destinationDir}`);
       }
     } catch (error) {
+      setFailedExportTrackIds(tracks.map((track) => track.id));
       setMessage(String(error));
     } finally {
       exportInProgressRef.current = false;
       setIsProcessing(false);
+      setExportingTrackIds([]);
     }
   };
 
@@ -691,6 +976,10 @@ function App() {
     const changedTracks = editorTracks.filter(needsExport);
     if (!changedTracks.length) {
       setMessage("All editor tracks are already exported.");
+      return;
+    }
+    if (!canExportTracks(changedTracks)) {
+      setMessage("Changed tracks are not ready to export yet.");
       return;
     }
     void exportTracks(changedTracks);
@@ -709,177 +998,257 @@ function App() {
       threshold: dbfsToAmplitude(selectedTrack.silenceThresholdDb),
       minDuration: selectedTrack.minimumSilenceDurationMs / 1_000,
     });
-    updateSelectedTrack((track) => ({ ...track, silenceRegions, silenceDetectionEnabled: true }));
+    commitTrackEdit(selectedTrack.id, "detect silence", (track) => ({
+      ...track,
+      silenceRegions,
+      silenceDetectionEnabled: true,
+      selectedRange: null,
+    }));
   };
 
-  return (
-    <main className="app-shell">
-      <section className={`recording-panel ${recordings.length || isRecording || isProcessing ? "has-content" : "is-empty"}`} aria-label="Recording">
-        <header className="panel-header">
-          <div className="window-drag-area" data-tauri-drag-region><p className="eyebrow">Recording</p><h1>Simple Audio Cut</h1></div>
-          <div className="recording-actions">
-            <button type="button" className={isRecording ? "record-button is-active" : "record-button"} onClick={isRecording ? stopRecording : startRecording} disabled={isProcessing} aria-label={isRecording ? "Stop recording" : "Start recording"}>
-              <span className="record-symbol" />{isRecording ? formatTimeStandard(recordingSeconds) : "Record"}
-            </button>
-            <button type="button" onClick={importAudio} disabled={isRecording || isProcessing}>Import</button>
-            <button type="button" className="lufs-target-button" aria-label="Loudness normalization target" disabled={isRecording || isProcessing} onWheel={(event) => {
-              if (event.deltaY === 0) return;
-              event.preventDefault();
-              setTargetLufs((current) => Math.max(-70, Math.min(-5, current + (event.deltaY < 0 ? 1 : -1))));
-            }}>{targetLufs} LUFS</button>
-            <div className="window-controls">
-              <button type="button" className="window-control minimize-control" aria-label="Minimize window" onClick={() => void getCurrentWindow().minimize()} />
-              <button type="button" className="window-control maximize-control" aria-label="Maximize window" onClick={() => void getCurrentWindow().toggleMaximize()} />
-              <button type="button" className="window-control close-control" aria-label="Close window" onClick={() => void getCurrentWindow().close()} />
-            </div>
-          </div>
-        </header>
-        {(recordings.length > 0 || isRecording || isProcessing) && <div className="recording-content">
-          <p className="status-line">{isProcessing ? "Processing audio locally" : message}</p>
-          <div className="recording-library">
-            {recordings.map((recording) => (
-              <article key={recording.id} className="recording-item" draggable onDragStart={(event) => event.dataTransfer.setData("application/simple-audio-cut-recording", recording.id)} onContextMenu={(event) => {
-                event.preventDefault();
-                setRecordingContextMenu({
-                  recordingId: recording.id,
-                  x: Math.min(event.clientX, window.innerWidth - 132),
-                  y: Math.min(event.clientY, window.innerHeight - 44),
-                });
-              }}>
-                <div className="recording-details"><input aria-label="Recording name" className="recording-name" defaultValue={recording.name} onBlur={(event) => renameRecording(recording.id, event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} onDragStart={(event) => event.stopPropagation()} /><span>{formatTimeStandard(recording.durationSeconds)}</span></div>
-                <div className="recording-meta"><span className="lufs-badge">{recording.integratedLufs?.toFixed(1) ?? "--"} LUFS</span><span className={recording.denoiseStatus === "queued" || recording.denoiseStatus === "processing" ? "denoise-processing" : recording.denoiseStatus === "failed" ? "denoise-failed" : ""}>{denoiseLabel(recording)}</span></div>
-              </article>
-            ))}
-          </div>
-        </div>}
-        {recordingContextMenu && <div ref={recordingContextMenuRef} className="recording-context-menu" role="menu" style={{ left: recordingContextMenu.x, top: recordingContextMenu.y }}>
-          <button type="button" role="menuitem" onClick={() => removeRecording(recordingContextMenu.recordingId)}>Delete</button>
-        </div>}
-      </section>
+  const updateSilenceSettings = (partial: Partial<Pick<ReadyRecording, "silenceThresholdDb" | "minimumSilenceDurationMs">>) => {
+    if (!selectedTrack) return;
+    const nextThreshold = partial.silenceThresholdDb ?? selectedTrack.silenceThresholdDb;
+    const nextDuration = partial.minimumSilenceDurationMs ?? selectedTrack.minimumSilenceDurationMs;
+    const silenceRegions = selectedTrack.silenceDetectionEnabled
+      ? detectSilence(selectedTrack.buffer, {
+        threshold: dbfsToAmplitude(nextThreshold),
+        minDuration: nextDuration / 1_000,
+      })
+      : selectedTrack.silenceRegions;
+    commitTrackEdit(selectedTrack.id, "silence settings", (track) => ({
+      ...track,
+      ...partial,
+      silenceRegions,
+    }), true);
+  };
 
-      <div className="panel-divider" />
+  const clearSilenceCuts = () => {
+    if (!selectedTrack?.silenceDetectionEnabled) return;
+    commitTrackEdit(selectedTrack.id, "clear silence cuts", (track) => ({
+      ...track,
+      silenceRegions: [],
+      silenceDetectionEnabled: false,
+    }));
+  };
 
-      <section className="editor-panel" aria-label="Editor" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
-        <header className="panel-header editor-header">
-          <div className="editor-heading"><p className="eyebrow">Editor</p><h2>{selectedTrack ? selectedTrack.name : "Drop a recording here"}</h2></div>
-          {selectedTrack && <div className="editor-actions">
-            <button type="button" className="play-button" onClick={() => isPlaying ? stopPlayback(true) : startPlayback(playbackOffsetRef.current)}>{isPlaying ? formatTimeStandard(currentTime) : "Play"}</button>
-            <fieldset className="silence-control" aria-label="Silence threshold" onMouseLeave={() => {
-              setSilenceControlOpen(false);
-              setSilencePrecision(0);
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const key = event.key.toLowerCase();
+      if ((event.ctrlKey || event.metaKey) && key === ",") {
+        event.preventDefault();
+        setSettingsOpen(true);
+        return;
+      }
+      if (target?.closest("input, textarea, select, [contenteditable='true']") || settingsOpen) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (key === " " || key === "k") {
+        event.preventDefault();
+        if (!selectedTrack) return;
+        if (isPlaying) stopPlayback(true);
+        else void startPlayback(playbackOffsetRef.current);
+        return;
+      }
+      if (key === "j") {
+        event.preventDefault();
+        const next = Math.max(0, playbackOffsetRef.current - 5);
+        playbackOffsetRef.current = next;
+        setCurrentTime(next);
+        if (isPlaying) void startPlayback(next);
+        return;
+      }
+      if (key === "l") {
+        event.preventDefault();
+        const next = Math.min(selectedTrack?.buffer.duration ?? 0, playbackOffsetRef.current + 5);
+        playbackOffsetRef.current = next;
+        setCurrentTime(next);
+        if (selectedTrack) void startPlayback(next);
+        return;
+      }
+      if (key === "m") {
+        event.preventDefault();
+        toggleSelectedRangeMute();
+        return;
+      }
+      if (key === "b" || key === "c") {
+        event.preventDefault();
+        setBladeActive(true);
+        setMessage("Blade active. Click the waveform to add an edit point; press A to return.");
+        return;
+      }
+      if (key === "a" || key === "v") {
+        event.preventDefault();
+        setBladeActive(false);
+        setMessage("Direct editing active. Drag the waveform to select a range.");
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  });
+
+  return <main className="app-shell">
+    <header className="titlebar">
+      <div className="titlebar-brand" data-tauri-drag-region>
+        <img className="app-mark" src={APP_ICON_URL} alt="" />
+        <div><h1>Simple Audio Cut</h1><span>Local spoken-word editor</span></div>
+      </div>
+      <div className="titlebar-tools">
+        <button type="button" className={isRecording ? "record-button is-active" : "record-button"} onClick={isRecording ? stopRecording : startRecording} disabled={isProcessing || isRecordingTransitioning}>
+          <Icon name={isRecording ? "pause" : "record"} />
+          <span>{isRecording ? "Stop" : "Record"}</span>
+          {isRecording && <strong>{formatTimeStandard(recordingSeconds)}</strong>}
+        </button>
+        <button type="button" className="import-button" onClick={() => void importAudio()} disabled={isRecording}>
+          <Icon name="import" /><span>Import</span>
+        </button>
+        <label className="loudness-setting">
+          <span><strong>Normalization</strong></span>
+          <span className="number-field"><input aria-label="Normalization target" type="number" min="-70" max="-5" step="1" value={targetLufs} disabled={isRecording || pendingImportCount > 0} onChange={(event) => setTargetLufs(Math.max(-70, Math.min(-5, Number(event.target.value) || -14)))} /><b>LUFS</b></span>
+        </label>
+        <button type="button" className="delete-selection-button" onClick={deleteSelectedItem} disabled={isProcessing || (!selectedSource && !selectedTrack)} aria-label={selectedSource ? "Delete selected source" : selectedTrack ? "Delete selected track" : "Delete selected item"} title={selectedSource ? `Delete source: ${selectedSource.name}` : selectedTrack ? `Delete track: ${selectedTrack.name}` : "Select a source or track to delete"}><Icon name="remove" /></button>
+      </div>
+      <div className="titlebar-actions">
+        <div className="titlebar-session" data-tauri-drag-region>
+          <span className={hasUnsavedWork ? "session-dot has-changes" : "session-dot"} />
+          {hasUnsavedWork ? [unexportedSessionCount > 0 ? `${unexportedSessionCount} unexported` : "", activeTaskCount > 0 ? `${activeTaskCount} processing` : ""].filter(Boolean).join(" · ") : "Up to date"}
+        </div>
+        <button type="button" className={`provider-button ${denoiseProviderStatus?.ready ? "is-ready" : "needs-setup"}`} onClick={() => setSettingsOpen(true)} title={denoiseProviderStatus?.summary ?? "Open denoising settings"}>
+          <span className="provider-status-dot" />{denoiseProviderStatus?.providerName ?? "Denoising"}<Icon name="settings" />
+        </button>
+      </div>
+    </header>
+
+    <div className="workspace">
+      <aside className="media-panel" aria-label="Media pool">
+        <div className="media-list-scroll">
+          {recordings.length === 0 ? <div className="media-empty">
+            <Icon name="volume" size={20} />
+            <span><strong>No source media</strong><small>Record or import audio to begin</small></span>
+          </div> : <div className="media-list">{recordings.map((recording) => {
+            const ready = isRecordingReady(recording);
+            const processing = recording.importStatus === "normalizing" || recording.denoiseStatus === "queued" || recording.denoiseStatus === "processing";
+            const selectSource = () => {
+              if (selectedTrackId) stopPlayback(false);
+              setSelectedSourceId(recording.id);
+              setSelectedTrackId(null);
+              selectedTrackIdRef.current = null;
+            };
+            return <article key={recording.id} className={`media-item ${ready ? "is-ready" : "is-unavailable"} ${recording.id === selectedSourceId ? "is-selected" : ""} ${recording.importStatus === "failed" ? "has-error" : ""}`} draggable={ready} aria-current={recording.id === selectedSourceId ? "true" : undefined} aria-disabled={!ready} onMouseDownCapture={selectSource} onFocusCapture={selectSource} onDragStart={(event) => {
+              if (!ready) return event.preventDefault();
+              event.dataTransfer.setData("application/simple-audio-cut-recording", recording.id);
             }}>
-              {silenceControlOpen ? <div className="silence-wheel" onWheel={(event) => {
-                if (event.deltaY === 0) return;
-                event.preventDefault();
-                const step = 10 ** -silencePrecision;
-                const direction = event.deltaY < 0 ? 1 : -1;
-                updateSelectedTrack((track) => {
-                  const next = Math.round(track.silenceThresholdDb / step) * step + direction * step;
-                  return {
-                    ...track,
-                    silenceThresholdDb: Math.max(-70, Math.min(-12, Number(next.toFixed(silencePrecision)))),
-                  };
-                });
-              }}>
-                <span>{Math.min(-12, selectedSilenceThresholdDb + 10 ** -silencePrecision).toFixed(silencePrecision)} dBFS</span>
-                <button type="button" className="silence-button silence-wheel-center" onClick={() => setSilencePrecision((current) => Math.max(0, current - 1) as 0 | 1 | 2)} onContextMenu={(event) => {
-                  event.preventDefault();
-                  setSilencePrecision((current) => Math.min(2, current + 1) as 0 | 1 | 2);
-                }}><span className="silence-label is-threshold">{selectedSilenceThresholdDb.toFixed(silencePrecision)} dBFS</span></button>
-                <span>{Math.max(-70, selectedSilenceThresholdDb - 10 ** -silencePrecision).toFixed(silencePrecision)} dBFS</span>
-              </div> : <button type="button" className="silence-button" onClick={markSilence} onContextMenu={(event) => {
-                event.preventDefault();
-                setSilencePrecision(0);
-                setSilenceControlOpen(true);
-              }}><span className="silence-label">Mark silence</span></button>}
-            </fieldset>
-            <fieldset className="silence-duration-control" aria-label="Minimum silence duration" onMouseLeave={() => setSilenceDurationControlOpen(false)}>
-              {silenceDurationControlOpen ? <div className="silence-duration-wheel" onWheel={(event) => {
-                if (event.deltaY === 0) return;
-                event.preventDefault();
-                const direction = event.deltaY < 0 ? 10 : -10;
-                updateSelectedTrack((track) => ({
-                  ...track,
-                  minimumSilenceDurationMs: Math.max(0, Math.min(5_000, track.minimumSilenceDurationMs + direction)),
-                }));
-              }}>
-                <span>{Math.min(5_000, selectedMinimumSilenceDurationMs + 10)} ms</span>
-                <button type="button" className="silence-duration-button" onClick={() => setSilenceDurationControlOpen(false)} onContextMenu={(event) => {
-                  event.preventDefault();
-                  setSilenceDurationControlOpen(false);
-                }}>{selectedMinimumSilenceDurationMs} ms</button>
-                <span>{Math.max(0, selectedMinimumSilenceDurationMs - 10)} ms</span>
-              </div> : <button type="button" className="silence-duration-button" onClick={() => setSilenceDurationControlOpen(true)} onContextMenu={(event) => {
-                event.preventDefault();
-                setSilenceDurationControlOpen(true);
-              }}>{selectedMinimumSilenceDurationMs} ms</button>}
-            </fieldset>
-            <button type="button" className={selectedTrack.collapsed ? "collapse-button is-active" : "collapse-button"} onClick={() => updateSelectedTrack((track) => ({ ...track, collapsed: !track.collapsed }))} disabled={selectedDeletedRegions.length === 0}>{selectedTrack.collapsed ? "Show cuts" : "Collapse cuts"}</button>
-            <button type="button" className="return-button" onClick={returnToLibrary} disabled={isProcessing}>Return</button>
-            <button type="button" className="remove-track-button" onClick={removeTrack} disabled={isProcessing}>Remove</button>
-            <button type="button" className="export-button" onClick={exportChangedTracks} disabled={isProcessing || pendingExportCount === 0 || !canExportTracks(editorTracks)} title={pendingExportCount === 0 ? "All tracks are up to date" : "Export new and changed tracks"}>Export all ({pendingExportCount})</button>
-          </div>}
+              <div className="media-item-icon"><Icon name={recording.importStatus === "failed" ? "warning" : "volume"} /></div>
+              <div className="media-item-body">
+                <input aria-label="Media name" className="media-name" value={recording.name} disabled={!ready} onChange={(event) => setRecordings((current) => current.map((item) => item.id === recording.id ? { ...item, name: event.target.value } : item))} onBlur={(event) => renameRecording(recording.id, event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} onDragStart={(event) => event.stopPropagation()} />
+                <div className="media-item-meta"><span>{ready ? formatTimeStandard(recording.durationSeconds) : "--:--"}</span><span>{recording.integratedLufs?.toFixed(1) ?? "--"} LUFS</span></div>
+                <div className={`media-state ${recordingStatusClass(recording)}`}>{processing && <span className="activity-spinner" />}{denoiseLabel(recording)}</div>
+                {recording.importError && <p className="media-error" title={recording.importError}>{recording.importError}</p>}
+              </div>
+              <div className="media-item-actions">
+                {recording.importStatus === "failed" && recording.sourcePath && <button type="button" onClick={() => retryImport(recording)}>Retry</button>}
+                <button type="button" className="add-timeline-button" onClick={() => moveToEditor(recording.id)} disabled={!ready} title="Add to timeline" aria-label={`Add ${recording.name} to timeline`}><Icon name="add" /></button>
+              </div>
+              {processing && <span className="media-progress" />}
+            </article>;
+          })}</div>}
+        </div>
+      </aside>
+
+      <section className="timeline-panel" aria-label="Timeline editor" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
+        <header className="timeline-heading">
+          <div className="timeline-title"><p className="section-kicker">Timeline</p><h2>{selectedTrack?.name ?? (editorTracks.length ? "Select a track" : "Untitled session")}</h2></div>
+          <div className="timeline-playback">
+            <button type="button" className="play-control" onClick={() => isPlaying ? stopPlayback(true) : void startPlayback(playbackOffsetRef.current)} disabled={!selectedTrack} title="Play / pause (Space)"><Icon name={isPlaying ? "pause" : "play"} /></button>
+            <span className="timecode"><strong>{formatTimeStandard(currentTime)}</strong><i>/</i><span>{formatTimeStandard(selectedTrack?.buffer.duration ?? 0)}</span></span>
+          </div>
+          <div className="timeline-heading-meta"><span>{editorTracks.length} {editorTracks.length === 1 ? "track" : "tracks"}</span><span>{pendingExportCount} changed</span></div>
+          <button type="button" className="export-button" onClick={exportChangedTracks} disabled={isProcessing || pendingExportCount === 0}>
+            {isProcessing ? <span className="activity-spinner" /> : <Icon name="export" />}<span>{isProcessing ? "Exporting" : "Export changed"}</span>{pendingExportCount > 0 && <b>{pendingExportCount}</b>}
+          </button>
         </header>
-        <div className="editor-content">
+
+        {selectedTrack && <div className="inspector-bar">
+          <div className="inspector-group silence-inspector">
+            <span className="inspector-label">Silence</span>
+            <label><span>Threshold</span><input type="number" min="-70" max="-12" step="1" value={selectedSilenceThresholdDb} onChange={(event) => updateSilenceSettings({ silenceThresholdDb: Math.max(-70, Math.min(-12, Number(event.target.value))) })} /><b>dBFS</b></label>
+            <label><span>Minimum</span><input type="number" min="0" max="5000" step="10" value={selectedMinimumSilenceDurationMs} onChange={(event) => updateSilenceSettings({ minimumSilenceDurationMs: Math.max(0, Math.min(5_000, Number(event.target.value))) })} /><b>ms</b></label>
+            <button type="button" className={selectedTrack.silenceDetectionEnabled ? "compact-button is-active" : "compact-button"} onClick={selectedTrack.silenceDetectionEnabled ? clearSilenceCuts : markSilence}>{selectedTrack.silenceDetectionEnabled ? "Silence cuts on" : "Detect silence"}</button>
+          </div>
+          <div className="direct-edit-hint"><span>Right-drag right: delete · left: restore</span><span>Click yellow curve to add a point</span><span>Drag points to shape loudness</span></div>
+          <div className="inspector-group track-actions">
+            <button type="button" className="track-menu-button" onClick={(event) => setTrackContextMenu({ trackId: selectedTrack.id, x: Math.max(4, event.currentTarget.getBoundingClientRect().right - 174), y: event.currentTarget.getBoundingClientRect().bottom + 4, kind: "actions" })} aria-label="Track actions" title="Track actions">•••</button>
+          </div>
+        </div>}
+
+        <div className={bladeActive ? "timeline-content is-blade-active" : "timeline-content"}>
           {editorTracks.length > 0 ? <div className="editor-tracks">{editorTracks.map((track) => {
             const deletedRegions = combineRegions(track.manualDeletedRegions, track.silenceRegions);
             const isSelected = track.id === selectedTrackId;
-            return <EditorTrack key={track.id} name={track.name} status={denoiseLabel(track)} statusKind={track.denoiseStatus} exportPending={needsExport(track)} buffer={track.buffer} selected={isSelected} collapsed={track.collapsed} currentTime={isSelected ? currentTime : 0} pixelsPerSecond={track.pixelsPerSecond} deletedRegions={deletedRegions} envelopePoints={track.envelopePoints} silenceThresholdDb={track.silenceThresholdDb} onSelect={() => {
+            const exportState = exportingTrackIds.includes(track.id)
+              ? "exporting"
+              : failedExportTrackIds.includes(track.id)
+                ? "failed"
+                : needsExport(track)
+                  ? "pending"
+                  : "exported";
+            return <EditorTrack key={track.id} name={track.name} status={denoiseLabel(track)} statusKind={track.denoiseStatus} exportState={exportState} buffer={track.buffer} selected={isSelected} collapsed={track.collapsed} currentTime={isSelected ? currentTime : 0} bladeActive={bladeActive} pixelsPerSecond={track.pixelsPerSecond} deletedRegions={deletedRegions} mutedRegions={track.mutedRegions} editPoints={track.editPoints} selectedRange={isSelected ? track.selectedRange : null} envelopePoints={track.envelopePoints} silenceThresholdDb={track.silenceThresholdDb} onSelect={() => {
+              setSelectedSourceId(null);
               if (track.id === selectedTrackId) return;
-              stopPlayback(false);
-              setSelectedTrackId(track.id);
-              setCurrentTime(0);
-              playbackOffsetRef.current = 0;
-              editedPlaybackOffsetRef.current = 0;
-            }} onScaleContextMenu={(x, y) => {
-              setTrackContextMenu({
-                trackId: track.id,
-                x: Math.max(4, Math.min(x, window.innerWidth - 144)),
-                y: Math.max(4, Math.min(y, window.innerHeight - 44)),
-              });
-            }} onScale={(deltaY) => updateTrack(track.id, (current) => ({
-              ...current,
-              pixelsPerSecond: Math.max(0.25, current.pixelsPerSecond * (deltaY < 0 ? 1.15 : 1 / 1.15)),
-            }))} onSeek={(time) => {
-              setCurrentTime(time);
-              playbackOffsetRef.current = time;
-              if (isPlaying && isSelected) void startPlayback(time);
-            }} onRegionAdd={(start, end) => {
-              stopPlayback(false);
-              updateTrack(track.id, (current) => ({ ...current, manualDeletedRegions: mergeRegions(current.manualDeletedRegions, { start, end }) }));
-            }} onRegionRemove={(start, end) => {
-              stopPlayback(false);
-              updateTrack(track.id, (current) => ({
-                ...current,
-                manualDeletedRegions: subtractRegion(current.manualDeletedRegions, { start, end }),
-                silenceRegions: subtractRegion(current.silenceRegions, { start, end }),
-              }));
+              stopPlayback(false); setSelectedTrackId(track.id); selectedTrackIdRef.current = track.id; setCurrentTime(0); playbackOffsetRef.current = 0; editedPlaybackOffsetRef.current = 0;
+            }} onScaleContextMenu={(x, y) => setTrackContextMenu({ trackId: track.id, x: Math.max(4, Math.min(x, window.innerWidth - 156)), y: Math.max(4, Math.min(y, window.innerHeight - 52)), kind: "export" })} onScale={(deltaY) => updateTrack(track.id, (current) => ({ ...current, pixelsPerSecond: Math.max(0.25, current.pixelsPerSecond * (deltaY < 0 ? 1.15 : 1 / 1.15)) }))} onSeek={(time) => {
+              setCurrentTime(time); playbackOffsetRef.current = time; updateTrack(track.id, (current) => ({ ...current, selectedRange: null })); if (isPlaying && isSelected) void startPlayback(time);
+            }} onRangeSelect={(start, end) => {
+              setSelectedTrackId(track.id); selectedTrackIdRef.current = track.id; updateTrack(track.id, (current) => ({ ...current, selectedRange: { start, end } })); setMessage(`Range selected: ${formatTimeStandard(end - start)}. Press M to mute or restore sound.`);
+            }} onDirectRegionEdit={(start, end, operation) => {
+              setSelectedTrackId(track.id); selectedTrackIdRef.current = track.id; directEditTrackRange(track.id, start, end, operation);
+            }} onRegionRestore={(region) => {
+              stopPlayback(false); commitTrackEdit(track.id, "restore audio", (current) => ({ ...current, manualDeletedRegions: subtractRegion(current.manualDeletedRegions, region), silenceRegions: subtractRegion(current.silenceRegions, region), selectedRange: null }));
+            }} onRangeMuteToggle={() => toggleTrackRangeMute(track.id)} onEditPointRemove={(time) => {
+              commitTrackEdit(track.id, "remove edit point", (current) => ({ ...current, editPoints: current.editPoints.filter((point) => Math.abs(point - time) >= 0.01) }));
+            }} onBlade={(time) => {
+              stopPlayback(false); commitTrackEdit(track.id, "add edit point", (current) => ({ ...current, editPoints: addEditPoint(current.editPoints, time, current.buffer.duration), selectedRange: null })); setCurrentTime(time); playbackOffsetRef.current = time; setMessage(`Edit point added at ${formatTimeStandard(time)}`);
             }} onEnvelopePointAdd={(point) => {
-              stopPlayback(false);
-              updateTrack(track.id, (current) => ({ ...current, envelopePoints: [...current.envelopePoints, point].sort((left, right) => left.time - right.time) }));
+              stopPlayback(false); commitTrackEdit(track.id, "add volume keyframe", (current) => ({ ...current, envelopePoints: [...current.envelopePoints, point].sort((left, right) => left.time - right.time) }));
             }} onEnvelopePointMove={(id, time, gain) => {
-              stopPlayback(false);
-              updateTrack(track.id, (current) => ({
-                ...current,
-                envelopePoints: current.envelopePoints
-                  .map((point) => point.id === id ? { ...point, time: Math.max(0, Math.min(current.buffer.duration, time)), gain: Math.max(0, Math.min(2, gain)) } : point)
-                  .sort((left, right) => left.time - right.time),
-              }));
+              stopPlayback(false); commitTrackEdit(track.id, "move volume keyframe", (current) => ({ ...current, envelopePoints: current.envelopePoints.map((point) => point.id === id ? { ...point, time: Math.max(0, Math.min(current.buffer.duration, time)), gain: Math.max(0, Math.min(2, gain)) } : point).sort((left, right) => left.time - right.time) }), true);
             }} onEnvelopePointRemove={(id) => {
-              stopPlayback(false);
-              updateTrack(track.id, (current) => ({
-                ...current,
-                envelopePoints: current.envelopePoints.filter((point) => point.id !== id),
-              }));
+              stopPlayback(false); commitTrackEdit(track.id, "remove volume keyframe", (current) => ({ ...current, envelopePoints: current.envelopePoints.filter((point) => point.id !== id) }));
             }} />;
-          })}</div> : <div className="editor-empty">Drag completed recordings from above into this area.</div>}
+          })}</div> : <div className="timeline-empty">
+            <span className="timeline-empty-mark"><Icon name="add" size={24} /></span>
+            <h3>Build your timeline</h3>
+            <p>Add a ready item from the media pool or drag it here. Each take stays independent and exports as its own WAV file.</p>
+            <div><span><kbd>Drag</kbd> Select range</span><span><kbd>Right-drag →</kbd> Delete</span><span><kbd>Right-drag ←</kbd> Restore</span><span><kbd>Space</kbd> Play</span></div>
+          </div>}
         </div>
-        {trackContextMenu && <div ref={trackContextMenuRef} className="track-context-menu" role="menu" style={{ left: trackContextMenu.x, top: trackContextMenu.y }}>
-          <button type="button" role="menuitem" disabled={isProcessing || !canExportTracks(editorTracks.filter((track) => track.id === trackContextMenu.trackId))} onClick={() => exportSingleTrack(trackContextMenu.trackId)}>Export track</button>
-        </div>}
+
+        <footer className="status-bar" aria-live="polite">
+          <div className="status-message"><span className={isProcessing || pendingImportCount + pendingDenoiseCount > 0 || bladeActive ? "status-pulse is-active" : "status-pulse"} />{bladeActive ? "Blade active: click the waveform to cut, A returns to direct editing" : message}</div>
+          <div className="status-counts">{pendingImportCount > 0 && <span>{pendingImportCount} normalizing</span>}{pendingDenoiseCount > 0 && <span>{pendingDenoiseCount} denoising</span>}{isProcessing && <span>{exportingTrackIds.length} exporting</span>}</div>
+          <div className="status-hint"><kbd>A</kbd> Direct <kbd>B</kbd> Blade <kbd>Space</kbd> Play <kbd>M</kbd> Mute range</div>
+        </footer>
       </section>
-    </main>
-  );
+    </div>
+
+    {trackContextMenu && <div ref={trackContextMenuRef} className="context-menu" role="menu" style={{ left: trackContextMenu.x, top: trackContextMenu.y }}>
+      {trackContextMenu.kind === "export" && <button type="button" role="menuitem" disabled={isProcessing || !canExportTracks(editorTracks.filter((track) => track.id === trackContextMenu.trackId))} onClick={() => exportSingleTrack(trackContextMenu.trackId)}><Icon name="export" />Force export track</button>}
+      {trackContextMenu.kind === "actions" && trackContextMenu.trackId === selectedTrackId && <>
+        <button type="button" role="menuitem" onClick={() => { setTrackContextMenu(null); updateSelectedTrack((track) => ({ ...track, collapsed: !track.collapsed, selectedRange: null })); }} disabled={selectedDeletedRegions.length === 0}><Icon name="collapse" />{selectedTrack?.collapsed ? "Show all edits" : "Collapse deleted audio"}</button>
+        <button type="button" role="menuitem" disabled={isProcessing} onClick={() => { setTrackContextMenu(null); returnToLibrary(); }}><Icon name="return" />Move to media pool</button>
+      </>}
+    </div>}
+    <DenoiseSettings visible={settingsOpen} onClose={() => setSettingsOpen(false)} onDialogClosed={() => audioContextManagerRef.current?.requestReset()} onStatusChange={setDenoiseProviderStatus} onSaved={(status) => {
+      setDenoiseProviderStatus(status);
+      setMessage(status.ready ? "Denoising setup saved. Queuing eligible media." : status.summary);
+      if (status.ready) {
+        [...recordings, ...editorTracks]
+          .filter(isRecordingReady)
+          .filter((recording) => recording.denoiseStatus === "unavailable" || recording.denoiseStatus === "failed")
+          .forEach((recording) => void queueDenoise(recording));
+      }
+    }} />
+  </main>;
 }
 
 export default App;

@@ -3,6 +3,8 @@ use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::denoise::DenoiseAvailability;
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingInfo {
@@ -12,6 +14,28 @@ pub struct RecordingInfo {
     pub duration_seconds: f64,
     pub integrated_lufs: Option<f64>,
 }
+
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ImportUpdate {
+    Normalizing {
+        recording_id: String,
+    },
+    Complete {
+        info: RecordingInfo,
+    },
+    Failed {
+        recording_id: String,
+        source_path: String,
+        error: String,
+    },
+}
+
+pub type ImportCompletion = Box<dyn Fn(ImportUpdate) + Send>;
 
 #[derive(Clone, Deserialize)]
 pub struct Region {
@@ -36,12 +60,6 @@ pub struct DenoiseResult {
     pub task_id: String,
     pub path: String,
     pub integrated_lufs: Option<f64>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DenoiseAvailability {
-    pub available: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -75,6 +93,7 @@ pub struct ExportEdit {
     pub name: String,
     pub source_path: String,
     pub deleted_regions: Vec<Region>,
+    pub muted_regions: Vec<Region>,
     pub envelope_points: Vec<EnvelopePoint>,
 }
 
@@ -89,7 +108,13 @@ pub struct ExportResult {
 pub trait AudioEngine: Send + Sync {
     fn start_recording(&self) -> Result<(), String>;
     fn stop_recording(&self, target_lufs: f64) -> Result<RecordingInfo, String>;
-    fn import_audio(&self, source: &str, target_lufs: f64) -> Result<RecordingInfo, String>;
+    fn start_import_audio(
+        &self,
+        recording_id: String,
+        source: String,
+        target_lufs: f64,
+        completion: ImportCompletion,
+    ) -> Result<(), String>;
     fn normalize_to_lufs(&self, source: &str, target_lufs: f64) -> Result<RecordingInfo, String>;
     fn denoise_availability(&self, sample_rate: u32) -> DenoiseAvailability;
     fn start_denoise(
@@ -105,6 +130,7 @@ pub trait AudioEngine: Send + Sync {
         &self,
         source: &str,
         deleted_regions: &[Region],
+        muted_regions: &[Region],
         envelope_points: &[EnvelopePoint],
         destination: &str,
     ) -> Result<String, String>;
@@ -152,7 +178,7 @@ pub fn reserve_export_path(destination_dir: &Path, name: &str) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{reserve_export_path, DenoiseUpdate};
+    use super::{reserve_export_path, DenoiseUpdate, ImportUpdate, RecordingInfo};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -169,6 +195,57 @@ mod tests {
                 "status": "processing",
                 "recordingId": "recording",
                 "taskId": "task",
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_import_progress_for_the_frontend_contract() {
+        let progress = ImportUpdate::Normalizing {
+            recording_id: "recording".into(),
+        };
+        let complete = ImportUpdate::Complete {
+            info: RecordingInfo {
+                id: "recording".into(),
+                name: "Voice".into(),
+                path: "/tmp/voice.wav".into(),
+                duration_seconds: 12.5,
+                integrated_lufs: Some(-14.0),
+            },
+        };
+        let failed = ImportUpdate::Failed {
+            recording_id: "recording".into(),
+            source_path: "/tmp/source.mp4".into(),
+            error: "No audio stream".into(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(progress).expect("serialize import progress"),
+            serde_json::json!({
+                "status": "normalizing",
+                "recordingId": "recording",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(complete).expect("serialize import completion"),
+            serde_json::json!({
+                "status": "complete",
+                "info": {
+                    "id": "recording",
+                    "name": "Voice",
+                    "path": "/tmp/voice.wav",
+                    "durationSeconds": 12.5,
+                    "integratedLufs": -14.0,
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(failed).expect("serialize import failure"),
+            serde_json::json!({
+                "status": "failed",
+                "recordingId": "recording",
+                "sourcePath": "/tmp/source.mp4",
+                "error": "No audio stream",
             })
         );
     }

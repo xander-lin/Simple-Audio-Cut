@@ -2,6 +2,7 @@
   font-family: Inter, "Noto Sans", "Noto Sans SC", system-ui, sans-serif;
   color: #e7ebea;
   background: #111315;
+  color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -24,6 +25,13 @@ body,
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
+}
+
+button,
+input,
+select {
+  -webkit-tap-highlight-color: transparent;
 }

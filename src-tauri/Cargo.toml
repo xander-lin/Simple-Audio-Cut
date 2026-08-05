@@ -28,7 +28,8 @@ ffmpeg-next = { version = "8", optional = true }
 hound = "3.5"
 
 [features]
-default = ["native-audio"]
+default = ["native-audio", "clearvoice-denoise"]
 native-audio = ["dep:cpal", "dep:ffmpeg-next"]
+clearvoice-denoise = []
 mock-audio = []
 custom-protocol = ["tauri/custom-protocol"]

@@ -1,20 +1,30 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import WaveformRow from "./WaveformRow";
 import { type RmsFrame } from "../utils/audioAnalysis";
 import { type EnvelopePoint, type Region } from "../utils/regionUtils";
+import { directRegionEdit, segmentAtTime } from "../utils/directEdit";
 
 interface WaveformScoreProps {
   buffer: AudioBuffer;
   currentTime: number;
+  bladeActive: boolean;
+  showEnvelope: boolean;
   onSeek: (time: number) => void;
   pixelsPerSecond?: number;
   regions: Region[];
+  mutedRegions: Region[];
+  editPoints: number[];
+  selectedRange: Region | null;
   envelopePoints: EnvelopePoint[];
   rmsFrames: readonly RmsFrame[];
   silenceThresholdDb: number;
   showSilenceThreshold: boolean;
-  onRegionAdd: (start: number, end: number) => void;
-  onRegionRemove: (start: number, end: number) => void;
+  onRangeSelect: (start: number, end: number) => void;
+  onDirectRegionEdit: (start: number, end: number, operation: "delete" | "restore") => void;
+  onRegionRestore: (region: Region) => void;
+  onRangeMuteToggle: () => void;
+  onBlade: (time: number) => void;
+  onEditPointRemove: (time: number) => void;
   onEnvelopePointAdd: (point: EnvelopePoint) => void;
   onEnvelopePointMove: (id: string, time: number, gain: number) => void;
   onEnvelopePointRemove: (id: string) => void;
@@ -29,16 +39,56 @@ interface RowMeta {
   trailingPadding: number;
 }
 
-const ROW_HEIGHT = 96;
-const ROW_GAP = 8;
+const ROW_HEIGHT = 120;
+const ROW_GAP = 10;
 
 const WaveformScore = ({
-  buffer, currentTime, onSeek, pixelsPerSecond = 48, regions, envelopePoints,
-  rmsFrames, silenceThresholdDb, showSilenceThreshold, onRegionAdd, onRegionRemove, onEnvelopePointAdd, onEnvelopePointMove, onEnvelopePointRemove,
+  buffer, currentTime, bladeActive, showEnvelope, onSeek, pixelsPerSecond = 48, regions, mutedRegions,
+  editPoints, selectedRange, envelopePoints, rmsFrames, silenceThresholdDb,
+  showSilenceThreshold, onRangeSelect, onRegionRestore, onRangeMuteToggle,
+  onDirectRegionEdit,
+  onBlade, onEditPointRemove, onEnvelopePointAdd, onEnvelopePointMove,
+  onEnvelopePointRemove,
 }: WaveformScoreProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [rowWidth, setRowWidth] = useState(0);
   const [regionDrag, setRegionDrag] = useState<{ start: number; current: number } | null>(null);
+  const [directEditDrag, setDirectEditDrag] = useState<{ start: number; current: number } | null>(null);
+  const regionDragRef = useRef(regionDrag);
+  const directEditDragRef = useRef(directEditDrag);
+  const draggingRegion = regionDrag !== null;
+  const minimumDragDuration = Math.max(0.01, 3 / Math.max(0.25, pixelsPerSecond));
+  regionDragRef.current = regionDrag;
+  directEditDragRef.current = directEditDrag;
+
+  const finishRegionDrag = useCallback((endTime?: number) => {
+    const activeDrag = regionDragRef.current;
+    if (!activeDrag) return;
+    const finishedDrag = endTime === undefined ? activeDrag : { ...activeDrag, current: endTime };
+    regionDragRef.current = null;
+    setRegionDrag(null);
+    const delta = finishedDrag.current - finishedDrag.start;
+    if (Math.abs(delta) > minimumDragDuration) {
+      onRangeSelect(
+        Math.min(finishedDrag.start, finishedDrag.current),
+        Math.max(finishedDrag.start, finishedDrag.current),
+      );
+      return;
+    }
+    onSeek(finishedDrag.start);
+    const segment = segmentAtTime(editPoints, finishedDrag.start, buffer.duration);
+    if (segment) onRangeSelect(segment.start, segment.end);
+  }, [buffer.duration, editPoints, minimumDragDuration, onRangeSelect, onSeek]);
+
+  const finishDirectEditDrag = useCallback((endTime?: number) => {
+    const activeDrag = directEditDragRef.current;
+    if (!activeDrag) return;
+    const finishedDrag = endTime === undefined ? activeDrag : { ...activeDrag, current: endTime };
+    directEditDragRef.current = null;
+    setDirectEditDrag(null);
+    const edit = directRegionEdit(finishedDrag.start, finishedDrag.current, minimumDragDuration);
+    if (edit) onDirectRegionEdit(edit.start, edit.end, edit.operation);
+  }, [minimumDragDuration, onDirectRegionEdit]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -75,17 +125,16 @@ const WaveformScore = ({
   }
 
   useEffect(() => {
-    if (!regionDrag) return;
-    const cancelDrag = () => setRegionDrag(null);
-    const finishDrag = () => {
-      const delta = regionDrag.current - regionDrag.start;
-      if (Math.abs(delta) > 0.01) {
-        const start = Math.min(regionDrag.start, regionDrag.current);
-        const end = Math.max(regionDrag.start, regionDrag.current);
-        if (delta > 0) onRegionAdd(start, end);
-        else onRegionRemove(start, end);
-      }
+    if (!draggingRegion && !directEditDrag) return;
+    const cancelDrag = () => {
+      regionDragRef.current = null;
       setRegionDrag(null);
+      directEditDragRef.current = null;
+      setDirectEditDrag(null);
+    };
+    const finishDrag = () => {
+      finishRegionDrag();
+      finishDirectEditDrag();
     };
     window.addEventListener("blur", cancelDrag);
     window.addEventListener("mouseup", finishDrag);
@@ -93,32 +142,42 @@ const WaveformScore = ({
       window.removeEventListener("blur", cancelDrag);
       window.removeEventListener("mouseup", finishDrag);
     };
-  }, [regionDrag, onRegionAdd, onRegionRemove]);
+  }, [directEditDrag, draggingRegion, finishDirectEditDrag, finishRegionDrag]);
 
-  const finishRegionDrag = (time: number) => {
-    setRegionDrag((current) => {
-      if (!current) return null;
-      const delta = time - current.start;
-      if (Math.abs(delta) > 0.01) {
-        const start = Math.min(current.start, time);
-        const end = Math.max(current.start, time);
-        if (delta > 0) onRegionAdd(start, end);
-        else onRegionRemove(start, end);
-      }
-      return null;
-    });
-  };
-
-  const preview = regionDrag
+  const preview = directEditDrag
+    ? {
+      start: Math.min(directEditDrag.start, directEditDrag.current),
+      end: Math.max(directEditDrag.start, directEditDrag.current),
+      direction: directEditDrag.current >= directEditDrag.start ? "delete" : "restore",
+    }
+    : regionDrag
     ? {
       start: Math.min(regionDrag.start, regionDrag.current),
       end: Math.max(regionDrag.start, regionDrag.current),
-      direction: regionDrag.current >= regionDrag.start ? "delete" : "restore",
+      direction: "range",
     }
     : null;
 
   return <div ref={containerRef} className="waveform-score-container">
-    {rowMetas.map((row) => <WaveformRow key={row.index} buffer={buffer} startTime={row.startTime} endTime={row.endTime} width={row.renderedWidth} height={ROW_HEIGHT} leadingPadding={row.leadingPadding} trailingPadding={row.trailingPadding} currentTime={currentTime} onSeek={onSeek} regions={regions} envelopePoints={envelopePoints} rmsFrames={rmsFrames} silenceThresholdDb={silenceThresholdDb} showSilenceThreshold={showSilenceThreshold} onRegionAdd={onRegionAdd} onRegionRemove={onRegionRemove} onRegionDragStart={(time) => setRegionDrag({ start: time, current: time })} onRegionDragMove={(time) => setRegionDrag((current) => current ? { ...current, current: time } : current)} onRegionDragEnd={finishRegionDrag} onEnvelopePointAdd={onEnvelopePointAdd} onEnvelopePointMove={onEnvelopePointMove} onEnvelopePointRemove={onEnvelopePointRemove} />)}
+    {rowMetas.map((row) => <WaveformRow key={row.index} buffer={buffer} startTime={row.startTime} endTime={row.endTime} width={row.renderedWidth} height={ROW_HEIGHT} leadingPadding={row.leadingPadding} trailingPadding={row.trailingPadding} currentTime={currentTime} bladeActive={bladeActive} showEnvelope={showEnvelope} onSeek={onSeek} regions={regions} mutedRegions={mutedRegions} editPoints={editPoints} selectedRange={selectedRange} envelopePoints={envelopePoints} rmsFrames={rmsFrames} silenceThresholdDb={silenceThresholdDb} showSilenceThreshold={showSilenceThreshold} onRegionDragStart={(time) => {
+      const next = { start: time, current: time };
+      regionDragRef.current = next;
+      setRegionDrag(next);
+    }} onRegionDragMove={(time) => setRegionDrag((current) => {
+      if (!current) return current;
+      const next = { ...current, current: time };
+      regionDragRef.current = next;
+      return next;
+    })} onRegionDragEnd={finishRegionDrag} onDirectEditDragStart={(time) => {
+      const next = { start: time, current: time };
+      directEditDragRef.current = next;
+      setDirectEditDrag(next);
+    }} onDirectEditDragMove={(time) => setDirectEditDrag((current) => {
+      if (!current) return current;
+      const next = { ...current, current: time };
+      directEditDragRef.current = next;
+      return next;
+    })} onDirectEditDragEnd={finishDirectEditDrag} onRegionRestore={onRegionRestore} onRangeMuteToggle={onRangeMuteToggle} onBlade={onBlade} onEditPointRemove={onEditPointRemove} onEnvelopePointAdd={onEnvelopePointAdd} onEnvelopePointMove={onEnvelopePointMove} onEnvelopePointRemove={onEnvelopePointRemove} />)}
     {preview && <div className="score-region-preview-layer">{rowMetas.map((row) => {
       const start = Math.max(preview.start, row.startTime);
       const end = Math.min(preview.end, row.endTime);

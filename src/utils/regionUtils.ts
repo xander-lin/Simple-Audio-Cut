@@ -11,13 +11,11 @@ export interface EnvelopePoint {
 
 export function envelopeGainAtTime(points: EnvelopePoint[], duration: number, time: number) {
   if (points.length === 0 || duration <= 0) return 1;
-  const anchors = [
-    { time: 0, gain: 1 },
-    ...points
-      .map((point) => ({ time: Math.max(0, Math.min(duration, point.time)), gain: Math.max(0, Math.min(2, point.gain)) }))
-      .sort((left, right) => left.time - right.time),
-    { time: duration, gain: 1 },
-  ];
+  const anchors = points
+    .map((point) => ({ time: Math.max(0, Math.min(duration, point.time)), gain: Math.max(0, Math.min(2, point.gain)) }))
+    .sort((left, right) => left.time - right.time);
+  if (anchors[0].time > 0) anchors.unshift({ time: 0, gain: 1 });
+  if (anchors[anchors.length - 1].time < duration) anchors.push({ time: duration, gain: 1 });
 
   for (let index = 1; index < anchors.length; index++) {
     const left = anchors[index - 1];
@@ -62,6 +60,11 @@ export function mergeRegions(regions: Region[], newRegion: Region): Region[] {
 
 export function combineRegions(...groups: Region[][]): Region[] {
   return groups.flat().reduce<Region[]>((regions, region) => mergeRegions(regions, region), []);
+}
+
+export function regionIsCovered(regions: Region[], target: Region) {
+  if (target.end <= target.start) return false;
+  return combineRegions(regions).some((region) => region.start <= target.start && region.end >= target.end);
 }
 
 /**

@@ -29,26 +29,32 @@ export interface ExportableTrack {
   path: string;
   manualDeletedRegions: Region[];
   silenceRegions: Region[];
+  mutedRegions: Region[];
   envelopePoints: EnvelopePoint[];
   lastExportSignature: string | null;
 }
 
-export function exportSignature(track: Omit<ExportableTrack, "lastExportSignature">) {
-  const deletedRegions = [...track.manualDeletedRegions, ...track.silenceRegions]
+function normalizedRegions(regions: Region[]) {
+  return [...regions]
     .sort((left, right) => left.start - right.start)
-    .reduce<Region[]>((regions, region) => {
-      const previous = regions[regions.length - 1];
+    .reduce<Region[]>((normalized, region) => {
+      const previous = normalized[normalized.length - 1];
       if (previous && region.start <= previous.end) {
         previous.end = Math.max(previous.end, region.end);
       } else {
-        regions.push({ ...region });
+        normalized.push({ ...region });
       }
-      return regions;
+      return normalized;
     }, []);
+}
+
+export function exportSignature(track: Omit<ExportableTrack, "lastExportSignature">) {
+  const deletedRegions = normalizedRegions([...track.manualDeletedRegions, ...track.silenceRegions]);
   return JSON.stringify({
     name: track.name,
     path: track.path,
     deletedRegions,
+    mutedRegions: normalizedRegions(track.mutedRegions),
     envelopePoints: [...track.envelopePoints]
       .sort((left, right) => left.time - right.time)
       .map(({ time, gain }) => ({ time, gain })),
