@@ -112,24 +112,23 @@ async function importReadySource() {
   await screen.findByRole("button", { name: "Add voice to timeline" });
 }
 
-describe("App selection deletion", () => {
-  it("uses one delete button for the selected source", async () => {
+describe("App deletion controls", () => {
+  it("deletes a source from its own media card", async () => {
     render(<App />);
     await importReadySource();
     fireEvent.mouseDown(screen.getByDisplayValue("voice"));
-    const deleteButton = screen.getByRole("button", { name: "Delete selected source" });
-    expect(screen.getAllByRole("button", { name: /Delete selected/ })).toHaveLength(1);
+    expect((screen.getByRole("button", { name: "Delete selected timeline track" }) as HTMLButtonElement).disabled).toBe(true);
+    const deleteButton = screen.getByRole("button", { name: "Delete voice from source media" });
     fireEvent.click(deleteButton);
     expect(mocks.confirm).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByDisplayValue("voice")).toBeNull());
   });
 
-  it("retargets the same delete button to the selected timeline track", async () => {
+  it("uses the header delete button only for the selected timeline track", async () => {
     render(<App />);
     await importReadySource();
     fireEvent.click(screen.getByRole("button", { name: "Add voice to timeline" }));
-    const deleteButton = await screen.findByRole("button", { name: "Delete selected track" });
-    expect(screen.getAllByRole("button", { name: /Delete selected/ })).toHaveLength(1);
+    const deleteButton = await screen.findByRole("button", { name: "Delete selected timeline track" });
     fireEvent.click(deleteButton);
     expect(mocks.confirm).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByText("Build your timeline")).toBeTruthy());

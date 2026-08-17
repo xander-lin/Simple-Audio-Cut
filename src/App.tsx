@@ -195,7 +195,6 @@ function App() {
   editorTracksRef.current = editorTracks;
   selectedTrackIdRef.current = selectedTrackId;
   const selectedTrack = editorTracks.find((track) => track.id === selectedTrackId) ?? null;
-  const selectedSource = recordings.find((recording) => recording.id === selectedSourceId) ?? null;
   const selectedDeletedRegions = selectedTrack
     ? combineRegions(selectedTrack.manualDeletedRegions, selectedTrack.silenceRegions)
     : [];
@@ -890,14 +889,6 @@ function App() {
     setMessage(`${recording.name} deleted from the source shelf`);
   };
 
-  const deleteSelectedItem = () => {
-    if (selectedSource) {
-      removeRecording(selectedSource.id);
-      return;
-    }
-    if (selectedTrack) removeTrack(selectedTrack.id);
-  };
-
   const exportTracks = async (tracks: Recording[], singleTrack = false) => {
     if (!tracks.length || exportInProgressRef.current || !canExportTracks(tracks)) return;
     exportInProgressRef.current = true;
@@ -1106,7 +1097,7 @@ function App() {
           <span><strong>Normalization</strong></span>
           <span className="number-field"><input aria-label="Normalization target" type="number" min="-70" max="-5" step="1" value={targetLufs} disabled={isRecording || pendingImportCount > 0} onChange={(event) => setTargetLufs(Math.max(-70, Math.min(-5, Number(event.target.value) || -14)))} /><b>LUFS</b></span>
         </label>
-        <button type="button" className="delete-selection-button" onClick={deleteSelectedItem} disabled={isProcessing || (!selectedSource && !selectedTrack)} aria-label={selectedSource ? "Delete selected source" : selectedTrack ? "Delete selected track" : "Delete selected item"} title={selectedSource ? `Delete source: ${selectedSource.name}` : selectedTrack ? `Delete track: ${selectedTrack.name}` : "Select a source or track to delete"}><Icon name="remove" /></button>
+        <button type="button" className="delete-selection-button" onClick={() => selectedTrack && removeTrack(selectedTrack.id)} disabled={isProcessing || !selectedTrack} aria-label="Delete selected timeline track" title={selectedTrack ? `Delete timeline track: ${selectedTrack.name}` : "Select a timeline track to delete"}><Icon name="remove" /></button>
       </div>
       <div className="titlebar-actions">
         <div className="titlebar-session" data-tauri-drag-region>
@@ -1148,6 +1139,7 @@ function App() {
               <div className="media-item-actions">
                 {recording.importStatus === "failed" && recording.sourcePath && <button type="button" onClick={() => retryImport(recording)}>Retry</button>}
                 <button type="button" className="add-timeline-button" onClick={() => moveToEditor(recording.id)} disabled={!ready} title="Add to timeline" aria-label={`Add ${recording.name} to timeline`}><Icon name="add" /></button>
+                <button type="button" className="delete-media-button" onClick={() => removeRecording(recording.id)} disabled={isProcessing} title={`Delete source: ${recording.name}`} aria-label={`Delete ${recording.name} from source media`}><Icon name="remove" /></button>
               </div>
               {processing && <span className="media-progress" />}
             </article>;

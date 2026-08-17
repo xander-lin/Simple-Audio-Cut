@@ -103,6 +103,8 @@ h1, h2, h3, p { margin: 0; }
 .media-item-actions button:hover:not(:disabled) { border-color: #70847c; background: #2e3935; color: var(--text); }
 .media-item-actions button:disabled { opacity: .28; cursor: not-allowed; }
 .add-timeline-button:not(:disabled) { color: var(--cyan); }
+.media-item-actions .delete-media-button { border-color: #754843; background: #2b1d1c; color: #e5a49e; }
+.media-item-actions .delete-media-button:hover:not(:disabled) { border-color: #b56861; background: #442725; color: #ffd9d5; }
 .media-progress { position: absolute; right: 0; bottom: 0; left: 0; height: 2px; overflow: hidden; background: #37321f; }
 .media-progress::after { content: ""; position: absolute; width: 40%; height: 100%; background: var(--accent); animation: indeterminate 1.5s ease-in-out infinite; }
 .media-empty { min-height: 61px; display: flex; align-items: center; gap: 12px; padding: 0 18px; color: var(--muted); text-align: left; }
