@@ -1,6 +1,6 @@
 [package]
 name = "simple-audio-cut"
-version = "0.1.3"
+version = "0.2.0"
 description = "Fast spoken-word recording and audio editing"
 license = "GPL-3.0-only"
 repository = "https://github.com/xander-lin/Simple-Audio-Cut"
@@ -23,13 +23,11 @@ tauri = { version = "2", features = ["protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
-cpal = { version = "0.15", optional = true }
-ffmpeg-next = { version = "9", optional = true }
-hound = "3.5"
+simple-audio-cut-core = { path = "../crates/core", default-features = false }
 
 [features]
 default = ["native-audio", "clearvoice-denoise"]
-native-audio = ["dep:cpal", "dep:ffmpeg-next"]
-clearvoice-denoise = []
+native-audio = ["simple-audio-cut-core/native-audio"]
+clearvoice-denoise = ["simple-audio-cut-core/clearvoice-denoise"]
 mock-audio = []
 custom-protocol = ["tauri/custom-protocol"]

@@ -212,10 +212,21 @@ impl ClearVoiceProvider {
         }
         let mut candidates = Vec::new();
         #[cfg(debug_assertions)]
-        if let Ok(current_dir) = std::env::current_dir() {
-            candidates.push(current_dir.join("tools/clearvoice_denoise.py"));
-            if let Some(parent) = current_dir.parent() {
-                candidates.push(parent.join("tools/clearvoice_denoise.py"));
+        {
+            if let Ok(current_dir) = std::env::current_dir() {
+                candidates.push(current_dir.join("tools/clearvoice_denoise.py"));
+                if let Some(parent) = current_dir.parent() {
+                    candidates.push(parent.join("tools/clearvoice_denoise.py"));
+                }
+            }
+            candidates.push(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tools/clearvoice_denoise.py"),
+            );
+        }
+        if let Ok(executable) = std::env::current_exe() {
+            for ancestor in executable.ancestors().skip(1).take(4) {
+                candidates.push(ancestor.join("tools/clearvoice_denoise.py"));
             }
         }
         candidates.push(PathBuf::from(

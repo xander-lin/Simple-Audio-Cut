@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app"]
+# The legacy Tauri/React frontend is kept on the migration branch for diffing
+# but is not part of the native build.
+exclude = ["src-tauri"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

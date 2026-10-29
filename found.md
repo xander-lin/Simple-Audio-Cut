@@ -93,3 +93,31 @@
 - **纠正**：构建前用 `pacman -S --needed pnpm` 补齐。
 - **预防**：打包/安装前先校验 `makedepends` 清单中每个命令是否可用
   （`command -v`），再启动 makepkg；不要等 makepkg 在中途报错。
+
+## 2026-10-29 迁移到 iced 时 `cpal::Stream` 不能跨线程持有
+
+- **背景**：为 iced 前端新增播放后端，最初把 `cpal::Stream` 放进
+  `Mutex<Option<Stream>>` 字段，编译报 `*mut ()` cannot be sent between threads。
+- **根因**：ALSA 后端的 `cpal::Stream` 内含 `NotSendSyncAcrossAllPlatforms`，
+  因此整个播放器无法满足 `AudioPlayer: Send + Sync`。
+- **纠正**：把流的创建/持有/销毁放在专用线程，播放器只保留命令通道
+  （`Command::Play/Stop`）与共享游标（`crates/core/src/audio/player.rs`）。
+- **预防**：凡在 GUI 状态里持有系统音频/窗口句柄，先把句柄限制在单一线程，
+  对外只暴露 `Send + Sync` 的消息接口；不要用 `unsafe impl Send` 绕过。
+
+## 2026-10-29 pkill -f 会杀掉正在执行命令的 shell 自身
+
+- **背景**：用 `pkill -f seed_preview` 结束预览进程时，命令本身以 SIGTERM 结束，
+  后续构建/截图步骤没有执行。
+- **根因**：`-f` 匹配完整命令行，而当前 shell 的命令行包含 `seed_preview`。
+- **纠正**：改用 `pkill -x <进程名>` 或匹配绝对路径并排除自身。
+- **预防**：结束进程优先用 `-x`（精确进程名）；需要 `-f` 时确认模式不会匹配当前 shell。
+
+## 2026-10-29 iced canvas 缓存必须放在应用状态里
+
+- **背景**：波形 `canvas::Program` 若在视图函数里创建并持有 `Cache`，每次重建都会
+  丢失缓存；若想在 `&self` 上清缓存又不可变。
+- **根因**：`canvas::Program::draw` 接收 `&self`，无法直接 `clear()` 内部缓存。
+- **纠正**：把 `WaveformCache` 放在 `Session.waveform_caches`，用 `Cell<u64>` 记录
+  已缓存 revision，draw 时对比 revision 并清空（`crates/app/src/waveform.rs`）。
+- **预防**：iced 中任何需要跨帧保留的绘制缓存都放进应用状态，而不是 widget 构造处。

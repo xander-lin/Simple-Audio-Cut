@@ -1,0 +1,24 @@
+[package]
+name = "simple-audio-cut-iced"
+version = "0.2.0"
+description = "Native iced frontend for Simple Audio Cut"
+license = "GPL-3.0-only"
+repository = "https://github.com/xander-lin/Simple-Audio-Cut"
+edition = "2021"
+
+[[bin]]
+name = "simple-audio-cut"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14", features = ["canvas", "advanced", "tokio"] }
+rfd = "0.16"
+simple-audio-cut-core = { path = "../core", default-features = false }
+
+[dev-dependencies]
+hound = "3.5"
+
+[features]
+default = ["native-audio", "clearvoice-denoise"]
+native-audio = ["simple-audio-cut-core/native-audio"]
+clearvoice-denoise = ["simple-audio-cut-core/clearvoice-denoise"]

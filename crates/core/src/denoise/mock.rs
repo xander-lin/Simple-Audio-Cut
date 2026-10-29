@@ -9,6 +9,12 @@ pub struct MockDenoiseProvider {
     config: RwLock<DenoiseConfig>,
 }
 
+impl Default for MockDenoiseProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockDenoiseProvider {
     pub fn new() -> Self {
         Self {

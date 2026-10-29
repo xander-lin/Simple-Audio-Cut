@@ -3207,16 +3207,25 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simple-audio-cut"
-version = "0.1.3"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "simple-audio-cut-core",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+]
+
+[[package]]
+name = "simple-audio-cut-core"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "ffmpeg-next",
  "hound",
  "serde",
  "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
 ]
 
 [[package]]

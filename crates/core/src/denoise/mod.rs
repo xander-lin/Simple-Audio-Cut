@@ -2,14 +2,12 @@
 mod clearvoice;
 #[cfg(all(feature = "native-audio", not(feature = "clearvoice-denoise")))]
 mod disabled;
-#[cfg(any(test, not(feature = "native-audio")))]
 mod mock;
 
 #[cfg(feature = "clearvoice-denoise")]
 pub use clearvoice::ClearVoiceProvider;
 #[cfg(all(feature = "native-audio", not(feature = "clearvoice-denoise")))]
 pub use disabled::DisabledDenoiseProvider;
-#[cfg(any(test, not(feature = "native-audio")))]
 pub use mock::MockDenoiseProvider;
 
 use serde::{Deserialize, Serialize};

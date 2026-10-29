@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::denoise::DenoiseAvailability;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingInfo {
     pub id: String,
@@ -15,7 +15,7 @@ pub struct RecordingInfo {
     pub integrated_lufs: Option<f64>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(
     tag = "status",
     rename_all = "camelCase",
@@ -53,7 +53,7 @@ pub struct EnvelopePoint {
     pub gain: f64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DenoiseResult {
     pub recording_id: String,
@@ -62,7 +62,7 @@ pub struct DenoiseResult {
     pub integrated_lufs: Option<f64>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(
     tag = "status",
     rename_all = "camelCase",
@@ -97,7 +97,7 @@ pub struct ExportEdit {
     pub envelope_points: Vec<EnvelopePoint>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportResult {
     pub recording_id: String,
