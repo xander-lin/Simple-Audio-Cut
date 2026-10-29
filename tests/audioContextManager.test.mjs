@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  AudioContextOperationTimeoutError,
   AudioContextManager,
   MockAudioContext,
   MockAudioContextFactory,
+  resumeAudioContext,
 } from "../src/audio/audioContextManager.ts";
 
 function deferred() {
@@ -26,6 +28,61 @@ test("creates the audio context lazily and reuses it", async () => {
 
   assert.strictEqual(second, first);
   assert.equal(factory.contexts.length, 1);
+});
+
+test("resumes a suspended context before the timeout", async () => {
+  const context = new MockAudioContext();
+
+  await resumeAudioContext(context, 20);
+
+  assert.equal(context.resumeCalls, 1);
+  assert.equal(context.state, "running");
+});
+
+test("rejects when resume never settles", async () => {
+  const pendingResume = deferred();
+  const context = new MockAudioContext(async () => undefined, () => pendingResume.promise);
+
+  await assert.rejects(
+    resumeAudioContext(context, 10),
+    (error) => error instanceof AudioContextOperationTimeoutError
+      && error.operation === "AudioContext.resume()"
+      && error.timeoutMs === 10,
+  );
+
+  pendingResume.resolve();
+});
+
+test("does not consider a context current after reset is requested", async () => {
+  const manager = new AudioContextManager(new MockAudioContextFactory());
+  const first = await manager.get();
+  const firstVersion = manager.version;
+
+  assert.equal(manager.isCurrent(first), true);
+  assert.equal(manager.isCurrent(first, firstVersion), true);
+  manager.requestReset();
+  assert.equal(manager.isCurrent(first), false);
+  assert.notEqual(manager.version, firstVersion);
+  assert.equal(manager.isCurrent(first, firstVersion), false);
+
+  const replacement = await manager.get();
+  assert.notStrictEqual(replacement, first);
+  assert.equal(manager.isCurrent(first), false);
+  assert.equal(manager.isCurrent(replacement), true);
+});
+
+test("invalidates pending work when a closed context is replaced", async () => {
+  const factory = new MockAudioContextFactory();
+  const manager = new AudioContextManager(factory);
+  const first = await manager.get();
+  const firstVersion = manager.version;
+  first.state = "closed";
+
+  const replacement = await manager.get();
+
+  assert.notStrictEqual(replacement, first);
+  assert.notEqual(manager.version, firstVersion);
+  assert.equal(manager.isCurrent(replacement, firstVersion), false);
 });
 
 test("waits for close before creating one shared replacement", async () => {

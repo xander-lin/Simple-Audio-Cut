@@ -57,10 +57,31 @@ const providerStatus = {
 
 const fakeBuffer = {
   duration: 1,
+  length: 48_000,
   sampleRate: 48_000,
   numberOfChannels: 1,
   getChannelData: () => new Float32Array(48_000),
 } as unknown as AudioBuffer;
+
+class FakeAudioBuffer {
+  readonly duration: number;
+  readonly length: number;
+  readonly numberOfChannels: number;
+  readonly sampleRate: number;
+  private readonly channels: Float32Array[];
+
+  constructor({ length = 0, numberOfChannels = 1, sampleRate = 48_000 }: AudioBufferOptions) {
+    this.length = length;
+    this.numberOfChannels = numberOfChannels;
+    this.sampleRate = sampleRate;
+    this.duration = length / sampleRate;
+    this.channels = Array.from({ length: numberOfChannels }, () => new Float32Array(length));
+  }
+
+  getChannelData(channel: number) {
+    return this.channels[channel];
+  }
+}
 
 class FakeAudioContext {
   state: AudioContextState = "running";
@@ -79,6 +100,7 @@ beforeEach(() => {
     return Promise.resolve(undefined);
   });
   vi.stubGlobal("AudioContext", FakeAudioContext);
+  vi.stubGlobal("AudioBuffer", FakeAudioBuffer);
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(16) })));
   vi.stubGlobal("ResizeObserver", class {
     observe() {}
@@ -87,6 +109,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
@@ -112,6 +135,14 @@ async function importReadySource() {
   await screen.findByRole("button", { name: "Add voice to timeline" });
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 describe("App deletion controls", () => {
   it("deletes a source from its own media card", async () => {
     render(<App />);
@@ -132,5 +163,78 @@ describe("App deletion controls", () => {
     fireEvent.click(deleteButton);
     expect(mocks.confirm).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByText("Build your timeline")).toBeTruthy());
+  });
+});
+
+describe("App playback recovery", () => {
+  it("replaces a context whose resume stalls and never starts the late request", async () => {
+    const stalledResume = deferred();
+    const contexts: PlaybackAudioContext[] = [];
+
+    class PlaybackAudioContext extends FakeAudioContext {
+      currentTime = 0;
+      destination = {};
+      readonly sources: Array<{
+        buffer: AudioBuffer | null;
+        connect: ReturnType<typeof vi.fn>;
+        onended: (() => void) | null;
+        start: ReturnType<typeof vi.fn>;
+        stop: ReturnType<typeof vi.fn>;
+      }> = [];
+      resume = vi.fn(async () => {
+        if (contexts[0] === this) await stalledResume.promise;
+        if (this.state !== "closed") this.state = "running";
+      });
+      createBufferSource = vi.fn(() => {
+        const source = {
+          buffer: null as AudioBuffer | null,
+          connect: vi.fn(),
+          onended: null as (() => void) | null,
+          start: vi.fn(),
+          stop: vi.fn(),
+        };
+        this.sources.push(source);
+        return source;
+      });
+
+      constructor() {
+        super();
+        contexts.push(this);
+      }
+    }
+
+    vi.stubGlobal("AudioContext", PlaybackAudioContext);
+    render(<App />);
+    await importReadySource();
+    fireEvent.click(screen.getByRole("button", { name: "Add voice to timeline" }));
+    const first = contexts[0];
+    first.state = "suspended";
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByTitle("Play / pause (Space)"));
+    await act(async () => { await Promise.resolve(); });
+    expect(first.resume).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+    });
+    expect(screen.getByText("Audio output stopped responding; resetting the audio context.")).toBeTruthy();
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(contexts).toHaveLength(2);
+
+    stalledResume.resolve();
+    await act(async () => {
+      for (let index = 0; index < 4; index++) await Promise.resolve();
+    });
+    expect(first.createBufferSource).not.toHaveBeenCalled();
+
+    const replacement = contexts[1];
+    fireEvent.click(screen.getByTitle("Play / pause (Space)"));
+    await act(async () => {
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+    });
+    expect(replacement.createBufferSource).toHaveBeenCalledTimes(1);
+    expect(replacement.sources[0].start).toHaveBeenCalledTimes(1);
   });
 });

@@ -14,7 +14,12 @@ import { appendUniqueTrack } from "./utils/trackUtils";
 import { applyDenoiseUpdate, canExportTracks, type DenoiseState } from "./utils/denoiseUtils";
 import { exportSignature, getLastExportDirectory, needsExport, rememberLastExportDirectory } from "./utils/exportState";
 import { fileBasename, fileStem, importQueuedSummary, selectedPaths } from "./utils/importUtils";
-import { AudioContextManager, BrowserAudioContextFactory } from "./audio/audioContextManager";
+import {
+  AudioContextManager,
+  AudioContextOperationTimeoutError,
+  BrowserAudioContextFactory,
+  resumeAudioContext,
+} from "./audio/audioContextManager";
 import { savedPlaybackPosition } from "./utils/playbackUtils";
 import { addEditPoint } from "./utils/directEdit";
 import "./App.css";
@@ -672,13 +677,29 @@ function App() {
 
   const startPlayback = async (offset: number) => {
     if (!selectedTrack) return;
+    const manager = audioContextManagerRef.current;
+    if (!manager) {
+      setMessage("Audio context is unavailable.");
+      return;
+    }
+    const playbackTrackId = selectedTrack.id;
     stopPlayback(false);
     const playbackRequest = playbackRequestRef.current;
+    const playbackContextVersion = manager.version;
+    let playbackContext: AudioContext | null = null;
+    let resumeInProgress = false;
     try {
       const context = await getAudioContext();
-      if (playbackRequest !== playbackRequestRef.current) return;
-      if (context.state === "suspended") await context.resume();
-      if (playbackRequest !== playbackRequestRef.current) return;
+      playbackContext = context;
+      const isCurrentRequest = () => playbackRequest === playbackRequestRef.current
+        && selectedTrackIdRef.current === playbackTrackId
+        && editorTracksRef.current.find((track) => track.id === playbackTrackId) === selectedTrack
+        && manager.isCurrent(context, playbackContextVersion);
+      if (!isCurrentRequest()) return;
+      resumeInProgress = true;
+      await resumeAudioContext(context);
+      resumeInProgress = false;
+      if (!isCurrentRequest()) return;
       const keptRegions = getKeptRegions(selectedDeletedRegions, selectedTrack.buffer.duration);
       const editedBuffer = createEditedBuffer(selectedTrack.buffer, selectedDeletedRegions, selectedTrack.envelopePoints, selectedTrack.mutedRegions);
       if (editedBuffer.duration === 0) {
@@ -709,10 +730,14 @@ function App() {
       startedAtRef.current = context.currentTime;
       playbackOffsetRef.current = safeOffset;
       editedPlaybackOffsetRef.current = editedOffset;
-      source.start(0, editedOffset);
       sourceNodeRef.current = source;
       playbackContextRef.current = context;
       playbackKeptRegionsRef.current = keptRegions;
+      source.start(0, editedOffset);
+      if (!isCurrentRequest() || sourceNodeRef.current !== source) {
+        if (sourceNodeRef.current === source) stopPlayback(false);
+        return;
+      }
       setIsPlaying(true);
       const tick = () => {
         if (sourceNodeRef.current !== source || playbackRequest !== playbackRequestRef.current) return;
@@ -726,7 +751,17 @@ function App() {
     } catch (error) {
       if (playbackRequest !== playbackRequestRef.current) return;
       stopPlayback(false);
-      setMessage(`Unable to play audio: ${String(error)}`);
+      const needsReset = resumeInProgress || error instanceof AudioContextOperationTimeoutError;
+      if (needsReset) {
+        if (playbackContext && manager.isCurrent(playbackContext, playbackContextVersion)) {
+          void manager.reset().catch(() => undefined);
+        } else {
+          manager.requestReset();
+        }
+      }
+      setMessage(error instanceof AudioContextOperationTimeoutError
+        ? "Audio output stopped responding; resetting the audio context."
+        : `Unable to play audio: ${String(error)}`);
     }
   };
 
@@ -1230,7 +1265,7 @@ function App() {
         <button type="button" role="menuitem" disabled={isProcessing} onClick={() => { setTrackContextMenu(null); returnToLibrary(); }}><Icon name="return" />Move to media pool</button>
       </>}
     </div>}
-    <DenoiseSettings visible={settingsOpen} onClose={() => setSettingsOpen(false)} onDialogClosed={() => audioContextManagerRef.current?.requestReset()} onStatusChange={setDenoiseProviderStatus} onSaved={(status) => {
+    <DenoiseSettings visible={settingsOpen} onClose={() => setSettingsOpen(false)} onDialogClosed={() => { stopPlayback(false); audioContextManagerRef.current?.requestReset(); }} onStatusChange={setDenoiseProviderStatus} onSaved={(status) => {
       setDenoiseProviderStatus(status);
       setMessage(status.ready ? "Denoising setup saved. Queuing eligible media." : status.summary);
       if (status.ready) {
