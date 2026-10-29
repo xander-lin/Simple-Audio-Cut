@@ -723,15 +723,8 @@ fn track_row<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message> {
     } else {
         track.duration()
     };
-    let audio = if collapsed {
-        track
-            .collapsed_audio
-            .clone()
-            .unwrap_or_else(|| track.audio().clone())
-    } else {
-        track.audio().clone()
-    };
-    let rms = track.rms().clone();
+    let audio = track.display_audio();
+    let rms = track.display_rms();
     let pps = track.pixels_per_second;
     let deleted = if collapsed {
         Vec::new()

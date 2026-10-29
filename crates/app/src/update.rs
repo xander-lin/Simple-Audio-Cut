@@ -933,7 +933,7 @@ impl App {
         if let Some(track) = self.session.track_mut(id) {
             let factor = if delta < 0.0 { 1.15 } else { 1.0 / 1.15 };
             track.pixels_per_second = (track.pixels_per_second * factor).clamp(0.25, 400.0);
-            track.touch();
+            track.bump_revision();
         }
     }
 

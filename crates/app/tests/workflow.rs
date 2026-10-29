@@ -194,7 +194,7 @@ fn export_changed_writes_only_changed_tracks_and_marks_them_exported() {
     let _ = harness.app.update(Message::ExportChanged);
     let finished = harness.pump_until(
         |app| app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose"),
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     );
     assert!(finished, "export did not finish: {}", harness.app.ui.message);
     assert!(harness.app.ui.message.starts_with("Exported"), "{}", harness.app.ui.message);

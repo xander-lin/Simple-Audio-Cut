@@ -182,6 +182,7 @@ pub struct Track {
     pub selected_range: Option<Region>,
     pub collapsed: bool,
     pub collapsed_audio: Option<Arc<AudioBuffer>>,
+    pub collapsed_rms: Option<Arc<Vec<RmsFrame>>>,
     pub last_export_signature: Option<String>,
     pub revision: u64,
 }
@@ -202,6 +203,7 @@ impl Track {
             selected_range: None,
             collapsed: false,
             collapsed_audio: None,
+            collapsed_rms: None,
             last_export_signature: None,
             revision: 1,
         }
@@ -266,43 +268,57 @@ impl Track {
         self.last_export_signature = Some(self.signature());
     }
 
-    pub fn touch(&mut self) {
+    /// Signals that the cached waveform geometry must be rebuilt.
+    pub fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        self.collapsed_audio = None;
     }
 
-    pub fn display_audio(&self) -> Arc<AudioBuffer> {
+    /// Records an output-affecting edit and refreshes the collapsed view.
+    pub fn touch(&mut self) {
+        self.bump_revision();
         if self.collapsed {
-            if let Some(audio) = &self.collapsed_audio {
-                return audio.clone();
-            }
-            self.audio().clone()
-        } else {
-            self.audio().clone()
+            self.rebuild_collapsed();
         }
     }
 
-    /// Recomputes the collapsed (deleted audio removed) view buffer.
+    /// Recomputes the collapsed (deleted audio removed) view buffers.
     pub fn rebuild_collapsed(&mut self) {
         if !self.collapsed {
             self.collapsed_audio = None;
+            self.collapsed_rms = None;
             return;
         }
-        self.collapsed_audio = Some(Arc::new(create_edited_buffer(
+        let audio = Arc::new(create_edited_buffer(
             self.audio(),
             &self.deleted(),
             &[],
             &self.muted,
-        )));
+        ));
+        let rms = Arc::new(simple_audio_cut_core::analysis::analyze_rms(
+            &audio,
+            simple_audio_cut_core::analysis::RmsOptions::default(),
+        ));
+        self.collapsed_audio = Some(audio);
+        self.collapsed_rms = Some(rms);
     }
 
-    pub fn display_audio_cached(&self) -> Arc<AudioBuffer> {
+    /// Audio shown in the waveform for the current view mode.
+    pub fn display_audio(&self) -> Arc<AudioBuffer> {
         if self.collapsed {
             self.collapsed_audio
                 .clone()
                 .unwrap_or_else(|| self.audio().clone())
         } else {
             self.audio().clone()
+        }
+    }
+
+    /// RMS frames matching [`Track::display_audio`].
+    pub fn display_rms(&self) -> Arc<Vec<RmsFrame>> {
+        if self.collapsed {
+            self.collapsed_rms.clone().unwrap_or_else(|| self.rms().clone())
+        } else {
+            self.rms().clone()
         }
     }
 }
