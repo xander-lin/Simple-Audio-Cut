@@ -121,3 +121,15 @@
 - **纠正**：把 `WaveformCache` 放在 `Session.waveform_caches`，用 `Cell<u64>` 记录
   已缓存 revision，draw 时对比 revision 并清空（`crates/app/src/waveform.rs`）。
 - **预防**：iced 中任何需要跨帧保留的绘制缓存都放进应用状态，而不是 widget 构造处。
+
+## 2026-10-29 后台事件不能写进"操作反馈"那一行
+
+- **背景**：`workflow` 测试偶发失败（10 次里 3~4 次），断言
+  `ui.message == "Export cancelled"` 实际得到 `"Mock denoising is disabled."`。
+- **根因**：降噪完成/失败、降噪不可用等后台事件与用户操作（导出、
+  导入、选区静音）共用 `UiState::message` 这一个字段，异步事件到达顺序不定，
+  会覆盖用户刚看到的结果；同时它也是测试不稳定的来源。
+- **纠正**：后台事件改写 `Session::denoise_note`，只在设置抽屉和状态栏末尾
+  以灰色提示显示；`ui.message` 只保留用户操作的结果。
+- **预防**：区分"操作反馈"与"环境/后台状态"两类文本，不要共用一个字段；
+  凡是后台线程可以异步写入的 UI 状态，都要考虑它是否会覆盖用户的即时反馈。
