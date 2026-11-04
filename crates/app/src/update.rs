@@ -374,16 +374,14 @@ impl App {
                 if let Some(clip) = self.session.editing_mut(id) {
                     clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
                 }
-                if let Some(reason) = reason {
-                    let name = self
-                        .session
-                        .clip_by_id(id)
-                        .map(|clip| clip.name.clone())
-                        .unwrap_or_default();
-                    self.ui.message = format!("{name}: {reason}");
+                // Ambient state, not an action result: surface it in the
+                // settings drawer instead of overwriting the status bar.
+                if reason.is_some() {
+                    self.session.denoise_note = reason;
                 }
             }
             AppEvent::DenoiseStarted { id, task_id } => {
+                self.session.denoise_note = None;
                 self.session.mark_denoise(id, &task_id, crate::model::DenoiseStatus::Processing);
             }
             AppEvent::DenoiseCompleted {
@@ -414,6 +412,7 @@ impl App {
                 if let Some(clip) = self.session.editing_mut(id) {
                     clip.denoise.status = crate::model::DenoiseStatus::Complete;
                 }
+                self.session.denoise_note = None;
                 if was_selected {
                     self.refresh_silence_inputs();
                 }
@@ -422,7 +421,7 @@ impl App {
                     .clip_by_id(id)
                     .map(|clip| clip.name.clone())
                     .unwrap_or_default();
-                self.ui.message = format!("{name}: denoising complete.");
+                self.session.denoise_note = Some(format!("{name}: denoising complete."));
             }
             AppEvent::DenoiseFailed { id, task_id, error } => {
                 let current = self
@@ -435,7 +434,10 @@ impl App {
                 if let Some(clip) = self.session.editing_mut(id) {
                     clip.denoise.status = crate::model::DenoiseStatus::Failed;
                 }
-                self.ui.message = error;
+                // Background denoise failures are ambient: the row badge and
+                // the drawer already show them, so do not overwrite the status
+                // bar result of whatever the user just did.
+                self.session.denoise_note = Some(error);
             }
             AppEvent::ExportCompleted {
                 results,
@@ -1460,6 +1462,21 @@ mod tests {
             rms,
         });
         let _ = app.update(Message::Tick);
+    }
+
+    #[test]
+    fn selecting_a_pool_item_closes_the_track_editor_and_resets_the_playhead() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        add_ready_media(&mut app, 2);
+        let _ = app.update(Message::AddToTimeline(1));
+        app.session.playhead = 0.8;
+
+        let _ = app.update(Message::SelectMedia(2));
+
+        assert_eq!(app.session.selected_media, Some(2));
+        assert_eq!(app.session.selected_track, None);
+        assert_eq!(app.session.playhead, 0.0);
     }
 
     #[test]

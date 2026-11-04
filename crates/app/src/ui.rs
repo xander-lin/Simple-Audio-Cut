@@ -431,7 +431,7 @@ fn media_card<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
         body = body.push(text(error.to_string()).size(10.0).color(theme::RED));
     }
 
-    container(body)
+    let card = container(body)
         .padding(9.0)
         .width(Length::Fixed(248.0))
         .style(move |theme| {
@@ -442,7 +442,10 @@ fn media_card<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
             } else {
                 theme::raised_card(theme)
             }
-        })
+        });
+
+    iced::widget::mouse_area(card)
+        .on_press(Message::SelectMedia(clip.id))
         .into()
 }
 
@@ -871,42 +874,50 @@ fn original_display_time(time: f64, kept: &[Region], collapsed: bool) -> f64 {
 
 fn status_bar(app: &App) -> Element<'_, Message> {
     let pending = app.session.pending_imports() + app.session.pending_denoise();
-    container(
-        row![
-            text(app.ui.message.clone())
+    let mut line = row![
+        text(app.ui.message.clone())
+            .size(10.0)
+            .color(theme::TEXT_SOFT)
+            .width(Length::Fill),
+    ]
+    .align_y(Alignment::Center);
+    if let Some(note) = &app.session.denoise_note {
+        line = line.push(text(note.clone()).size(10.0).color(theme::MUTED).wrapping(
+            iced::widget::text::Wrapping::WordOrGlyph,
+        ));
+    }
+    if pending > 0 {
+        line = line.push(
+            text(format!("{pending} processing"))
                 .size(10.0)
-                .color(theme::TEXT_SOFT)
-                .width(Length::Fill),
-            if pending > 0 {
-                text(format!("{pending} processing")).size(10.0).color(theme::ACCENT)
-            } else {
-                text("").size(10.0)
-            },
-            row![
-                keycap("A"),
-                text("Direct").size(9.0).color(theme::MUTED),
-                keycap("B"),
-                text("Blade").size(9.0).color(theme::MUTED),
-                keycap("Space"),
-                text("Play").size(9.0).color(theme::MUTED),
-                keycap("M"),
-                text("Mute range").size(9.0).color(theme::MUTED),
-            ]
-            .spacing(5.0)
-            .align_y(Alignment::Center),
+                .color(theme::ACCENT),
+        );
+    }
+    line = line.push(
+        row![
+            keycap("A"),
+            text("Direct").size(9.0).color(theme::MUTED),
+            keycap("B"),
+            text("Blade").size(9.0).color(theme::MUTED),
+            keycap("Space"),
+            text("Play").size(9.0).color(theme::MUTED),
+            keycap("M"),
+            text("Mute range").size(9.0).color(theme::MUTED),
         ]
-        .spacing(12.0)
+        .spacing(5.0)
         .align_y(Alignment::Center),
-    )
-    .padding(Padding {
-        top: 6.0,
-        bottom: 6.0,
-        left: 14.0,
-        right: 14.0,
-    })
-    .width(Length::Fill)
-    .style(theme::statusbar_style)
-    .into()
+    );
+
+    container(line.spacing(10.0))
+        .padding(Padding {
+            top: 6.0,
+            bottom: 6.0,
+            left: 14.0,
+            right: 14.0,
+        })
+        .width(Length::Fill)
+        .style(theme::statusbar_style)
+        .into()
 }
 
 /// Thin colored strip on the left of every track: wheel zooms, right click
@@ -1366,6 +1377,15 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
         }
     } else if busy {
         body = body.push(text("Inspecting the local environment…").size(11.0).color(theme::MUTED));
+    }
+
+    if let Some(note) = &app.session.denoise_note {
+        body = body.push(
+            container(text(note.clone()).size(10.0).color(theme::MUTED))
+                .padding(9.0)
+                .width(Length::Fill)
+                .style(theme::soft_card),
+        );
     }
 
     if let Some(error) = &app.ui.settings.error {

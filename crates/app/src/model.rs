@@ -406,6 +406,9 @@ pub struct Session {
     pub exporting: Vec<MediaId>,
     pub failed_exports: Vec<MediaId>,
     pub denoise_status: Option<DenoiseProviderStatus>,
+    /// Latest ambient reason reported when denoising could not run. Kept out
+    /// of `UiState::message` so background jobs never clobber action feedback.
+    pub denoise_note: Option<String>,
     pub waveform_caches: HashMap<MediaId, crate::waveform::WaveformCache>,
 }
 
@@ -424,6 +427,7 @@ impl Default for Session {
             exporting: Vec::new(),
             failed_exports: Vec::new(),
             denoise_status: None,
+            denoise_note: None,
             waveform_caches: HashMap::new(),
         }
     }
@@ -495,7 +499,9 @@ impl Session {
         let id = track.id();
         if self.tracks.iter().any(|existing| existing.id() == id) {
             if let Some(existing) = self.track_mut(id) {
+                let revision = existing.revision.wrapping_add(1);
                 *existing = track;
+                existing.revision = revision;
             }
             self.selected_track = Some(id);
             return;
