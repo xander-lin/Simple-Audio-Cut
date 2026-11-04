@@ -3,8 +3,8 @@
 use iced::widget::canvas;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, space, stack, text, text_input,
-    Space,
+    button, checkbox, column, container, pick_list, responsive, row, scrollable, space, stack, text,
+    text_input, Space,
 };
 use iced::{Alignment, Element, Font, Length, Padding, Size};
 
@@ -766,11 +766,14 @@ fn track_row<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message> {
     let show_envelope = selected && !collapsed;
     let show_threshold = selected;
 
-    let row_width = canvas_width(app.window_size.width);
-    let canvas_element = {
-        let width = row_width;
+    let fallback_width = canvas_width(app.window_size.width);
+    let canvas_element = responsive(move |size| {
+        let width = if size.width.is_finite() && size.width > 0.0 {
+            size.width
+        } else {
+            fallback_width
+        };
         let height = canvas_height(width, duration, pps);
-        eprintln!("DEBUG track {id} window {:?} width {width} height {height} rows {:?}", app.window_size, crate::waveform::layout_rows(width, duration, pps).len());
         let mut program = TrackCanvas::new(cache, id, audio.clone(), rms.clone(), duration, pps);
         program.deleted = deleted.clone();
         program.muted = muted.clone();
@@ -784,8 +787,12 @@ fn track_row<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message> {
         program.threshold_db = threshold;
         program.revision = revision;
         program.selected = selected;
-        canvas(program).width(width).height(height)
-    };
+        canvas(program)
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .into()
+    })
+    .height(Length::Shrink);
 
     let (export_label, export_color) = if app.session.exporting.contains(&id) {
         ("exporting", theme::ACCENT)
