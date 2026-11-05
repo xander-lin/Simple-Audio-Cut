@@ -700,6 +700,15 @@ impl WorkerProcess {
                 config.device.clone(),
             ])
             .current_dir(&config.model_root)
+            // The application never downloads models (see AGENTS.md). Without
+            // this, ClearVoice tries to fetch a checkpoint when it is missing
+            // and blocks for minutes on an unreachable Hugging Face endpoint —
+            // and then happily "runs" a model that was never loaded, writing a
+            // silent file. Offline mode makes that fail immediately instead.
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
+            .env("HF_DATASETS_OFFLINE", "1")
+            .env("HF_HUB_DISABLE_TELEMETRY", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

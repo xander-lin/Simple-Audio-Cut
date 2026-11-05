@@ -312,6 +312,36 @@ impl NativeAudioEngine {
         }
     }
 
+    /// Guards against a provider that "succeeds" without producing audio.
+    ///
+    /// ClearVoice prints an error *and* returns normally when a checkpoint is
+    /// missing, writing a silent file. Replacing the user's take with that
+    /// would destroy their recording, so a silent output is a hard failure.
+    fn verify_denoise_output(input: &Path, model_output: &Path) -> Result<(), String> {
+        let output_lufs = Self::measure_lufs(&model_output.display().to_string())?;
+        const SILENT_LUFS: f64 = -60.0;
+        if output_lufs <= SILENT_LUFS {
+            return Err(format!(
+                "The denoising provider returned silence ({output_lufs:.1} LUFS). \
+                 Check that its model files are complete; the take keeps its original audio."
+            ));
+        }
+        // A provider must not change the length of the audio it was given.
+        if let (Ok(input_len), Ok(output_len)) = (
+            Self::media_duration_from_source(&input.display().to_string()),
+            Self::media_duration_from_source(&model_output.display().to_string()),
+        ) {
+            let tolerance = (input_len * 0.02).max(0.25);
+            if (output_len - input_len).abs() > tolerance {
+                return Err(format!(
+                    "The denoising provider changed the audio length ({input_len:.2}s → {output_len:.2}s). \
+                     The take keeps its original audio."
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn measure_lufs(source: &str) -> Result<f64, String> {
         let report = Self::run_ffmpeg(&[
             "-hide_banner".into(),
@@ -584,6 +614,7 @@ impl AudioEngine for NativeAudioEngine {
                         "FFmpeg denoise preparation",
                     )?;
                     denoise_session.enhance(&input, &model_output)?;
+                    Self::verify_denoise_output(&input, &model_output)?;
                     Self::run_command(
                         Path::new("ffmpeg"),
                         &[
@@ -867,6 +898,76 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_test_wav(path: &std::path::Path, seconds: f64, amplitude: f32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        let frames = (seconds * spec.sample_rate as f64) as usize;
+        for index in 0..frames {
+            let phase = index as f32 / spec.sample_rate as f32 * 220.0 * std::f32::consts::TAU;
+            writer
+                .write_sample((phase.sin() * amplitude * i16::MAX as f32) as i16)
+                .expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    fn temp_wav(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("simple-audio-cut-{name}-{stamp}.wav"))
+    }
+
+    #[test]
+    fn rejects_a_silent_denoise_result_instead_of_destroying_the_take() {
+        let input = temp_wav("denoise-input");
+        let silent = temp_wav("denoise-silent");
+        write_test_wav(&input, 1.0, 0.3);
+        write_test_wav(&silent, 1.0, 0.0);
+
+        let error = NativeAudioEngine::verify_denoise_output(&input, &silent)
+            .expect_err("silence must be rejected");
+        assert!(error.contains("silence"), "{error}");
+        assert!(error.contains("original audio"), "{error}");
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(silent);
+    }
+
+    #[test]
+    fn rejects_a_denoise_result_that_changes_the_length() {
+        let input = temp_wav("denoise-length-in");
+        let shorter = temp_wav("denoise-length-out");
+        write_test_wav(&input, 4.0, 0.3);
+        write_test_wav(&shorter, 1.0, 0.3);
+
+        let error = NativeAudioEngine::verify_denoise_output(&input, &shorter)
+            .expect_err("length change must be rejected");
+        assert!(error.contains("length"), "{error}");
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(shorter);
+    }
+
+    #[test]
+    fn accepts_a_denoise_result_that_keeps_audio_and_length() {
+        let input = temp_wav("denoise-ok-in");
+        let output = temp_wav("denoise-ok-out");
+        write_test_wav(&input, 2.0, 0.3);
+        write_test_wav(&output, 2.0, 0.25);
+
+        NativeAudioEngine::verify_denoise_output(&input, &output).expect("valid result");
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
 
     #[test]
     fn validates_ffmpeg_loudness_target_range() {

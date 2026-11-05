@@ -73,8 +73,20 @@ pub fn run() -> iced::Result {
         Services::mock()
     };
 
+    let files: Vec<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .collect();
+    if !files.is_empty() {
+        eprintln!(
+            "simple-audio-cut: importing {} file argument(s)",
+            files.len()
+        );
+    }
+
     iced::application(
-        move || App::boot(services.clone()),
+        move || App::boot_with_files(services.clone(), files.clone()),
         App::update,
         App::view,
     )
@@ -93,10 +105,35 @@ pub fn run() -> iced::Result {
 fn subscription(_app: &App) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
-        iced::event::listen_with(keyboard_shortcut),
+        iced::event::listen_with(global_event),
         window::close_requests().map(|_| Message::CloseRequested),
         window::resize_events().map(|(_, size)| Message::WindowResized(size)),
     ])
+}
+
+/// Maps runtime events that are not widget-specific.
+///
+/// File drag-and-drop from the file manager arrives here; it is unavailable on
+/// Wayland (winit limitation), where the in-app library drag is the way to add
+/// takes.
+fn global_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(window::Event::FileDropped(path)) => {
+            return Some(Message::FilesDropped(vec![path]));
+        }
+        iced::Event::Window(window::Event::FileHovered(_)) => {
+            return Some(Message::FilesHovered);
+        }
+        iced::Event::Window(window::Event::FilesHoveredLeft) => {
+            return Some(Message::FilesHoverLeft);
+        }
+        _ => {}
+    }
+    keyboard_shortcut(event, status, window)
 }
 
 fn keyboard_shortcut(

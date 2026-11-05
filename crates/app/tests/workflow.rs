@@ -66,7 +66,19 @@ fn harness() -> Harness {
         dialogs.clone(),
         events,
     );
-    let (app, _) = App::boot(services);
+    let (mut app, _) = App::boot(services);
+    // The provider status is resolved by a background job. Wait for it so the
+    // denoising policy is known before the test imports anything; otherwise
+    // the outcome would depend on job scheduling.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.session.denoise_status.is_none() {
+        let _ = app.update(Message::Tick);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the denoise provider status never resolved"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     Harness {
         app,
         player,
@@ -374,4 +386,30 @@ fn recording_cannot_be_toggled_twice_while_the_microphone_is_opening() {
     let _ = harness.app.update(Message::RecordToggle);
     assert!(harness.app.ui.recording_busy);
     assert!(harness.app.session.recording.is_none());
+}
+
+#[test]
+fn playback_uses_the_selected_track_not_the_last_one() {
+    let mut harness = harness();
+    // Two takes with different sample rates so the player call is identifiable.
+    let first = 91;
+    let second = 92;
+    harness.import_ready(first, "first");
+    harness.import_ready(second, "second");
+    let _ = harness.app.update(Message::AddToTimeline(first));
+    let _ = harness.app.update(Message::AddToTimeline(second));
+    assert_eq!(harness.app.session.selected_track, Some(second));
+
+    let _ = harness.app.update(Message::SelectTrack(first));
+    assert_eq!(harness.app.session.selected_track, Some(first));
+
+    let _ = harness.app.update(Message::PlayPause);
+
+    let playback = harness.app.session.playback.as_ref().expect("playing");
+    assert_eq!(playback.track_id, first, "played the wrong track");
+    let last_call = harness.player.calls().pop().expect("player call");
+    assert!(
+        last_call.starts_with("play 1000 Hz"),
+        "player received {last_call}"
+    );
 }

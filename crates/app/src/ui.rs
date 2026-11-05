@@ -257,6 +257,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
+    // Children publish first, so a drop on the timeline runs `DropItem` and
+    // this trailing `DragCancel` becomes a no-op; releasing anywhere else
+    // simply cancels.
+    let base = iced::widget::mouse_area(base)
+        .on_release(Message::DragCancel);
+
     let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
     if let Some(menu) = &app.ui.context_menu {
         layers.push(context_menu_overlay(app, menu));
@@ -266,6 +272,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if app.ui.confirm_quit {
         layers.push(confirm_quit_overlay(app));
+    }
+    if app.ui.dragging.is_some() || app.ui.files_hovering {
+        layers.push(drop_hint(app));
     }
     stack(layers).width(Length::Fill).height(Length::Fill).into()
 }
@@ -660,8 +669,11 @@ fn library_row<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
         .width(Length::Fill)
         .style(card_style);
 
+    // A press both selects the take and arms a drag; releasing over the
+    // timeline adds it as a track. (`Message::DragItem` selects first, so a
+    // plain click behaves exactly like before.)
     iced::widget::mouse_area(card)
-        .on_press(Message::SelectMedia(clip.id))
+        .on_press(Message::DragItem(clip.id))
         .into()
 }
 
@@ -782,7 +794,7 @@ fn library_card<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
     });
 
     iced::widget::mouse_area(card)
-        .on_press(Message::SelectMedia(clip.id))
+        .on_press(Message::DragItem(clip.id))
         .into()
 }
 
@@ -848,11 +860,19 @@ fn timeline(app: &App, wide: bool) -> Element<'_, Message> {
         .into()
     };
 
+    let dragging = app.ui.dragging.is_some();
+    let body = iced::widget::mouse_area(
+        container(body).width(Length::Fill).height(Length::Fill),
+    )
+    // `on_release` only fires while the cursor is over this widget, which is
+    // exactly the "dropped on the timeline" test.
+    .on_release(Message::DropItem);
+
     let mut content = column![header];
     if !wide {
         content = content.push(inspector_bar(app));
     }
-    container(
+    let mut panel = container(
         content
             .push(body)
             .push(status_bar(app))
@@ -860,9 +880,13 @@ fn timeline(app: &App, wide: bool) -> Element<'_, Message> {
             .height(Length::Fill),
     )
     .width(Length::Fill)
-    .height(Length::Fill)
-    .style(theme::panel_style)
-    .into()
+    .height(Length::Fill);
+    if dragging {
+        panel = panel.style(theme::drop_target_style);
+    } else {
+        panel = panel.style(theme::panel_style);
+    }
+    panel.into()
 }
 
 fn empty_timeline() -> Element<'static, Message> {
@@ -873,6 +897,8 @@ fn empty_timeline() -> Element<'static, Message> {
                 .size(11.0)
                 .color(theme::MUTED),
             row![
+                keycap("Drag"),
+                text("add take").size(9.0).color(theme::MUTED),
                 keycap("Enter"),
                 text("add selected").size(9.0).color(theme::MUTED),
                 keycap("Drag"),
@@ -1794,6 +1820,11 @@ impl canvas::Program<Message> for ScaleHandle {
         cursor: iced::mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
         use iced::mouse;
+        // iced forwards every canvas event to the program, whether or not the
+        // pointer is inside this widget. Without this guard each track's strip
+        // would react to a click anywhere in the window and the last one would
+        // win — which made playback always use the last track.
+        let position = cursor.position_in(bounds)?;
         match event {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let delta_y = match delta {
@@ -1812,7 +1843,6 @@ impl canvas::Program<Message> for ScaleHandle {
                 Some(canvas::Action::publish(Message::SelectTrack(self.track_id)))
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                let position = cursor.position_in(bounds).unwrap_or_default();
                 Some(canvas::Action::publish(Message::ContextMenu {
                     track: self.track_id,
                     kind: ContextMenuKind::Export,
@@ -2365,6 +2395,49 @@ fn field_label<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
     .into()
 }
 
+/// Thin banner that explains what a drop will do. Deliberately not a scrim:
+/// the user still needs to see where the take will land.
+fn drop_hint(app: &App) -> Element<'_, Message> {
+    let label = if let Some(id) = app.ui.dragging {
+        let name = app
+            .session
+            .clip_by_id(id)
+            .map(|clip| clip.name.clone())
+            .unwrap_or_else(|| "Take".into());
+        format!("Release over the timeline to add “{name}” as a new track")
+    } else {
+        "Release to import the dropped files".to_string()
+    };
+    let banner = container(
+        row![
+            text("⤓").size(12.0).color(theme::ACCENT),
+            text(label).size(11.0).color(theme::TEXT),
+        ]
+        .spacing(8.0)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding {
+        top: 8.0,
+        bottom: 8.0,
+        left: 14.0,
+        right: 14.0,
+    })
+    .style(theme::menu_style);
+
+    container(banner)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(Alignment::End)
+        .align_x(Alignment::Center)
+        .padding(Padding {
+            top: 0.0,
+            bottom: 54.0,
+            left: 0.0,
+            right: 0.0,
+        })
+        .into()
+}
+
 fn confirm_quit_overlay(app: &App) -> Element<'_, Message> {
     let _ = app;
     let scrim = container(Space::new().width(Length::Fill).height(Length::Fill))
@@ -2434,6 +2507,49 @@ mod tests {
     fn layout_falls_back_to_an_absolute_width_without_monitor_info() {
         assert_eq!(layout_for(1400.0, None), Layout::Columns);
         assert_eq!(layout_for(1100.0, None), Layout::Stacked);
+    }
+
+    #[test]
+    fn the_scale_strip_ignores_clicks_outside_its_own_bounds() {
+        use super::ScaleHandle;
+        use crate::message::Message;
+        use crate::theme;
+        use iced::widget::canvas;
+        use iced::{mouse, Point, Rectangle};
+
+        let strip = ScaleHandle {
+            track_id: 7,
+            color: theme::GREEN,
+        };
+        let bounds = Rectangle::new(Point::new(0.0, 0.0), iced::Size::new(10.0, 120.0));
+        let pressed = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+
+        // iced delivers every canvas event to the program; a click elsewhere in
+        // the window must not select this track. This is what made playback
+        // always use the last track.
+        let outside = mouse::Cursor::Available(Point::new(600.0, 400.0));
+        let action = canvas::Program::<Message>::update(
+            &strip,
+            &mut (),
+            &pressed,
+            bounds,
+            outside,
+        );
+        assert!(action.is_none(), "a click outside must be ignored");
+
+        let inside = mouse::Cursor::Available(Point::new(4.0, 40.0));
+        let action = canvas::Program::<Message>::update(
+            &strip,
+            &mut (),
+            &pressed,
+            bounds,
+            inside,
+        );
+        let action = action.expect("a click inside must select the track");
+        assert!(
+            matches!(action.into_inner().0, Some(Message::SelectTrack(7))),
+            "a click inside must select this track"
+        );
     }
 
     #[test]

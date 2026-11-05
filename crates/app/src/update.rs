@@ -55,6 +55,21 @@ impl App {
         crate::ui::view(self)
     }
 
+    /// Boots and immediately imports the given files, so the app can be opened
+    /// from a file manager or the command line. Unsupported paths are ignored.
+    pub fn boot_with_files(
+        services: Services,
+        paths: Vec<std::path::PathBuf>,
+    ) -> (Self, Task<Message>) {
+        let (app, _) = Self::boot(services);
+        let task = if paths.is_empty() {
+            Task::none()
+        } else {
+            Task::done(Message::FilesDropped(paths))
+        };
+        (app, task)
+    }
+
     pub fn boot(services: Services) -> (Self, Task<Message>) {
         let app = Self {
             session: Session::default(),
@@ -101,6 +116,12 @@ impl App {
             Message::RenameCommit => self.commit_rename(),
             Message::Dismiss => self.dismiss(),
             Message::AddToTimeline(id) => self.add_to_timeline(id),
+            Message::DragItem(id) => self.begin_drag(id),
+            Message::DropItem => self.drop_item(),
+            Message::DragCancel => self.ui.dragging = None,
+            Message::FilesHovered => self.ui.files_hovering = true,
+            Message::FilesHoverLeft => self.ui.files_hovering = false,
+            Message::FilesDropped(paths) => self.import_dropped(paths),
             Message::DeleteMedia(id) => self.delete_media(id),
             Message::RetryImport(id) => self.retry_import(id),
             Message::SetDenoise { id, enabled } => self.set_denoise(id, enabled),
@@ -354,6 +375,10 @@ impl App {
 
     /// Escape closes the innermost transient layer.
     fn dismiss(&mut self) {
+        if self.ui.dragging.is_some() {
+            self.ui.dragging = None;
+            return;
+        }
         if self.ui.rename.is_some() {
             self.ui.rename = None;
             return;
@@ -732,6 +757,7 @@ impl App {
                         }
                         self.ui.settings.status = Some(status.clone());
                         self.session.denoise_status = Some(status);
+                        self.apply_denoise_policy();
                     }
                     Err(error) => self.ui.settings.error = Some(error),
                 }
@@ -767,7 +793,7 @@ impl App {
                             status.summary.clone()
                         };
                         if status.ready {
-                            self.requeue_denoise_candidates();
+                            self.apply_denoise_policy();
                         }
                     }
                     Err(error) => self.ui.settings.error = Some(error),
@@ -1016,21 +1042,23 @@ impl App {
         let Some(clip) = self.session.clip_by_id(id) else {
             return;
         };
-        if clip.denoise.status.is_busy()
-            || (!force && clip.denoise.status == crate::model::DenoiseStatus::Skipped)
-        {
+        if clip.denoise.status.is_busy() || (!force && clip.denoise.opted_out) {
             return;
         }
         if !force {
             // The global switch means "denoise new media automatically". When
             // it is off the take keeps its normalized audio and the inspector
-            // can still trigger it explicitly.
-            let automatic = self
+            // can still trigger it explicitly. Until the provider status has
+            // been resolved we do not know the switch, so the take is left
+            // alone; `apply_denoise_policy` runs once the status arrives.
+            let Some(automatic) = self
                 .session
                 .denoise_status
                 .as_ref()
                 .map(|status| status.effective.enabled)
-                .unwrap_or(true);
+            else {
+                return;
+            };
             if !automatic {
                 // A build without a provider cannot denoise at all; anything
                 // else is a user preference that can be overridden per take.
@@ -1071,6 +1099,7 @@ impl App {
                 status: crate::model::DenoiseStatus::Queued,
                 task_id: task_id.clone(),
                 reason: None,
+                opted_out: false,
             };
         }
         if let Some(track) = self.session.track_mut(id) {
@@ -1108,6 +1137,7 @@ impl App {
             if let Some(clip) = self.session.editing_mut(id) {
                 let mut skipped = crate::model::DenoiseState::skipped();
                 skipped.reason = Some("Denoising is off for this take.".into());
+                skipped.opted_out = true;
                 clip.denoise = skipped;
             }
             if let Some(track) = self.session.track_mut(id) {
@@ -1144,24 +1174,52 @@ impl App {
         self.queue_denoise_forced(id);
     }
 
-    fn requeue_denoise_candidates(&mut self) {
+    /// Applies the global denoising policy to every ready take.
+    ///
+    /// Runs whenever the provider status is (re)resolved, so the outcome no
+    /// longer depends on whether the import finished before or after the
+    /// status arrived. An explicit per-take opt-out is never overridden.
+    fn apply_denoise_policy(&mut self) {
+        let Some(status) = self.session.denoise_status.clone() else {
+            return;
+        };
+        let automatic = status.effective.enabled;
+        let provider_usable = status.provider_id != "disabled";
         let candidates: Vec<MediaId> = self
             .session
             .media
             .iter()
             .chain(self.session.tracks.iter().map(|track| &track.clip))
             .filter(|clip| clip.ready())
+            .filter(|clip| !clip.denoise.opted_out)
             .filter(|clip| {
                 matches!(
                     clip.denoise.status,
                     crate::model::DenoiseStatus::Unavailable
                         | crate::model::DenoiseStatus::Failed
+                        | crate::model::DenoiseStatus::Skipped
                 )
             })
             .map(|clip| clip.id)
             .collect();
         for id in candidates {
-            self.queue_denoise(id);
+            if automatic {
+                self.queue_denoise(id);
+                continue;
+            }
+            if let Some(clip) = self.session.editing_mut(id) {
+                if provider_usable {
+                    let mut skipped = crate::model::DenoiseState::skipped();
+                    skipped.reason = Some(
+                        "Automatic denoising is off. You can denoise this take manually.".into(),
+                    );
+                    clip.denoise = skipped;
+                } else {
+                    clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
+                    clip.denoise.task_id.clear();
+                    clip.denoise.reason = Some(status.summary.clone());
+                }
+            }
         }
     }
 
@@ -1195,6 +1253,50 @@ impl App {
         self.session.selected_media = None;
         self.session.playhead = 0.0;
         self.refresh_silence_inputs();
+    }
+
+    /// Picks a library take up for dragging. Selecting it first matches what a
+    /// plain click used to do, so a cancelled drag leaves no odd state behind.
+    fn begin_drag(&mut self, id: MediaId) {
+        // Selecting is unconditional: a press on a card must still behave like
+        // a click even when the take is not ready to be dragged.
+        self.select_media(id);
+        if self.session.media(id).is_some_and(MediaClip::ready) {
+            self.ui.dragging = Some(id);
+        }
+    }
+
+    /// Finishes a library drag: the take becomes its own timeline track.
+    fn drop_item(&mut self) {
+        let Some(id) = self.ui.dragging.take() else {
+            return;
+        };
+        self.add_to_timeline(id);
+    }
+
+    /// Imports files dropped from the file manager, filtering by extension the
+    /// same way the import dialog does.
+    fn import_dropped(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.ui.files_hovering = false;
+        let accepted: Vec<std::path::PathBuf> = paths
+            .into_iter()
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.to_ascii_lowercase())
+                    .is_some_and(|extension| {
+                        crate::services::IMPORT_EXTENSIONS
+                            .iter()
+                            .any(|candidate| *candidate == extension)
+                    })
+            })
+            .collect();
+        if accepted.is_empty() {
+            self.ui.message =
+                "Only audio or video files can be dropped here.".into();
+            return;
+        }
+        self.import_paths(accepted);
     }
 
     fn add_to_timeline(&mut self, id: MediaId) {
@@ -2315,6 +2417,157 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_library_take_onto_the_timeline_adds_a_track() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        assert!(app.session.tracks.is_empty());
+
+        let _ = app.update(Message::DragItem(1));
+        assert_eq!(app.ui.dragging, Some(1));
+        assert_eq!(app.session.selected_media, Some(1));
+
+        let _ = app.update(Message::DropItem);
+
+        assert!(app.ui.dragging.is_none());
+        assert!(app.session.track(1).is_some());
+        assert!(app.session.media(1).is_none());
+        assert_eq!(app.session.selected_track, Some(1));
+    }
+
+    #[test]
+    fn releasing_a_drag_away_from_the_timeline_cancels_it() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+
+        let _ = app.update(Message::DragItem(1));
+        let _ = app.update(Message::DragCancel);
+
+        assert!(app.ui.dragging.is_none());
+        assert!(app.session.media(1).is_some());
+        assert!(app.session.tracks.is_empty());
+    }
+
+    #[test]
+    fn a_pending_import_cannot_be_dragged_onto_the_timeline() {
+        let mut app = app();
+        app.session
+            .media
+            .push(crate::model::MediaClip::placeholder(2, "/tmp/pending.wav"));
+
+        let _ = app.update(Message::DragItem(2));
+
+        assert!(app.ui.dragging.is_none());
+        let _ = app.update(Message::DropItem);
+        assert!(app.session.tracks.is_empty());
+        assert!(app.session.media(2).is_some());
+    }
+
+    #[test]
+    fn dropping_files_imports_the_accepted_ones_only() {
+        let mut app = app();
+        let before = app.session.media.len();
+
+        let _ = app.update(Message::FilesDropped(vec![
+            std::path::PathBuf::from("/tmp/voice.WAV"),
+            std::path::PathBuf::from("/tmp/clip.mp4"),
+            std::path::PathBuf::from("/tmp/notes.txt"),
+        ]));
+
+        // Only the two audio/video files are queued.
+        assert_eq!(app.session.media.len(), before + 2);
+        assert!(app.ui.message.contains('2'));
+    }
+
+    #[test]
+    fn dropping_unsupported_files_explains_why_nothing_happened() {
+        let mut app = app();
+        let _ = app.update(Message::FilesDropped(vec![std::path::PathBuf::from(
+            "/tmp/notes.txt",
+        )]));
+
+        assert_eq!(
+            app.ui.message,
+            "Only audio or video files can be dropped here."
+        );
+        assert!(app.session.media.is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_a_drag_before_closing_anything_else() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        app.ui.settings_open = true;
+
+        let _ = app.update(Message::DragItem(1));
+        let _ = app.update(Message::Dismiss);
+
+        assert!(app.ui.dragging.is_none());
+        assert!(app.ui.settings_open, "the drawer should stay open");
+    }
+
+    #[test]
+    fn an_unresolved_provider_status_does_not_start_denoising() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        // Simulate the race: the take exists while the provider status is
+        // still unknown (the boot job has not reported yet).
+        app.session.denoise_status = None;
+        if let Some(clip) = app.session.editing_mut(1) {
+            clip.denoise = crate::model::DenoiseState::default();
+        }
+
+        app.queue_denoise(1);
+
+        let status = app.session.clip_by_id(1).unwrap().denoise.status;
+        assert!(
+            !status.is_busy(),
+            "denoising started before the provider was known ({status:?})"
+        );
+    }
+
+    #[test]
+    fn resolving_the_status_applies_the_policy_to_already_imported_takes() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        // The take is sitting untouched, waiting for the provider status.
+        if let Some(clip) = app.session.editing_mut(1) {
+            clip.denoise = crate::model::DenoiseState::default();
+        }
+        let mut status = app.services.denoise.status();
+        status.effective.enabled = false;
+        status.configured.enabled = false;
+        app.session.denoise_status = Some(status);
+
+        app.apply_denoise_policy();
+
+        let clip = app.session.clip_by_id(1).unwrap();
+        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
+        assert!(clip.denoise.reason.is_some());
+        assert!(!clip.denoise.opted_out);
+    }
+
+    #[test]
+    fn the_policy_never_overrides_an_explicit_opt_out() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: false,
+        });
+        assert!(app.session.clip_by_id(1).unwrap().denoise.opted_out);
+        let mut status = app.services.denoise.status();
+        status.effective.enabled = true;
+        status.configured.enabled = true;
+        app.session.denoise_status = Some(status);
+
+        app.apply_denoise_policy();
+
+        let clip = app.session.clip_by_id(1).unwrap();
+        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
+        assert!(clip.denoise.opted_out);
+    }
+
+    #[test]
     fn turning_denoising_off_keeps_the_take_editable_and_exportable() {
         let mut app = app();
         add_ready_media(&mut app, 1);
@@ -2377,7 +2630,7 @@ mod tests {
             enabled: false,
         });
 
-        app.requeue_denoise_candidates();
+        app.apply_denoise_policy();
 
         assert_eq!(
             app.session.clip_by_id(1).unwrap().denoise.status,

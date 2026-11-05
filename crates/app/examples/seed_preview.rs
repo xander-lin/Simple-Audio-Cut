@@ -99,6 +99,9 @@ fn seed() -> App {
     // Leave the pickup line in the library so the sidebar design is visible.
     let _ = app.update(Message::SelectTrack(1));
     let _ = app.update(Message::Seek(1.2));
+    if std::env::var_os("PREVIEW_DRAG").is_some() {
+        let _ = app.update(Message::DragItem(3));
+    }
     if std::env::var_os("PREVIEW_SELECTION").is_some() {
         let _ = app.update(Message::SelectRange(Some(Region::new(1.0, 2.2))));
     }

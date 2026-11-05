@@ -72,6 +72,9 @@ pub struct DenoiseState {
     /// Why denoising did not run. Shown in the inspector so "No denoise" is
     /// never a dead end.
     pub reason: Option<String>,
+    /// True when the user explicitly chose the original audio for this take.
+    /// Automatic policies must never override that choice.
+    pub opted_out: bool,
 }
 
 impl DenoiseState {
@@ -80,6 +83,7 @@ impl DenoiseState {
             status: DenoiseStatus::Skipped,
             task_id: String::new(),
             reason: None,
+            opted_out: false,
         }
     }
 }
@@ -440,6 +444,10 @@ pub struct UiState {
     /// Uncommitted media rename. The model keeps the previous name until the
     /// draft is committed, so clearing the field can never erase it.
     pub rename: Option<RenameDraft>,
+    /// Library take currently being dragged towards the timeline.
+    pub dragging: Option<MediaId>,
+    /// True while files from the file manager hover the window.
+    pub files_hovering: bool,
     /// True while the microphone is being opened or the take is being
     /// finalized; the record button is inert meanwhile.
     pub recording_busy: bool,
@@ -458,6 +466,8 @@ impl Default for UiState {
             silence_threshold_input: DEFAULT_SILENCE_THRESHOLD_DB.to_string(),
             min_silence_input: DEFAULT_MIN_SILENCE_MS.to_string(),
             rename: None,
+            dragging: None,
+            files_hovering: false,
             recording_busy: false,
         }
     }

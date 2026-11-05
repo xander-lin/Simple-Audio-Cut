@@ -59,6 +59,16 @@ pub enum Message {
     /// Escape: dismiss the innermost transient layer (rename, menu, drawer).
     Dismiss,
     AddToTimeline(MediaId),
+    /// Starts dragging a library item.
+    DragItem(MediaId),
+    /// Released while hovering the timeline.
+    DropItem,
+    /// Released anywhere else: the drag is abandoned.
+    DragCancel,
+    /// Files dragged in from the file manager.
+    FilesHovered,
+    FilesHoverLeft,
+    FilesDropped(Vec<std::path::PathBuf>),
     DeleteMedia(MediaId),
     RetryImport(MediaId),
     /// Turn denoising on or off for one take.

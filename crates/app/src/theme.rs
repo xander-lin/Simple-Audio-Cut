@@ -222,6 +222,20 @@ pub fn pill(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// Timeline panel while a library take is being dragged over it.
+pub fn drop_target_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(PANEL)),
+        border: Border {
+            color: Color { a: 0.55, ..ACCENT },
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        text_color: Some(TEXT),
+        ..container::Style::default()
+    }
+}
+
 pub fn scrim_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
