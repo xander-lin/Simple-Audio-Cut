@@ -1,5 +1,4 @@
-mod audio;
-mod denoise;
+use simple_audio_cut_core::{audio, denoise};
 
 #[cfg(feature = "native-audio")]
 use audio::NativeAudioEngine;
