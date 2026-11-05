@@ -30,7 +30,6 @@ use crate::ui::format_time_standard;
 struct PendingExport {
     edits: Vec<ExportEdit>,
     signatures: Vec<(MediaId, String)>,
-    single: bool,
 }
 
 pub struct App {
@@ -39,6 +38,10 @@ pub struct App {
     pub services: Services,
     pub window_size: Size,
     pending_export: Option<PendingExport>,
+    /// Whether the in-flight export was started from a single track. Kept
+    /// apart from [`PendingExport`] so the dispatched request never has to
+    /// carry placeholder data just to remember the completion wording.
+    export_single: bool,
 }
 
 impl App {
@@ -53,6 +56,7 @@ impl App {
             services,
             window_size: Size::new(1100.0, 760.0),
             pending_export: None,
+            export_single: false,
         };
         let denoise = app.services.denoise.clone();
         let events = app.services.events.clone();
@@ -61,6 +65,7 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.commit_rename_before(&message);
         match message {
             Message::Tick => self.tick(),
             Message::RecordToggle => self.toggle_recording(),
@@ -79,14 +84,9 @@ impl App {
             Message::ImportPressed => self.import_audio(),
             Message::SelectMedia(id) => self.select_media(id),
             Message::SelectTrack(id) => self.select_track(id),
-            Message::RenameMedia(id, name) => {
-                if let Some(clip) = self.session.editing_mut(id) {
-                    clip.name = name;
-                }
-                if let Some(track) = self.session.track_mut(id) {
-                    track.touch();
-                }
-            }
+            Message::RenameMedia(id, name) => self.edit_rename(id, name),
+            Message::RenameCommit => self.commit_rename(),
+            Message::Dismiss => self.dismiss(),
             Message::AddToTimeline(id) => self.add_to_timeline(id),
             Message::DeleteMedia(id) => self.delete_media(id),
             Message::RetryImport(id) => self.retry_import(id),
@@ -151,10 +151,16 @@ impl App {
                 self.ui.settings_open = true;
                 self.ui.settings.busy = true;
                 self.ui.settings.error = None;
+                // Re-seed from the saved configuration; unsaved edits are not
+                // carried across drawer visits.
+                self.ui.settings.draft = None;
                 jobs::provider_status(self.services.denoise.clone(), self.services.events.clone());
             }
             Message::CloseSettings => {
                 self.ui.settings_open = false;
+                // The note is a one-drawer ambient report; it must not survive
+                // into the next visit or leak into the status bar forever.
+                self.session.denoise_note = None;
                 self.stop_playback(false);
             }
             Message::SettingsEnabled(enabled) => {
@@ -241,9 +247,87 @@ impl App {
             Message::CancelQuit => self.ui.confirm_quit = false,
             Message::Shortcut(shortcut) => self.shortcut(shortcut),
             Message::WindowResized(size) => self.window_size = size,
-            Message::Noop => {}
         }
         Task::none()
+    }
+
+    /// Rename is committed like the old editor's `onBlur`: typing updates a
+    /// draft, any other interaction commits it, and Escape discards it.
+    fn commit_rename_before(&mut self, message: &Message) {
+        if self.ui.rename.is_none() {
+            return;
+        }
+        if matches!(
+            message,
+            Message::Tick | Message::RenameMedia(..) | Message::RenameCommit | Message::Dismiss
+        ) {
+            return;
+        }
+        self.commit_rename();
+    }
+
+    fn edit_rename(&mut self, id: MediaId, value: String) {
+        if self.session.clip_by_id(id).is_none() {
+            return;
+        }
+        let restart = self
+            .ui
+            .rename
+            .as_ref()
+            .is_none_or(|draft| draft.id != id);
+        if restart {
+            let original = self
+                .session
+                .clip_by_id(id)
+                .map(|clip| clip.name.clone())
+                .unwrap_or_default();
+            self.ui.rename = Some(crate::model::RenameDraft {
+                id,
+                original,
+                value: value.clone(),
+            });
+        }
+        if let Some(draft) = &mut self.ui.rename {
+            draft.value = value;
+        }
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(draft) = self.ui.rename.take() else {
+            return;
+        };
+        let name = draft.value.trim();
+        if name.is_empty() || name == draft.original.trim() {
+            return;
+        }
+        let name = name.to_string();
+        // Renaming changes the export file name only; it must not rebuild the
+        // collapsed waveform or invalidate the rendered canvas.
+        if let Some(clip) = self.session.editing_mut(draft.id) {
+            clip.name = name;
+        }
+    }
+
+    /// Escape closes the innermost transient layer.
+    fn dismiss(&mut self) {
+        if self.ui.rename.is_some() {
+            self.ui.rename = None;
+            return;
+        }
+        if self.ui.confirm_quit {
+            self.ui.confirm_quit = false;
+            return;
+        }
+        if self.ui.context_menu.is_some() {
+            self.ui.context_menu = None;
+            return;
+        }
+        if self.ui.settings_open {
+            self.ui.settings_open = false;
+            self.ui.settings.busy = false;
+            self.session.denoise_note = None;
+            self.stop_playback(false);
+        }
     }
 
     fn tick(&mut self) {
@@ -304,6 +388,7 @@ impl App {
                     Ok(decoded) => {
                         let id = placeholder;
                         let name = decoded.info.name.clone();
+                        let existed = self.session.clip_by_id(id).is_some();
                         self.apply_decoded(
                             id,
                             decoded.info.path.clone(),
@@ -311,6 +396,14 @@ impl App {
                             decoded.rms,
                             decoded.info.integrated_lufs,
                         );
+                        if !existed {
+                            // The placeholder was deleted while the take was
+                            // being finalized; do not claim a success the user
+                            // cannot see.
+                            self.ui.message =
+                                "The recording was discarded before it finished.".into();
+                            return;
+                        }
                         if let Some(clip) = self.session.editing_mut(id) {
                             if clip.name.trim().is_empty() {
                                 clip.name = name.clone();
@@ -338,6 +431,7 @@ impl App {
                 audio,
                 rms,
             } => {
+                let existed = self.session.clip_by_id(id).is_some();
                 self.apply_decoded(
                     id,
                     info.path.clone(),
@@ -345,6 +439,11 @@ impl App {
                     rms,
                     info.integrated_lufs,
                 );
+                if !existed {
+                    self.ui.message =
+                        "The imported media was removed before it finished.".into();
+                    return;
+                }
                 if let Some(clip) = self.session.editing_mut(id) {
                     if clip.name.trim().is_empty() {
                         clip.name = info.name;
@@ -453,19 +552,40 @@ impl App {
                     .filter(|result| result.error.is_some())
                     .filter_map(|result| result.recording_id.parse().ok())
                     .collect();
-                self.session.failed_exports = failed_ids;
-                for (id, signature) in signatures {
-                    if results.iter().any(|result| {
-                        result.recording_id == id.to_string() && result.error.is_none()
-                    }) {
-                        self.session.mark_exported(id, signature);
+                // Keep failures from earlier batches, but replace the state of
+                // every track that took part in this one.
+                let batch_ids: Vec<MediaId> = signatures.iter().map(|(id, _)| *id).collect();
+                self.session
+                    .failed_exports
+                    .retain(|id| !batch_ids.contains(id));
+                for id in failed_ids {
+                    if !self.session.failed_exports.contains(&id) {
+                        self.session.failed_exports.push(id);
                     }
                 }
-                let single = self
-                    .pending_export
-                    .as_ref()
-                    .map(|export| export.single)
-                    .unwrap_or(false);
+                let mut changed_during_export = false;
+                for (id, signature) in signatures {
+                    let succeeded = results.iter().any(|result| {
+                        result.recording_id == id.to_string() && result.error.is_none()
+                    });
+                    if !succeeded {
+                        continue;
+                    }
+                    // Only claim the export if the track still produces the
+                    // audio that was sent to FFmpeg. A denoise pass finishing
+                    // mid-export replaces the buffer, so the track must stay
+                    // queued instead of being marked with a stale signature.
+                    let unchanged = self
+                        .session
+                        .track(id)
+                        .is_some_and(|track| track.signature() == signature);
+                    if unchanged {
+                        self.session.mark_exported(id, signature);
+                    } else {
+                        changed_during_export = true;
+                    }
+                }
+                let single = self.export_single;
                 self.pending_export = None;
                 if let Some(failure) = failures.first() {
                     let name = results
@@ -502,17 +622,42 @@ impl App {
                         );
                     }
                 }
+                if changed_during_export {
+                    self.ui.message.push_str(
+                        " A track changed during export and stays queued for the next export.",
+                    );
+                }
             }
             AppEvent::ExportFailed { error } => {
                 self.session.exporting.clear();
                 self.pending_export = None;
+                self.export_single = false;
                 self.ui.message = error;
             }
             AppEvent::SettingsStatus(result) => {
                 self.ui.settings.busy = false;
                 match result {
                     Ok(status) => {
-                        self.ui.settings.draft = Some(status.configured.clone());
+                        // Opening the drawer seeds the draft from the saved
+                        // configuration.
+                        if self.ui.settings.draft.is_none() {
+                            self.ui.settings.draft = Some(status.configured.clone());
+                        }
+                        self.ui.settings.status = Some(status.clone());
+                        self.session.denoise_status = Some(status);
+                    }
+                    Err(error) => self.ui.settings.error = Some(error),
+                }
+            }
+            AppEvent::SettingsInspected(result) => {
+                self.ui.settings.busy = false;
+                match result {
+                    Ok(status) => {
+                        // Never touch the draft: the user may be editing it
+                        // while the check runs.
+                        if self.ui.settings.draft.is_none() {
+                            self.ui.settings.draft = Some(status.configured.clone());
+                        }
                         self.ui.settings.status = Some(status.clone());
                         self.session.denoise_status = Some(status);
                     }
@@ -526,7 +671,9 @@ impl App {
                         self.session.denoise_status = Some(status.clone());
                         self.ui.settings.draft = Some(status.configured.clone());
                         self.ui.settings.status = Some(status.clone());
-                        self.ui.settings_open = false;
+                        // Keep the drawer open so the user can read the
+                        // summary of what was saved.
+                        self.ui.settings.error = None;
                         self.ui.message = if status.ready {
                             "Denoising setup saved. Queuing eligible media.".into()
                         } else {
@@ -561,6 +708,7 @@ impl App {
                 if request == FileRequest::ExportFolder {
                     self.session.exporting.clear();
                     self.pending_export = None;
+                    self.export_single = false;
                     self.ui.message = "Export cancelled".into();
                 }
             }
@@ -568,6 +716,7 @@ impl App {
                 if request == FileRequest::ExportFolder {
                     self.session.exporting.clear();
                     self.pending_export = None;
+                    self.export_single = false;
                 } else {
                     self.ui.settings.busy = false;
                     self.ui.settings.error = Some(error.clone());
@@ -1261,6 +1410,7 @@ impl App {
 
     fn start_export(&mut self, ids: Vec<MediaId>, single: bool) {
         if !self.session.exporting.is_empty() {
+            self.ui.message = "An export is already running.".into();
             return;
         }
         self.stop_playback(true);
@@ -1306,14 +1456,11 @@ impl App {
             return;
         }
         self.session.exporting = ids;
+        self.export_single = single;
         self.session
             .failed_exports
             .retain(|id| !signatures.iter().any(|(candidate, _)| candidate == id));
-        self.pending_export = Some(PendingExport {
-            edits,
-            signatures,
-            single,
-        });
+        self.pending_export = Some(PendingExport { edits, signatures });
         self.ui.message = "Choose a folder for the exported audio.".into();
         jobs::choose_folder(
             self.services.dialogs.clone(),
@@ -1327,20 +1474,18 @@ impl App {
     fn export_to_folder(&mut self, destination: Option<std::path::PathBuf>) {
         let Some(pending) = self.pending_export.take() else {
             self.session.exporting.clear();
+            self.export_single = false;
             return;
         };
         let Some(destination) = destination else {
             self.session.exporting.clear();
+            self.export_single = false;
             self.ui.message = "Export cancelled".into();
             return;
         };
         let directory = destination.display().to_string();
         self.services.export_dirs.remember(&directory);
-        let PendingExport {
-            edits,
-            signatures,
-            single,
-        } = pending;
+        let PendingExport { edits, signatures } = pending;
         jobs::export_tracks(
             self.services.engine.clone(),
             self.services.events.clone(),
@@ -1348,12 +1493,6 @@ impl App {
             signatures,
             directory,
         );
-        // Keep `single` for the completion message.
-        self.pending_export = Some(PendingExport {
-            edits: Vec::new(),
-            signatures: Vec::new(),
-            single,
-        });
     }
 
     fn shortcut(&mut self, shortcut: Shortcut) {
@@ -1426,9 +1565,11 @@ pub fn track_signature(track: &Track) -> String {
 #[cfg(test)]
 mod tests {
     use super::App;
+    use crate::events::{AppEvent, DecodedClip};
     use crate::message::Message;
     use crate::model::{MediaId, Track};
     use crate::services::Services;
+    use simple_audio_cut_core::audio::ExportResult;
 
     fn app() -> App {
         let (app, _) = App::boot(Services::mock());
@@ -1543,5 +1684,280 @@ mod tests {
             app.ui.message,
             "All editor tracks are already exported."
         );
+    }
+
+    fn decoded_clip(id: MediaId) -> DecodedClip {
+        use simple_audio_cut_core::audio::RecordingInfo;
+        let audio = std::sync::Arc::new(simple_audio_cut_core::buffer::AudioBuffer::new(
+            1_000,
+            vec![vec![0.1; 1_000]],
+        ));
+        let rms = std::sync::Arc::new(simple_audio_cut_core::analysis::analyze_rms(
+            &audio,
+            Default::default(),
+        ));
+        DecodedClip {
+            info: RecordingInfo {
+                id: id.to_string(),
+                name: "Voice".into(),
+                path: "/tmp/voice.wav".into(),
+                duration_seconds: 1.0,
+                integrated_lufs: Some(-14.0),
+            },
+            audio,
+            rms,
+        }
+    }
+
+    #[test]
+    fn escape_closes_the_settings_drawer() {
+        let mut app = app();
+        let _ = app.update(Message::OpenSettings);
+        assert!(app.ui.settings_open);
+        let _ = app.update(Message::Dismiss);
+        assert!(!app.ui.settings_open);
+        assert!(!app.ui.settings.busy);
+    }
+
+    #[test]
+    fn escape_closes_the_context_menu_before_the_drawer() {
+        let mut app = app();
+        app.ui.settings_open = true;
+        app.ui.context_menu = Some(crate::model::ContextMenu {
+            track_id: 1,
+            kind: crate::model::ContextMenuKind::Actions,
+            x: 10.0,
+            y: 10.0,
+        });
+        let _ = app.update(Message::Dismiss);
+        assert!(app.ui.context_menu.is_none());
+        assert!(app.ui.settings_open);
+        let _ = app.update(Message::Dismiss);
+        assert!(!app.ui.settings_open);
+    }
+
+    #[test]
+    fn rename_commits_on_submit_and_ignores_an_empty_draft() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::RenameMedia(1, "Take two".into()));
+        let _ = app.update(Message::RenameCommit);
+        assert_eq!(app.session.clip_by_id(1).unwrap().name, "Take two");
+        assert!(app.ui.rename.is_none());
+
+        let _ = app.update(Message::RenameMedia(1, "   ".into()));
+        let _ = app.update(Message::RenameCommit);
+        assert_eq!(app.session.clip_by_id(1).unwrap().name, "Take two");
+    }
+
+    #[test]
+    fn rename_commits_when_another_interaction_starts() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        add_ready_media(&mut app, 2);
+        let _ = app.update(Message::RenameMedia(1, "Renamed".into()));
+        let _ = app.update(Message::SelectMedia(2));
+        assert_eq!(app.session.clip_by_id(1).unwrap().name, "Renamed");
+        assert!(app.ui.rename.is_none());
+    }
+
+    #[test]
+    fn escape_discards_an_uncommitted_rename() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let original = app.session.clip_by_id(1).unwrap().name.clone();
+        let _ = app.update(Message::RenameMedia(1, "Draft".into()));
+        let _ = app.update(Message::Dismiss);
+        assert!(app.ui.rename.is_none());
+        assert_eq!(app.session.clip_by_id(1).unwrap().name, original);
+    }
+
+    #[test]
+    fn renaming_a_collapsed_track_does_not_rebuild_the_collapsed_audio() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        {
+            let track = app.session.track_mut(1).unwrap();
+            track.manual_deleted = vec![simple_audio_cut_core::region::Region::new(0.2, 0.4)];
+            track.touch();
+            track.collapsed = true;
+            track.rebuild_collapsed();
+        }
+        let before = app
+            .session
+            .track(1)
+            .unwrap()
+            .collapsed_audio
+            .clone()
+            .expect("collapsed audio");
+        let revision = app.session.track(1).unwrap().revision;
+
+        let _ = app.update(Message::RenameMedia(1, "Renamed".into()));
+        let _ = app.update(Message::RenameCommit);
+
+        let track = app.session.track(1).unwrap();
+        assert_eq!(track.revision, revision);
+        let after = track.collapsed_audio.clone().expect("collapsed audio");
+        assert!(std::sync::Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn a_recording_deleted_while_finalizing_does_not_report_success() {
+        let mut app = app();
+        let placeholder = 7;
+        app.session.media.push(crate::model::MediaClip::recording_placeholder(
+            placeholder,
+            "Recording",
+        ));
+        app.session.recording = Some(crate::model::ActiveRecording {
+            placeholder,
+            started: std::time::Instant::now(),
+        });
+        let _ = app.update(Message::DeleteMedia(placeholder));
+        app.services.events.emit(AppEvent::RecordingStopped {
+            placeholder,
+            result: Ok(decoded_clip(placeholder)),
+        });
+        let _ = app.update(Message::Tick);
+
+        assert_eq!(
+            app.ui.message,
+            "The recording was discarded before it finished."
+        );
+        assert!(app.session.clip_by_id(placeholder).is_none());
+    }
+
+    #[test]
+    fn an_import_removed_before_completion_does_not_claim_success() {
+        let mut app = app();
+        let clip = decoded_clip(404);
+        app.services.events.emit(AppEvent::ImportCompleted {
+            id: 404,
+            info: clip.info,
+            audio: clip.audio,
+            rms: clip.rms,
+        });
+        let _ = app.update(Message::Tick);
+
+        assert_eq!(
+            app.ui.message,
+            "The imported media was removed before it finished."
+        );
+        assert!(app.session.clip_by_id(404).is_none());
+    }
+
+    fn add_track_for_export(app: &mut App, id: MediaId) {
+        add_ready_media(app, id);
+        let _ = app.update(Message::AddToTimeline(id));
+    }
+
+    fn completed_export(id: MediaId, signature: String) -> AppEvent {
+        AppEvent::ExportCompleted {
+            results: vec![ExportResult {
+                recording_id: id.to_string(),
+                path: Some("/tmp/export/voice.wav".into()),
+                error: None,
+            }],
+            signatures: vec![(id, signature)],
+        }
+    }
+
+    #[test]
+    fn a_track_that_changed_during_export_stays_queued() {
+        let mut app = app();
+        add_track_for_export(&mut app, 1);
+        let signature = app.session.track(1).unwrap().signature();
+        app.session.exporting = vec![1];
+        app.session.track_mut(1).unwrap().clip.name = "Renamed mid-export".into();
+
+        app.services
+            .events
+            .emit(completed_export(1, signature));
+        let _ = app.update(Message::Tick);
+
+        let track = app.session.track(1).unwrap();
+        assert!(track.needs_export());
+        assert!(app
+            .ui
+            .message
+            .contains("changed during export"));
+    }
+
+    #[test]
+    fn an_unchanged_export_marks_the_track_exported() {
+        let mut app = app();
+        add_track_for_export(&mut app, 1);
+        let signature = app.session.track(1).unwrap().signature();
+        app.session.exporting = vec![1];
+
+        app.services
+            .events
+            .emit(completed_export(1, signature));
+        let _ = app.update(Message::Tick);
+
+        assert!(!app.session.track(1).unwrap().needs_export());
+        assert!(app.session.failed_exports.is_empty());
+    }
+
+    #[test]
+    fn a_completed_export_keeps_failures_from_other_batches() {
+        let mut app = app();
+        add_track_for_export(&mut app, 1);
+        let signature = app.session.track(1).unwrap().signature();
+        app.session.exporting = vec![1];
+        app.session.failed_exports = vec![99];
+
+        app.services
+            .events
+            .emit(completed_export(1, signature));
+        let _ = app.update(Message::Tick);
+
+        assert_eq!(app.session.failed_exports, vec![99]);
+    }
+
+    #[test]
+    fn starting_a_second_export_reports_that_one_is_already_running() {
+        let mut app = app();
+        add_track_for_export(&mut app, 1);
+        app.session.exporting = vec![1];
+
+        let _ = app.update(Message::ExportChanged);
+
+        assert_eq!(app.ui.message, "An export is already running.");
+    }
+
+    #[test]
+    fn checking_the_setup_does_not_replace_the_draft() {
+        let mut app = app();
+        let mut status = app.services.denoise.status();
+        status.configured.executable_path = "/different/python".into();
+        app.ui.settings.draft = Some(app.services.denoise.status().configured);
+        app.ui.settings.busy = true;
+
+        app.services
+            .events
+            .emit(AppEvent::SettingsInspected(Ok(status)));
+        let _ = app.update(Message::Tick);
+
+        assert_eq!(
+            app.ui.settings.draft.as_ref().unwrap().executable_path,
+            app.services.denoise.status().configured.executable_path
+        );
+        assert!(!app.ui.settings.busy);
+    }
+
+    #[test]
+    fn saving_settings_keeps_the_drawer_open() {
+        let mut app = app();
+        let _ = app.update(Message::OpenSettings);
+        let status = app.services.denoise.status();
+        app.ui.settings.draft = Some(status.configured.clone());
+
+        app.services.events.emit(AppEvent::SettingsSaved(Ok(status)));
+        let _ = app.update(Message::Tick);
+
+        assert!(app.ui.settings_open);
+        assert!(app.ui.settings.status.is_some());
     }
 }

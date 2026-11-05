@@ -358,6 +358,13 @@ pub struct SettingsUi {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenameDraft {
+    pub id: MediaId,
+    pub original: String,
+    pub value: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct UiState {
     pub message: String,
@@ -369,7 +376,9 @@ pub struct UiState {
     pub target_lufs_input: String,
     pub silence_threshold_input: String,
     pub min_silence_input: String,
-    pub renaming: Option<MediaId>,
+    /// Uncommitted media rename. The model keeps the previous name until the
+    /// draft is committed, so clearing the field can never erase it.
+    pub rename: Option<RenameDraft>,
     /// True while the microphone is being opened or the take is being
     /// finalized; the record button is inert meanwhile.
     pub recording_busy: bool,
@@ -387,7 +396,7 @@ impl Default for UiState {
             target_lufs_input: DEFAULT_TARGET_LUFS.to_string(),
             silence_threshold_input: DEFAULT_SILENCE_THRESHOLD_DB.to_string(),
             min_silence_input: DEFAULT_MIN_SILENCE_MS.to_string(),
-            renaming: None,
+            rename: None,
             recording_busy: false,
         }
     }
@@ -551,6 +560,7 @@ impl Session {
             || !self.exporting.is_empty()
             || self.pending_imports() > 0
             || self.pending_denoise() > 0
+            || self.media.iter().any(MediaClip::ready)
             || !self.changed_tracks().is_empty()
     }
 
@@ -625,5 +635,13 @@ mod tests {
         assert_eq!(session.selected_track, Some(1));
         session.remove_track(1);
         assert_eq!(session.selected_track, None);
+    }
+
+    #[test]
+    fn ready_media_in_the_pool_counts_as_unsaved_work() {
+        let mut session = Session::default();
+        assert!(!session.has_unsaved_work());
+        session.media.push(clip_with_audio(1, 100));
+        assert!(session.has_unsaved_work());
     }
 }

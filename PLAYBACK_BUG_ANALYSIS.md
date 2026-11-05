@@ -1,5 +1,10 @@
 # 播放异常代码分析
 
+> **历史文档 / 已过时**：本文描述的是旧版 Tauri + React + WebKitGTK 前端的播放问题
+> （`src/App.tsx`、`src/audio/audioContextManager.ts`）。2026-10-29 起编辑器已迁移到
+> `crates/app` 的 iced 原生实现，解码、播放和渲染都在 Rust 进程内完成，WebAudio /
+> `AudioContext` 路径已不复存在。本文仅作为迁移背景与调查记录保留，不代表当前代码。
+
 初始分析：2026-08-22  
 运行时取证与修复：2026-08-30 至 2026-08-31
 

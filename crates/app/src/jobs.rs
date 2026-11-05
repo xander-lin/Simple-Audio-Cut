@@ -202,7 +202,7 @@ pub fn inspect_config(
     config: DenoiseConfig,
 ) {
     spawn(move || {
-        events.emit(AppEvent::SettingsStatus(Ok(denoise.inspect_config(config))));
+        events.emit(AppEvent::SettingsInspected(Ok(denoise.inspect_config(config))));
     });
 }
 

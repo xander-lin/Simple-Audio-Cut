@@ -16,7 +16,7 @@ use simple_audio_cut_core::region::{envelope_gain_at_time, EnvelopePoint, Region
 use crate::message::{Message, WaveformEvent};
 use crate::model::MediaId;
 use crate::theme;
-use crate::ui::{format_time_compact, format_time_precise};
+use crate::ui::format_time_compact;
 
 pub const ROW_HEIGHT: f32 = 120.0;
 pub const ROW_GAP: f32 = 10.0;
@@ -247,15 +247,20 @@ impl<'a> TrackCanvas<'a> {
                 let radius = Self::rms_radius(
                     simple_audio_cut_core::analysis::dbfs_to_amplitude(self.threshold_db),
                 );
-                let color = Color::from_rgba(0.84, 0.74, 0.35, 0.70);
-                frame.fill_rectangle(
-                    Point::new(row.leading, top + ROW_HEIGHT / 2.0 - radius),
-                    Size::new(row.timeline_width(), 1.0),
+                let color = Color::from_rgba(0.84, 0.74, 0.35, 0.82);
+                // The original editor drew the threshold as a dashed guide.
+                draw_dashed_rule(
+                    frame,
+                    row.leading,
+                    top + ROW_HEIGHT / 2.0 - radius,
+                    row.timeline_width(),
                     color,
                 );
-                frame.fill_rectangle(
-                    Point::new(row.leading, top + ROW_HEIGHT / 2.0 + radius),
-                    Size::new(row.timeline_width(), 1.0),
+                draw_dashed_rule(
+                    frame,
+                    row.leading,
+                    top + ROW_HEIGHT / 2.0 + radius,
+                    row.timeline_width(),
                     color,
                 );
             }
@@ -282,34 +287,62 @@ impl<'a> TrackCanvas<'a> {
         if width == 0 || self.rms.is_empty() {
             return;
         }
-        let mut upper: Vec<f32> = Vec::with_capacity(width);
-        let mut lower: Vec<f32> = Vec::with_capacity(width);
-        for index in 0..width {
-            let time = row.start + (index as f64 / width as f64) * (row.end - row.start);
-            let frame_index = self
-                .rms
-                .binary_search_by(|frame| frame.time.total_cmp(&time))
-                .unwrap_or_else(|index| index.min(self.rms.len() - 1));
-            let amplitude = self.rms[frame_index].amplitude;
-            let radius = Self::rms_radius(amplitude);
-            upper.push(top + ROW_HEIGHT / 2.0 - radius);
-            lower.push(top + ROW_HEIGHT / 2.0 + radius);
+        let columns = rms_columns(&self.rms, row.start, row.end, width);
+        if columns.is_empty() {
+            return;
         }
-        let path = Path::new(|builder| {
-            builder.move_to(Point::new(row.leading, upper[0]));
-            for (index, y) in upper.iter().enumerate().skip(1) {
+        let center = top + ROW_HEIGHT / 2.0;
+        let max_upper: Vec<f32> = columns
+            .iter()
+            .map(|column| center - Self::rms_radius(column.max))
+            .collect();
+        let max_lower: Vec<f32> = columns
+            .iter()
+            .map(|column| center + Self::rms_radius(column.max))
+            .collect();
+        // Filled band: the loudest RMS in every pixel column.
+        let band = Path::new(|builder| {
+            builder.move_to(Point::new(row.leading, max_upper[0]));
+            for (index, y) in max_upper.iter().enumerate().skip(1) {
                 builder.line_to(Point::new(row.leading + index as f32, *y));
             }
-            for (index, y) in lower.iter().enumerate().rev() {
+            for (index, y) in max_lower.iter().enumerate().rev() {
                 builder.line_to(Point::new(row.leading + index as f32, *y));
             }
             builder.close();
         });
-        frame.fill(&path, Color::from_rgba(0.41, 0.58, 0.67, 0.22));
+        frame.fill(&band, Color::from_rgba(0.41, 0.58, 0.67, 0.24));
         frame.stroke(
-            &path,
+            &band,
             Stroke::default()
-                .with_color(Color::from_rgba(0.52, 0.69, 0.78, 0.55))
+                .with_color(Color::from_rgba(0.52, 0.69, 0.78, 0.72))
+                .with_width(1.0),
+        );
+
+        // Quiet contour: the softest RMS in every pixel column, drawn as the
+        // two symmetric guides the old canvas used.
+        let min_upper: Vec<f32> = columns
+            .iter()
+            .map(|column| center - Self::rms_radius(column.min))
+            .collect();
+        let min_lower: Vec<f32> = columns
+            .iter()
+            .map(|column| center + Self::rms_radius(column.min))
+            .collect();
+        let contour = Path::new(|builder| {
+            builder.move_to(Point::new(row.leading, min_upper[0]));
+            for (index, y) in min_upper.iter().enumerate().skip(1) {
+                builder.line_to(Point::new(row.leading + index as f32, *y));
+            }
+            builder.move_to(Point::new(row.leading, min_lower[0]));
+            for (index, y) in min_lower.iter().enumerate().skip(1) {
+                builder.line_to(Point::new(row.leading + index as f32, *y));
+            }
+        });
+        frame.stroke(
+            &contour,
+            Stroke::default()
+                .with_color(Color::from_rgba(0.84, 0.90, 0.87, 0.88))
                 .with_width(1.0),
         );
     }
@@ -531,20 +564,22 @@ impl<'a> TrackCanvas<'a> {
                     );
                 }
             }
+        }
 
-            if let Some((x, y, gain)) = state.envelope_hover {
-                let text_position = Point::new(
-                    (x + 10.0).min(bounds.width - 70.0).max(4.0),
-                    (y - 30.0).clamp(top + 4.0, top + ROW_HEIGHT - 24.0),
-                );
-                frame.fill_text(Text {
-                    content: format_gain(gain),
-                    position: text_position,
-                    color: theme::ACCENT,
-                    size: 11.0.into(),
-                    ..Text::default()
-                });
-            }
+        // Drawn once in canvas coordinates: the hover used to be painted
+        // inside every row, which duplicated the label on wrapped tracks.
+        if let Some((x, y, gain)) = state.envelope_hover {
+            let text_position = Point::new(
+                (x + 10.0).min(bounds.width - 70.0).max(4.0),
+                (y - 30.0).clamp(4.0, (bounds.height - 24.0).max(4.0)),
+            );
+            frame.fill_text(Text {
+                content: format_gain(gain),
+                position: text_position,
+                color: theme::ACCENT,
+                size: 11.0.into(),
+                ..Text::default()
+            });
         }
     }
 
@@ -578,7 +613,66 @@ impl<'a> TrackCanvas<'a> {
     }
 
     fn hit_deleted(&self, time: f64) -> Option<Region> {
-        self.deleted.iter().copied().find(|region| region.contains(time))
+        deleted_at_time(&self.deleted, time)
+    }
+}
+
+/// Finds the deleted region under `time`. The right edge is exclusive so a
+/// click exactly at a boundary belongs to the audio after the cut.
+fn deleted_at_time(regions: &[Region], time: f64) -> Option<Region> {
+    regions
+        .iter()
+        .copied()
+        .find(|region| time >= region.start && time < region.end)
+}
+
+/// One waveform pixel column reduced to the quietest and loudest RMS frame it
+/// covers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RmsColumn {
+    min: f64,
+    max: f64,
+}
+
+/// Buckets RMS frames into pixel columns, the way the original canvas did.
+fn rms_columns(rms: &[RmsFrame], start: f64, end: f64, width: usize) -> Vec<RmsColumn> {
+    let mut columns = Vec::with_capacity(width);
+    if width == 0 || rms.is_empty() || end <= start {
+        return columns;
+    }
+    let mut index = rms.partition_point(|frame| frame.time < start).saturating_sub(1);
+    let mut previous = rms[index].amplitude;
+    let span = end - start;
+    for column in 0..width {
+        let bin_end = start + span * (column + 1) as f64 / width as f64;
+        let mut min = f64::INFINITY;
+        let mut max = 0.0_f64;
+        while index < rms.len() && rms[index].time < bin_end && rms[index].time <= end {
+            min = min.min(rms[index].amplitude);
+            max = max.max(rms[index].amplitude);
+            previous = rms[index].amplitude;
+            index += 1;
+        }
+        if !min.is_finite() {
+            min = previous;
+        }
+        if max == 0.0 {
+            max = previous;
+        }
+        columns.push(RmsColumn { min, max });
+    }
+    columns
+}
+
+/// Draws a dashed horizontal rule (5px dash, 4px gap) at `y`.
+fn draw_dashed_rule(frame: &mut Frame, x: f32, y: f32, length: f32, color: Color) {
+    const DASH: f32 = 5.0;
+    const GAP: f32 = 4.0;
+    let mut offset = 0.0;
+    while offset < length {
+        let segment = DASH.min(length - offset);
+        frame.fill_rectangle(Point::new(x + offset, y), Size::new(segment, 1.0), color);
+        offset += DASH + GAP;
     }
 }
 
@@ -741,7 +835,8 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                             let (row, local) = Self::row_at(bounds, &rows, position)?;
                             let time = Self::time_at_x(&row, local.x);
                             let gain = Self::gain_at_y(local.y);
-                            state.envelope_hover = Some((local.x, local.y, gain));
+                            state.envelope_hover =
+                                Some((local.x, Self::row_top(row.index) + local.y, gain));
                             return publish(WaveformEvent::EnvelopeMove { id, time, gain });
                         }
                     }
@@ -752,7 +847,7 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                         let gain = envelope_gain_at_time(&self.envelope, self.duration, time);
                         let y = Self::y_at_gain(gain);
                         state.envelope_hover = if (y - local.y).abs() <= 12.0 {
-                            Some((local.x, y, gain))
+                            Some((local.x, Self::row_top(row.index) + y, gain))
                         } else {
                             None
                         };
@@ -850,14 +945,11 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
     }
 }
 
-/// Formats the playhead time for the canvas tooltip area.
-pub fn playhead_label(time: f64) -> String {
-    format_time_precise(time)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{canvas_height, layout_rows, ROW_GAP, ROW_HEIGHT};
+    use super::{canvas_height, deleted_at_time, layout_rows, rms_columns, ROW_GAP, ROW_HEIGHT};
+    use simple_audio_cut_core::analysis::RmsFrame;
+    use simple_audio_cut_core::region::Region;
 
     #[test]
     fn wraps_long_audio_into_multiple_rows() {
@@ -887,5 +979,40 @@ mod tests {
             canvas_height(400.0, 200.0, 48.0),
             rows as f32 * ROW_HEIGHT + (rows.saturating_sub(1)) as f32 * ROW_GAP
         );
+    }
+
+    #[test]
+    fn rms_columns_keep_the_quietest_and_loudest_frame_per_pixel() {
+        let rms = vec![
+            RmsFrame { time: 0.05, amplitude: 0.2 },
+            RmsFrame { time: 0.08, amplitude: 0.8 },
+            RmsFrame { time: 0.15, amplitude: 0.4 },
+        ];
+        let columns = rms_columns(&rms, 0.0, 0.3, 3);
+
+        assert_eq!(columns.len(), 3);
+        // The first column holds both low and high frames.
+        assert!((columns[0].min - 0.2).abs() < 1e-9);
+        assert!((columns[0].max - 0.8).abs() < 1e-9);
+        assert!((columns[1].min - 0.4).abs() < 1e-9);
+        assert!((columns[1].max - 0.4).abs() < 1e-9);
+        // Columns with no frames reuse the previous amplitude.
+        assert!((columns[2].min - 0.4).abs() < 1e-9);
+        assert!((columns[2].max - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rms_columns_are_empty_without_analysis_or_duration() {
+        assert!(rms_columns(&[], 0.0, 1.0, 35).is_empty());
+        assert!(rms_columns(&[RmsFrame { time: 0.0, amplitude: 0.1 }], 1.0, 1.0, 10).is_empty());
+        assert!(rms_columns(&[RmsFrame { time: 0.0, amplitude: 0.1 }], 0.0, 1.0, 0).is_empty());
+    }
+
+    #[test]
+    fn deleted_regions_use_a_half_open_right_edge() {
+        let regions = vec![Region::new(1.0, 2.0)];
+        assert_eq!(deleted_at_time(&regions, 1.0), Some(Region::new(1.0, 2.0)));
+        assert_eq!(deleted_at_time(&regions, 1.5), Some(Region::new(1.0, 2.0)));
+        assert_eq!(deleted_at_time(&regions, 2.0), None);
     }
 }

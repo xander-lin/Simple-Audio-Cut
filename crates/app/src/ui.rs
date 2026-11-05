@@ -368,8 +368,11 @@ fn media_card<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
         .map(|value| format!("{value:.1} LUFS"))
         .unwrap_or_else(|| "-- LUFS".into());
 
-    let name = text_input(clip.name.as_str(), clip.name.as_str())
+    let renaming = app.ui.rename.as_ref().filter(|draft| draft.id == clip.id);
+    let name_value = renaming.map(|draft| draft.value.as_str()).unwrap_or(clip.name.as_str());
+    let name = text_input(clip.name.as_str(), name_value)
         .on_input(move |value| Message::RenameMedia(clip.id, value))
+        .on_submit(Message::RenameCommit)
         .size(12.0)
         .padding(4.0)
         .width(Length::Fixed(168.0))
@@ -888,11 +891,6 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             .width(Length::Fill),
     ]
     .align_y(Alignment::Center);
-    if let Some(note) = &app.session.denoise_note {
-        line = line.push(text(note.clone()).size(10.0).color(theme::MUTED).wrapping(
-            iced::widget::text::Wrapping::WordOrGlyph,
-        ));
-    }
     if pending > 0 {
         line = line.push(
             text(format!("{pending} processing"))
@@ -1115,11 +1113,7 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
             .height(Length::Fill)
             .style(theme::scrim_style),
     )
-    .on_press(if busy {
-        Message::Noop
-    } else {
-        Message::CloseSettings
-    });
+    .on_press(Message::CloseSettings);
 
     let header = container(
         row![
@@ -1132,7 +1126,7 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
             button(text("×").size(18.0))
                 .padding(4.0)
                 .style(theme::flat_button)
-                .on_press_maybe((!busy).then_some(Message::CloseSettings)),
+                .on_press(Message::CloseSettings),
         ]
         .align_y(Alignment::Center),
     )

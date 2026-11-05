@@ -102,6 +102,7 @@ fn keyboard_shortcut(
         return None;
     }
     let shortcut = match key {
+        Key::Named(Named::Escape) => return Some(Message::Dismiss),
         Key::Named(Named::Space) => Shortcut::TogglePlayback,
         Key::Character("k" | "K") => Shortcut::TogglePlayback,
         Key::Character("j" | "J") => Shortcut::Back,
@@ -157,6 +158,10 @@ mod tests {
         assert!(matches!(
             press(Key::Character("m".into())),
             Some(Message::Shortcut(Shortcut::MuteRange))
+        ));
+        assert!(matches!(
+            press(Key::Named(keyboard::key::Named::Escape)),
+            Some(Message::Dismiss)
         ));
     }
 

@@ -93,6 +93,9 @@ pub enum AppEvent {
         error: String,
     },
     SettingsStatus(Result<DenoiseProviderStatus, String>),
+    /// Result of an explicit "Check setup" run. Unlike [`AppEvent::SettingsStatus`]
+    /// it must never replace a draft the user is editing.
+    SettingsInspected(Result<DenoiseProviderStatus, String>),
     SettingsSaved(Result<DenoiseProviderStatus, String>),
     PathsChosen {
         request: FileRequest,

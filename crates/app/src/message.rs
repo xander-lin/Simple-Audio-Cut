@@ -47,6 +47,9 @@ pub enum Message {
     SelectMedia(MediaId),
     SelectTrack(MediaId),
     RenameMedia(MediaId, String),
+    RenameCommit,
+    /// Escape: dismiss the innermost transient layer (rename, menu, drawer).
+    Dismiss,
     AddToTimeline(MediaId),
     DeleteMedia(MediaId),
     RetryImport(MediaId),
@@ -94,5 +97,4 @@ pub enum Message {
     CancelQuit,
     Shortcut(Shortcut),
     WindowResized(iced::Size),
-    Noop,
 }
