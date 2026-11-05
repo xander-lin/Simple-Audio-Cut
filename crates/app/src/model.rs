@@ -12,7 +12,9 @@ use simple_audio_cut_core::analysis::RmsFrame;
 use simple_audio_cut_core::buffer::AudioBuffer;
 use simple_audio_cut_core::denoise::{DenoiseAvailability, DenoiseConfig, DenoiseProviderStatus};
 use simple_audio_cut_core::export_state::{export_signature, ExportableTrack};
-use simple_audio_cut_core::region::{combine_regions, EnvelopePoint, Region};
+use simple_audio_cut_core::region::{
+    combine_regions, merge_regions, region_is_covered, subtract_region, EnvelopePoint, Region,
+};
 use simple_audio_cut_core::timeline::{create_edited_buffer, edited_duration, kept_regions};
 
 pub type MediaId = u64;
@@ -63,6 +65,40 @@ impl DenoiseStatus {
     pub fn is_busy(self) -> bool {
         matches!(self, Self::Queued | Self::Processing)
     }
+
+    /// True when the automatic policy is allowed to reconsider this take.
+    ///
+    /// A failed run is deliberately excluded: retrying it is the user's
+    /// decision (the inspector offers "Retry denoising"), so reopening the
+    /// settings drawer never respawns a job that is known to fail.
+    pub fn awaits_policy(self) -> bool {
+        matches!(self, Self::Unavailable | Self::Skipped)
+    }
+
+    /// Whether this take currently uses the denoising pipeline at all.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Processing | Self::Complete)
+    }
+
+    /// Label of the primary denoising control in the inspector and library.
+    pub fn action_label(self) -> &'static str {
+        match self {
+            Self::Queued | Self::Processing => "Working…",
+            Self::Complete => "Use original audio",
+            Self::Failed => "Retry denoising",
+            Self::Skipped | Self::Unavailable => "Denoise this take",
+        }
+    }
+
+    /// Value to send with `Message::SetDenoise` when the primary control is
+    /// pressed. `None` while a task owns the take.
+    pub fn action_target(self) -> Option<bool> {
+        match self {
+            Self::Queued | Self::Processing => None,
+            Self::Complete => Some(false),
+            Self::Skipped | Self::Unavailable | Self::Failed => Some(true),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -79,10 +115,24 @@ pub struct DenoiseState {
 
 impl DenoiseState {
     pub fn skipped() -> Self {
+        Self::skipped_because(None)
+    }
+
+    pub fn skipped_because(reason: Option<String>) -> Self {
         Self {
             status: DenoiseStatus::Skipped,
             task_id: String::new(),
-            reason: None,
+            reason,
+            opted_out: false,
+        }
+    }
+
+    /// The take keeps its normalized audio because no provider is usable.
+    pub fn unavailable(reason: Option<String>) -> Self {
+        Self {
+            status: DenoiseStatus::Unavailable,
+            task_id: String::new(),
+            reason,
             opted_out: false,
         }
     }
@@ -202,7 +252,14 @@ impl MediaClip {
         self.rms.as_ref()
     }
 
-    pub fn apply_audio(&mut self, path: String, duration: f64, lufs: Option<f64>, audio: Arc<AudioBuffer>, rms: Arc<Vec<RmsFrame>>) {
+    pub fn apply_audio(
+        &mut self,
+        path: String,
+        duration: f64,
+        lufs: Option<f64>,
+        audio: Arc<AudioBuffer>,
+        rms: Arc<Vec<RmsFrame>>,
+    ) {
         if self.normalized_path.is_empty() {
             // First decoded audio for this take is the normalized source.
             self.normalized_path = path.clone();
@@ -333,6 +390,20 @@ impl Track {
         self.last_export_signature = Some(self.signature());
     }
 
+    /// Toggles silence for `range`: mutes it unless it is already fully
+    /// muted, in which case the silence is removed. Returns whether the range
+    /// is muted afterwards.
+    pub fn toggle_mute(&mut self, range: Region) -> bool {
+        let range = range.normalized();
+        let mute = !region_is_covered(&self.muted, range);
+        self.muted = if mute {
+            merge_regions(&self.muted, range)
+        } else {
+            subtract_region(&self.muted, range)
+        };
+        mute
+    }
+
     /// Signals that the cached waveform geometry must be rebuilt.
     pub fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
@@ -381,7 +452,9 @@ impl Track {
     /// RMS frames matching [`Track::display_audio`].
     pub fn display_rms(&self) -> Arc<Vec<RmsFrame>> {
         if self.collapsed {
-            self.collapsed_rms.clone().unwrap_or_else(|| self.rms().clone())
+            self.collapsed_rms
+                .clone()
+                .unwrap_or_else(|| self.rms().clone())
         } else {
             self.rms().clone()
         }
@@ -542,7 +615,8 @@ impl Session {
 
     /// Applies a change received for either a pool clip or a timeline track.
     pub fn clip_by_id(&self, id: MediaId) -> Option<&MediaClip> {
-        self.media(id).or_else(|| self.track(id).map(|track| &track.clip))
+        self.media(id)
+            .or_else(|| self.track(id).map(|track| &track.clip))
     }
 
     pub fn editing_mut(&mut self, id: MediaId) -> Option<&mut MediaClip> {
@@ -587,9 +661,7 @@ impl Session {
             return;
         }
         self.tracks.push(track);
-        self.waveform_caches
-            .entry(id)
-            .or_default();
+        self.waveform_caches.entry(id).or_default();
         self.selected_track = Some(id);
     }
 
@@ -616,6 +688,19 @@ impl Session {
                 )
             })
             .count()
+    }
+
+    /// Ready takes whose denoising state the automatic policy may change.
+    /// An explicit per-take opt-out is never a candidate.
+    pub fn denoise_policy_candidates(&self) -> Vec<MediaId> {
+        self.media
+            .iter()
+            .chain(self.tracks.iter().map(|track| &track.clip))
+            .filter(|clip| clip.ready())
+            .filter(|clip| !clip.denoise.opted_out)
+            .filter(|clip| clip.denoise.status.awaits_policy())
+            .map(|clip| clip.id)
+            .collect()
     }
 
     pub fn changed_tracks(&self) -> Vec<MediaId> {
@@ -709,6 +794,56 @@ mod tests {
         assert_eq!(session.selected_track, Some(1));
         session.remove_track(1);
         assert_eq!(session.selected_track, None);
+    }
+
+    #[test]
+    fn toggle_mute_merges_overlapping_ranges_and_splits_on_restore() {
+        let mut track = Track::from_clip(clip_with_audio(1, 1_000));
+        track.muted = vec![Region::new(0.1, 0.2)];
+
+        assert!(track.toggle_mute(Region::new(0.15, 0.3)));
+        assert_eq!(track.muted, vec![Region::new(0.1, 0.3)]);
+
+        // Fully covered: a second toggle restores exactly that inside range.
+        assert!(!track.toggle_mute(Region::new(0.15, 0.25)));
+        assert_eq!(
+            track.muted,
+            vec![Region::new(0.1, 0.15), Region::new(0.25, 0.3)]
+        );
+    }
+
+    #[test]
+    fn denoise_status_maps_to_one_primary_action() {
+        use DenoiseStatus::*;
+        assert_eq!(Queued.action_target(), None);
+        assert_eq!(Processing.action_target(), None);
+        assert_eq!(Complete.action_target(), Some(false));
+        assert_eq!(Complete.action_label(), "Use original audio");
+        assert_eq!(Skipped.action_target(), Some(true));
+        assert_eq!(Unavailable.action_target(), Some(true));
+        assert_eq!(Failed.action_target(), Some(true));
+        assert_eq!(Failed.action_label(), "Retry denoising");
+        assert!(Complete.is_active());
+        assert!(!Failed.is_active());
+        assert!(!Failed.awaits_policy());
+        assert!(Skipped.awaits_policy());
+    }
+
+    #[test]
+    fn denoise_policy_only_considers_ready_takes_without_an_opt_out() {
+        let mut session = Session::default();
+        let mut ready = clip_with_audio(1, 100);
+        ready.denoise.status = DenoiseStatus::Skipped;
+        session.media.push(ready);
+        let mut opted_out = clip_with_audio(2, 100);
+        opted_out.denoise = DenoiseState::skipped();
+        opted_out.denoise.opted_out = true;
+        session.media.push(opted_out);
+        let mut busy = clip_with_audio(3, 100);
+        busy.denoise.status = DenoiseStatus::Processing;
+        session.media.push(busy);
+
+        assert_eq!(session.denoise_policy_candidates(), vec![1]);
     }
 
     #[test]

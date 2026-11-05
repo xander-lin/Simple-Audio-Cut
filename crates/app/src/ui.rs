@@ -9,12 +9,12 @@
 
 use iced::widget::canvas;
 use iced::widget::scrollable::{Direction, Scrollbar};
+use iced::widget::Space;
 use iced::widget::{
     button, checkbox, column, container, pick_list, responsive, row, rule, scrollable, stack, text,
     text_input,
 };
 use iced::{Alignment, Element, Font, Length, Padding, Size};
-use iced::widget::Space;
 
 use simple_audio_cut_core::denoise::DenoiseCheckState;
 use simple_audio_cut_core::region::Region;
@@ -23,9 +23,9 @@ use crate::message::Message;
 use crate::model::{
     ClipStatus, ContextMenu, ContextMenuKind, DenoiseStatus, MediaClip, MediaId, Track,
 };
+use crate::theme;
 use crate::update::App;
 use crate::waveform::{canvas_height, TrackCanvas};
-use crate::theme;
 
 const LABEL_WIDTH: f32 = 164.0;
 const HANDLE_WIDTH: f32 = 10.0;
@@ -260,8 +260,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // Children publish first, so a drop on the timeline runs `DropItem` and
     // this trailing `DragCancel` becomes a no-op; releasing anywhere else
     // simply cancels.
-    let base = iced::widget::mouse_area(base)
-        .on_release(Message::DragCancel);
+    let base = iced::widget::mouse_area(base).on_release(Message::DragCancel);
 
     let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
     if let Some(menu) = &app.ui.context_menu {
@@ -276,7 +275,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if app.ui.dragging.is_some() || app.ui.files_hovering {
         layers.push(drop_hint(app));
     }
-    stack(layers).width(Length::Fill).height(Length::Fill).into()
+    stack(layers)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn body(app: &App) -> Element<'_, Message> {
@@ -308,7 +310,10 @@ fn titlebar(app: &App) -> Element<'_, Message> {
     let record_label = if busy {
         "Working…".into()
     } else if recording {
-        format!("Stop  {}", format_time_standard(app.session.recording_seconds))
+        format!(
+            "Stop  {}",
+            format_time_standard(app.session.recording_seconds)
+        )
     } else {
         "● Record".into()
     };
@@ -364,14 +369,20 @@ fn titlebar(app: &App) -> Element<'_, Message> {
         .session
         .denoise_status
         .as_ref()
-        .map(|status| (status.provider_name.clone(), status.ready, status.summary.clone()))
+        .map(|status| {
+            (
+                status.provider_name.clone(),
+                status.ready,
+                status.summary.clone(),
+            )
+        })
         .unwrap_or_else(|| ("Denoising".into(), false, "Open denoising settings".into()));
     let provider_ready = provider.1;
     let provider_automatic_off = app
         .session
         .denoise_status
         .as_ref()
-        .is_some_and(|status| !status.effective.enabled && status.provider_id != "disabled");
+        .is_some_and(|status| !status.effective.enabled && status.has_provider());
     let provider_button = button(
         row![
             status_dot(
@@ -493,7 +504,9 @@ fn library_sidebar(app: &App) -> Element<'_, Message> {
             left: 6.0,
             right: 6.0,
         }))
-        .direction(Direction::Vertical(Scrollbar::new().width(3.0).scroller_width(3.0)))
+        .direction(Direction::Vertical(
+            Scrollbar::new().width(3.0).scroller_width(3.0),
+        ))
         .height(Length::Fill)
         .style(theme::scrollable_style)
         .into()
@@ -588,27 +601,26 @@ fn library_row<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
     .spacing(5.0)
     .align_y(Alignment::Center);
 
-    let busy = clip.denoise.status.is_busy();
-    let denoise_on = !matches!(
-        clip.denoise.status,
-        DenoiseStatus::Skipped | DenoiseStatus::Unavailable
-    );
-    let state = button(
-        text(clip.status_label().to_string())
-            .size(9.0)
-            .color(clip_color(clip)),
-    )
-    .padding(Padding {
-        top: 0.0,
-        bottom: 0.0,
-        left: 2.0,
-        right: 2.0,
-    })
-    .style(theme::flat_button)
-    .on_press_maybe((ready && !busy).then_some(Message::SetDenoise {
-        id: clip.id,
-        enabled: !denoise_on,
-    }));
+    let status = clip.denoise.status;
+    let state =
+        button(
+            text(clip.status_label().to_string())
+                .size(9.0)
+                .color(clip_color(clip)),
+        )
+        .padding(Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 2.0,
+            right: 2.0,
+        })
+        .style(theme::flat_button)
+        .on_press_maybe(status.action_target().filter(|_| ready).map(|enabled| {
+            Message::SetDenoise {
+                id: clip.id,
+                enabled,
+            }
+        }));
 
     let add = button(text("+").size(13.0))
         .padding(Padding {
@@ -631,7 +643,9 @@ fn library_row<'a>(app: &'a App, clip: &'a MediaClip) -> Element<'a, Message> {
         .on_press(Message::DeleteMedia(clip.id));
 
     let mut body = column![
-        row![name, add, remove].spacing(3.0).align_y(Alignment::Center),
+        row![name, add, remove]
+            .spacing(3.0)
+            .align_y(Alignment::Center),
         row![status_dot(clip_color(clip), 6.0), meta, spacer(), state]
             .spacing(6.0)
             .align_y(Alignment::Center)
@@ -705,7 +719,9 @@ fn library_strip(app: &App) -> Element<'_, Message> {
             left: 8.0,
             right: 8.0,
         }))
-        .direction(Direction::Horizontal(Scrollbar::new().width(2.0).scroller_width(2.0)))
+        .direction(Direction::Horizontal(
+            Scrollbar::new().width(2.0).scroller_width(2.0),
+        ))
         .width(Length::Fill)
         .height(Length::Shrink)
         .style(theme::scrollable_style)
@@ -818,17 +834,15 @@ fn timeline(app: &App, wide: bool) -> Element<'_, Message> {
                 .push(
                     container(
                         row![
-                            text(
-                                format!(
-                                    "End of timeline · {} · {}",
-                                    if app.session.tracks.len() == 1 {
-                                        "1 track".to_string()
-                                    } else {
-                                        format!("{} tracks", app.session.tracks.len())
-                                    },
-                                    format_time_standard(total)
-                                )
-                            )
+                            text(format!(
+                                "End of timeline · {} · {}",
+                                if app.session.tracks.len() == 1 {
+                                    "1 track".to_string()
+                                } else {
+                                    format!("{} tracks", app.session.tracks.len())
+                                },
+                                format_time_standard(total)
+                            ))
                             .size(9.0)
                             .color(theme::MUTED),
                             spacer(),
@@ -861,12 +875,10 @@ fn timeline(app: &App, wide: bool) -> Element<'_, Message> {
     };
 
     let dragging = app.ui.dragging.is_some();
-    let body = iced::widget::mouse_area(
-        container(body).width(Length::Fill).height(Length::Fill),
-    )
-    // `on_release` only fires while the cursor is over this widget, which is
-    // exactly the "dropped on the timeline" test.
-    .on_release(Message::DropItem);
+    let body = iced::widget::mouse_area(container(body).width(Length::Fill).height(Length::Fill))
+        // `on_release` only fires while the cursor is over this widget, which is
+        // exactly the "dropped on the timeline" test.
+        .on_release(Message::DropItem);
 
     let mut content = column![header];
     if !wide {
@@ -901,8 +913,8 @@ fn empty_timeline() -> Element<'static, Message> {
                 text("add take").size(9.0).color(theme::MUTED),
                 keycap("Enter"),
                 text("add selected").size(9.0).color(theme::MUTED),
-                keycap("Drag"),
-                text("select range").size(9.0).color(theme::MUTED),
+                keycap("Left-drag"),
+                text("mute range").size(9.0).color(theme::MUTED),
                 keycap("Right-drag →"),
                 text("delete").size(9.0).color(theme::MUTED),
                 keycap("Space"),
@@ -936,7 +948,9 @@ fn transport(app: &App) -> Element<'_, Message> {
     let playing = app.session.playback.is_some();
     let changed = app.session.changed_tracks().len();
     let zoom_locked = selected.is_some_and(|track| track.zoom_locked);
-    let pps = selected.map(|track| track.pixels_per_second).unwrap_or(48.0);
+    let pps = selected
+        .map(|track| track.pixels_per_second)
+        .unwrap_or(48.0);
 
     let play = button(text(if playing { "⏸" } else { "▶" }).size(15.0))
         .padding(Padding {
@@ -1153,7 +1167,9 @@ fn inspector_bar(app: &App) -> Element<'_, Message> {
 
     container(
         row![
-            text(track.clip.name.clone()).size(10.0).color(theme::TEXT_SOFT),
+            text(track.clip.name.clone())
+                .size(10.0)
+                .color(theme::TEXT_SOFT),
             divider_vertical(14.0),
             text("Silence").size(9.0).color(theme::MUTED),
             threshold,
@@ -1168,7 +1184,7 @@ fn inspector_bar(app: &App) -> Element<'_, Message> {
             } else if app.ui.blade_mode {
                 "Blade active · click to cut"
             } else {
-                "Right-drag → delete · ← restore"
+                "Left-drag mute · right-drag delete/restore"
             })
             .size(9.0)
             .color(theme::MUTED),
@@ -1211,18 +1227,16 @@ fn inspector_panel(app: &App) -> Element<'_, Message> {
             .into(),
         None => text("").size(9.0).into(),
     };
-    let header = container(
-        row![section_kicker("Inspector"), spacer(), more]
-            .align_y(Alignment::Center),
-    )
-    .padding(Padding {
-        top: 10.0,
-        bottom: 8.0,
-        left: 14.0,
-        right: 10.0,
-    })
-    .width(Length::Fill)
-    .style(theme::panel_header_style);
+    let header =
+        container(row![section_kicker("Inspector"), spacer(), more].align_y(Alignment::Center))
+            .padding(Padding {
+                top: 10.0,
+                bottom: 8.0,
+                left: 14.0,
+                right: 10.0,
+            })
+            .width(Length::Fill)
+            .style(theme::panel_header_style);
 
     let content: Element<'_, Message> = match app.session.selected_track() {
         Some(track) => inspector_content(app, track),
@@ -1336,9 +1350,12 @@ fn inspector_content<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message>
         ("Exported", theme::GREEN)
     };
     let export = column![
-        row![status_dot(export_color, 6.0), text(export_state).size(10.0).color(export_color)]
-            .spacing(6.0)
-            .align_y(Alignment::Center),
+        row![
+            status_dot(export_color, 6.0),
+            text(export_state).size(10.0).color(export_color)
+        ]
+        .spacing(6.0)
+        .align_y(Alignment::Center),
         button(text("Force export this track").size(10.0))
             .width(Length::Fill)
             .padding(5.0)
@@ -1415,7 +1432,7 @@ fn inspector_content<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message>
             ]
             .spacing(6.0);
             block = block.push(
-                text("M toggles mute; Delete cuts the range out.")
+                text("M toggles mute; Delete cuts the range out. Left-drag mutes a new range.")
                     .size(9.0)
                     .color(theme::MUTED),
             );
@@ -1426,50 +1443,42 @@ fn inspector_content<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message>
 
     let status = track.clip.denoise.status;
     let denoise_busy = status.is_busy();
-    let denoise_on = !matches!(status, DenoiseStatus::Skipped | DenoiseStatus::Unavailable);
-    let denoise_button_label = if denoise_busy {
-        "Working…"
-    } else if denoise_on {
-        "Use original audio"
-    } else {
-        "Denoise this take"
-    };
-    let mut denoise = column![
-        row![
-            status_dot(denoise_color(status), 6.0),
-            text(track.clip.status_label().to_string())
-                .size(10.0)
-                .color(denoise_color(status)),
-            spacer(),
-            text(if denoise_busy || denoise_on {
-                app.session
-                    .denoise_status
-                    .as_ref()
-                    .map(|status| status.effective.device.clone())
-                    .unwrap_or_else(|| "cpu".into())
-            } else {
-                "off".to_string()
-            })
-            .size(9.0)
-            .color(theme::MUTED)
-            .font(mono()),
-        ]
-        .spacing(6.0)
-        .align_y(Alignment::Center),
+    let denoise_on = status.is_active();
+    let mut denoise = column![row![
+        status_dot(denoise_color(status), 6.0),
+        text(track.clip.status_label().to_string())
+            .size(10.0)
+            .color(denoise_color(status)),
+        spacer(),
+        text(if denoise_busy || denoise_on {
+            app.session
+                .denoise_status
+                .as_ref()
+                .map(|status| status.effective.device.clone())
+                .unwrap_or_else(|| "cpu".into())
+        } else {
+            "off".to_string()
+        })
+        .size(9.0)
+        .color(theme::MUTED)
+        .font(mono()),
     ]
+    .spacing(6.0)
+    .align_y(Alignment::Center),]
     .spacing(6.0);
     if let Some(reason) = &track.clip.denoise.reason {
         denoise = denoise.push(text(reason.clone()).size(9.0).color(theme::MUTED));
     }
     denoise = denoise.push(
-        button(text(denoise_button_label).size(10.0))
+        button(text(status.action_label()).size(10.0))
             .width(Length::Fill)
             .padding(5.0)
             .style(theme::tool_button)
-            .on_press_maybe((!denoise_busy).then_some(Message::SetDenoise {
-                id,
-                enabled: !denoise_on,
-            })),
+            .on_press_maybe(
+                status
+                    .action_target()
+                    .map(|enabled| Message::SetDenoise { id, enabled }),
+            ),
     );
     denoise = denoise.push(
         text("Denoising never blocks editing or export.")
@@ -1515,10 +1524,15 @@ fn inspector_content<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message>
 
 fn inspector_section<'a>(title: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
     column![
-        container(text(title.to_uppercase()).size(9.0).color(theme::MUTED).font(Font {
-            weight: iced::font::Weight::Bold,
-            ..Font::DEFAULT
-        }))
+        container(
+            text(title.to_uppercase())
+                .size(9.0)
+                .color(theme::MUTED)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::DEFAULT
+                })
+        )
         .padding(Padding {
             top: 0.0,
             bottom: 2.0,
@@ -1549,7 +1563,10 @@ fn field_row<'a>(
     unit: &'a str,
 ) -> Element<'a, Message> {
     row![
-        text(label).size(10.0).color(theme::MUTED).width(Length::Fixed(62.0)),
+        text(label)
+            .size(10.0)
+            .color(theme::MUTED)
+            .width(Length::Fixed(62.0)),
         input,
         text(unit).size(9.0).color(theme::MUTED),
     ]
@@ -1563,9 +1580,13 @@ fn field_row<'a>(
 fn track_row<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message> {
     let id = track.id();
     let Some(cache) = app.session.cache(id) else {
-        return container(text("Waveform cache unavailable").size(11.0).color(theme::MUTED))
-            .padding(8.0)
-            .into();
+        return container(
+            text("Waveform cache unavailable")
+                .size(11.0)
+                .color(theme::MUTED),
+        )
+        .padding(8.0)
+        .into();
     };
     let selected = app.session.selected_track == Some(id);
     let collapsed = track.collapsed;
@@ -1606,7 +1627,11 @@ fn track_row<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message> {
     };
     let kept = track.kept();
     let playhead = if selected {
-        Some(original_display_time(app.session.playhead, &kept, collapsed))
+        Some(original_display_time(
+            app.session.playhead,
+            &kept,
+            collapsed,
+        ))
     } else {
         None
     };
@@ -1703,7 +1728,9 @@ fn track_row<'a>(app: &'a App, track: &'a Track) -> Element<'a, Message> {
         row![
             handle,
             label,
-            container(canvas_element).width(Length::Fill).height(Length::Shrink),
+            container(canvas_element)
+                .width(Length::Fill)
+                .height(Length::Shrink),
         ]
         .spacing(2.0)
         .align_y(Alignment::Start)
@@ -1758,12 +1785,10 @@ fn original_display_time(time: f64, kept: &[Region], collapsed: bool) -> f64 {
 
 fn status_bar(app: &App) -> Element<'_, Message> {
     let pending = app.session.pending_imports() + app.session.pending_denoise();
-    let mut line = row![
-        text(app.ui.message.clone())
-            .size(10.0)
-            .color(theme::TEXT_SOFT)
-            .width(Length::Fill),
-    ]
+    let mut line = row![text(app.ui.message.clone())
+        .size(10.0)
+        .color(theme::TEXT_SOFT)
+        .width(Length::Fill),]
     .align_y(Alignment::Center)
     .spacing(10.0);
     if pending > 0 {
@@ -1780,7 +1805,7 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             keycap("J/L"),
             text("±5s").size(9.0).color(theme::MUTED),
             keycap("M"),
-            text("Mute range").size(9.0).color(theme::MUTED),
+            text("Toggle mute").size(9.0).color(theme::MUTED),
             keycap("B"),
             text("Blade").size(9.0).color(theme::MUTED),
             keycap("[ ]"),
@@ -1870,7 +1895,10 @@ impl canvas::Program<Message> for ScaleHandle {
         );
         frame.fill_rectangle(
             iced::Point::new(2.0, 4.0),
-            Size::new((bounds.width - 4.0).max(2.0), (bounds.height - 8.0).max(2.0)),
+            Size::new(
+                (bounds.width - 4.0).max(2.0),
+                (bounds.height - 8.0).max(2.0),
+            ),
             self.color,
         );
         vec![frame.into_geometry()]
@@ -1896,7 +1924,9 @@ fn context_menu_overlay<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, 
     let width = 216.0_f32;
     let mut items: Vec<Element<'_, Message>> = Vec::new();
 
-    let item = |label: String, message: Option<Message>, style: fn(&iced::Theme, button::Status) -> button::Style| {
+    let item = |label: String,
+                message: Option<Message>,
+                style: fn(&iced::Theme, button::Status) -> button::Style| {
         button(text(label).size(11.0))
             .width(Length::Fill)
             .padding(7.0)
@@ -2055,7 +2085,11 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
     let mut body = column![].spacing(14.0);
 
     if let Some(status) = &status {
-        let tone = if status.ready { theme::GREEN } else { theme::RED };
+        let tone = if status.ready {
+            theme::GREEN
+        } else {
+            theme::RED
+        };
         body = body.push(
             container(
                 column![
@@ -2070,9 +2104,7 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
                     ]
                     .spacing(8.0)
                     .align_y(Alignment::Center),
-                    text(status.summary.clone())
-                        .size(10.0)
-                        .color(theme::MUTED),
+                    text(status.summary.clone()).size(10.0).color(theme::MUTED),
                 ]
                 .spacing(5.0),
             )
@@ -2207,9 +2239,7 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
                     .spacing(4.0)
                     .width(Length::Fill),
                     column![
-                        text("Low-rate audio")
-                            .size(10.0)
-                            .color(theme::TEXT_SOFT),
+                        text("Low-rate audio").size(10.0).color(theme::TEXT_SOFT),
                         pick_list(
                             ready_models,
                             Some(draft.low_sample_rate_model.clone()),
@@ -2224,14 +2254,10 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
                 ]
                 .spacing(10.0),
                 column![
-                    text("Processing device")
-                        .size(10.0)
-                        .color(theme::TEXT_SOFT),
-                    pick_list(
-                        device_choices,
-                        device_selected,
-                        |choice: Choice| Message::SettingsDevice(choice.value),
-                    )
+                    text("Processing device").size(10.0).color(theme::TEXT_SOFT),
+                    pick_list(device_choices, device_selected, |choice: Choice| {
+                        Message::SettingsDevice(choice.value)
+                    },)
                     .width(Length::Fill)
                     .text_size(11.0)
                     .style(theme::pick_list_style),
@@ -2332,12 +2358,10 @@ fn settings_overlay(app: &App) -> Element<'_, Message> {
                 .padding(7.0)
                 .style(theme::tool_button)
                 .on_press_maybe((!busy && draft.is_some()).then_some(Message::SettingsCheck)),
-            button(
-                text(if busy { "Working…" } else { "Save settings" }).size(11.0)
-            )
-            .padding(7.0)
-            .style(theme::primary_button)
-            .on_press_maybe((!busy && draft.is_some()).then_some(Message::SettingsSave)),
+            button(text(if busy { "Working…" } else { "Save settings" }).size(11.0))
+                .padding(7.0)
+                .style(theme::primary_button)
+                .on_press_maybe((!busy && draft.is_some()).then_some(Message::SettingsSave)),
         ]
         .spacing(8.0),
     )
@@ -2447,7 +2471,9 @@ fn confirm_quit_overlay(app: &App) -> Element<'_, Message> {
 
     let dialog = container(
         column![
-            text("Quit Simple Audio Cut?").size(17.0).font(strong_font()),
+            text("Quit Simple Audio Cut?")
+                .size(17.0)
+                .font(strong_font()),
             text("Recording, processing, or unexported changes are still active. Quit anyway?")
                 .size(11.0)
                 .color(theme::MUTED),
@@ -2484,99 +2510,4 @@ fn confirm_quit_overlay(app: &App) -> Element<'_, Message> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        format_ruler_time, format_time_compact, format_time_precise, format_time_standard,
-        layout_for, Layout,
-    };
-
-    #[test]
-    fn full_screen_uses_columns_and_half_screen_stacks() {
-        // Half of a 4K monitor is ~1920px: still wider than any naive
-        // breakpoint, but there is no room for three columns.
-        assert_eq!(layout_for(1920.0, Some(3840.0)), Layout::Stacked);
-        assert_eq!(layout_for(3840.0, Some(3840.0)), Layout::Columns);
-        // A 1920 monitor: full screen keeps columns, half stacks.
-        assert_eq!(layout_for(1920.0, Some(1920.0)), Layout::Columns);
-        assert_eq!(layout_for(960.0, Some(1920.0)), Layout::Stacked);
-        // Narrow terminals always stack, even when maximised.
-        assert_eq!(layout_for(900.0, Some(1920.0)), Layout::Stacked);
-    }
-
-    #[test]
-    fn layout_falls_back_to_an_absolute_width_without_monitor_info() {
-        assert_eq!(layout_for(1400.0, None), Layout::Columns);
-        assert_eq!(layout_for(1100.0, None), Layout::Stacked);
-    }
-
-    #[test]
-    fn the_scale_strip_ignores_clicks_outside_its_own_bounds() {
-        use super::ScaleHandle;
-        use crate::message::Message;
-        use crate::theme;
-        use iced::widget::canvas;
-        use iced::{mouse, Point, Rectangle};
-
-        let strip = ScaleHandle {
-            track_id: 7,
-            color: theme::GREEN,
-        };
-        let bounds = Rectangle::new(Point::new(0.0, 0.0), iced::Size::new(10.0, 120.0));
-        let pressed = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
-
-        // iced delivers every canvas event to the program; a click elsewhere in
-        // the window must not select this track. This is what made playback
-        // always use the last track.
-        let outside = mouse::Cursor::Available(Point::new(600.0, 400.0));
-        let action = canvas::Program::<Message>::update(
-            &strip,
-            &mut (),
-            &pressed,
-            bounds,
-            outside,
-        );
-        assert!(action.is_none(), "a click outside must be ignored");
-
-        let inside = mouse::Cursor::Available(Point::new(4.0, 40.0));
-        let action = canvas::Program::<Message>::update(
-            &strip,
-            &mut (),
-            &pressed,
-            bounds,
-            inside,
-        );
-        let action = action.expect("a click inside must select the track");
-        assert!(
-            matches!(action.into_inner().0, Some(Message::SelectTrack(7))),
-            "a click inside must select this track"
-        );
-    }
-
-    #[test]
-    fn formats_standard_timecodes() {
-        assert_eq!(format_time_standard(0.0), "0:00");
-        assert_eq!(format_time_standard(65.4), "1:05");
-        assert_eq!(format_time_standard(3_665.0), "1:01:05");
-    }
-
-    #[test]
-    fn formats_compact_timecodes() {
-        assert_eq!(format_time_compact(0.0), "0s");
-        assert_eq!(format_time_compact(125.0), "2m5s");
-    }
-
-    #[test]
-    fn formats_precise_playhead_timecodes() {
-        assert_eq!(format_time_precise(0.0), "0:00.00");
-        assert_eq!(format_time_precise(61.25), "1:01.25");
-        assert_eq!(format_time_precise(f64::NAN), "0:00.00");
-    }
-
-    #[test]
-    fn formats_ruler_labels_according_to_the_tick_interval() {
-        assert_eq!(format_ruler_time(0.0, 0.5), "0:00.0");
-        assert_eq!(format_ruler_time(61.25, 0.25), "1:01.2");
-        assert_eq!(format_ruler_time(61.25, 5.0), "1:01");
-        assert_eq!(format_ruler_time(3_665.0, 30.0), "1:01:05");
-    }
-}
+mod tests;

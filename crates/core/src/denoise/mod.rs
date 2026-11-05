@@ -53,9 +53,8 @@ pub struct DenoiseDeviceInfo {
     pub label: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[allow(dead_code)]
 pub enum DenoiseCheckState {
     Ready,
     Warning,
@@ -84,6 +83,43 @@ pub struct DenoiseProviderStatus {
     pub checks: Vec<DenoiseCheck>,
     pub ready: bool,
     pub summary: String,
+}
+
+impl DenoiseProviderStatus {
+    /// True when a real provider is wired into this build.
+    ///
+    /// The disabled stand-in is still a valid status (and must keep the rest
+    /// of the editor usable), but it can never denoise anything, so callers
+    /// use this to distinguish "switched off by the user" from "not
+    /// installed".
+    pub fn has_provider(&self) -> bool {
+        self.provider_id != "disabled"
+    }
+
+    /// True when an automatic run can start right now: the user enabled it and
+    /// the environment passed every blocking check.
+    pub fn can_denoise_automatically(&self) -> bool {
+        self.effective.enabled && self.ready
+    }
+
+    /// Why automatic denoising cannot run, preferring a concrete failed check
+    /// over the generic summary. Always returns something the user can act on.
+    pub fn blocking_reason(&self) -> String {
+        if !self.has_provider() {
+            return "This build does not include a denoising provider.".into();
+        }
+        if !self.effective.enabled {
+            return "Automatic denoising is off. You can denoise this take manually.".into();
+        }
+        if let Some(check) = self
+            .checks
+            .iter()
+            .find(|check| check.state == DenoiseCheckState::Error)
+        {
+            return format!("{}: {}", check.label, check.detail);
+        }
+        self.summary.clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -6,22 +6,53 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use simple_audio_cut_core::analysis::{analyze_rms, RmsOptions, RmsFrame};
+use simple_audio_cut_core::analysis::{analyze_rms, RmsFrame, RmsOptions};
 use simple_audio_cut_core::audio::{AudioEngine, AudioPlayer, MockAudioEngine, MockAudioPlayer};
 use simple_audio_cut_core::buffer::AudioBuffer;
 use simple_audio_cut_core::denoise::{DenoiseProvider, MockDenoiseProvider};
-use simple_audio_cut_core::export_state::{
-    ExportDirectoryStore, MemoryExportDirectoryStore,
-};
 #[cfg(feature = "native-audio")]
 use simple_audio_cut_core::export_state::FileExportDirectoryStore;
+use simple_audio_cut_core::export_state::{ExportDirectoryStore, MemoryExportDirectoryStore};
 
 use crate::events::SharedSink;
+
+/// Runs blocking work away from the UI thread.
+///
+/// Production spawns a thread per job. Tests can plug in [`InlineJobRunner`]
+/// and every job completes before the message handler returns, which removes
+/// the sleeps and timeouts that used to make the workflow tests flaky.
+pub trait JobRunner: Send + Sync {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>);
+}
+
+/// Production runner: one detached worker thread per job.
+pub struct ThreadJobRunner;
+
+impl JobRunner for ThreadJobRunner {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        let _ = std::thread::Builder::new()
+            .name("simple-audio-cut-job".into())
+            .spawn(job);
+    }
+}
+
+/// Test runner: executes the job immediately on the calling thread.
+pub struct InlineJobRunner;
+
+impl JobRunner for InlineJobRunner {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        job();
+    }
+}
 
 /// Native file dialogs, always executed worker threads.
 pub trait DialogService: Send + Sync {
     fn pick_files(&self, title: &str, extensions: &[&str]) -> Result<Vec<PathBuf>, String>;
-    fn pick_folder(&self, title: &str, default_path: Option<&str>) -> Result<Option<PathBuf>, String>;
+    fn pick_folder(
+        &self,
+        title: &str,
+        default_path: Option<&str>,
+    ) -> Result<Option<PathBuf>, String>;
     fn pick_file(&self, title: &str) -> Result<Option<PathBuf>, String>;
 }
 
@@ -92,34 +123,30 @@ impl DialogService for MockDialogService {
         Ok(next)
     }
 
-    fn pick_folder(&self, _title: &str, _default_path: Option<&str>) -> Result<Option<PathBuf>, String> {
+    fn pick_folder(
+        &self,
+        _title: &str,
+        _default_path: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
         self.check_error()?;
-        Ok(self
-            .folders
-            .lock()
-            .ok()
-            .and_then(|mut folders| {
-                if folders.is_empty() {
-                    None
-                } else {
-                    folders.remove(0)
-                }
-            }))
+        Ok(self.folders.lock().ok().and_then(|mut folders| {
+            if folders.is_empty() {
+                None
+            } else {
+                folders.remove(0)
+            }
+        }))
     }
 
     fn pick_file(&self, _title: &str) -> Result<Option<PathBuf>, String> {
         self.check_error()?;
-        Ok(self
-            .single_files
-            .lock()
-            .ok()
-            .and_then(|mut files| {
-                if files.is_empty() {
-                    None
-                } else {
-                    files.remove(0)
-                }
-            }))
+        Ok(self.single_files.lock().ok().and_then(|mut files| {
+            if files.is_empty() {
+                None
+            } else {
+                files.remove(0)
+            }
+        }))
     }
 }
 
@@ -136,7 +163,11 @@ impl DialogService for RfdDialogService {
         Ok(files)
     }
 
-    fn pick_folder(&self, title: &str, default_path: Option<&str>) -> Result<Option<PathBuf>, String> {
+    fn pick_folder(
+        &self,
+        title: &str,
+        default_path: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
         let mut dialog = rfd::FileDialog::new().set_title(title);
         if let Some(path) = default_path.filter(|path| !path.is_empty()) {
             dialog = dialog.set_directory(path);
@@ -163,6 +194,8 @@ pub struct Services {
     pub dialogs: Arc<dyn DialogService>,
     pub export_dirs: Arc<dyn ExportDirectoryStore>,
     pub events: SharedSink,
+    /// Executes the blocking jobs dispatched by [`crate::jobs`].
+    pub jobs: Arc<dyn JobRunner>,
 }
 
 impl Services {
@@ -175,10 +208,9 @@ impl Services {
         let config = config_dir();
         let denoise_config_path = config.join("denoise.json");
         #[cfg(feature = "clearvoice-denoise")]
-        let denoise: Arc<dyn DenoiseProvider> =
-            Arc::new(simple_audio_cut_core::denoise::ClearVoiceProvider::new(
-                denoise_config_path,
-            ));
+        let denoise: Arc<dyn DenoiseProvider> = Arc::new(
+            simple_audio_cut_core::denoise::ClearVoiceProvider::new(denoise_config_path),
+        );
         #[cfg(not(feature = "clearvoice-denoise"))]
         let denoise: Arc<dyn DenoiseProvider> = {
             let _ = denoise_config_path;
@@ -195,6 +227,7 @@ impl Services {
                 config.join("last-export-directory"),
             )),
             events: bus,
+            jobs: Arc::new(ThreadJobRunner),
         })
     }
 
@@ -209,6 +242,7 @@ impl Services {
             dialogs: Arc::new(MockDialogService::new()),
             export_dirs: Arc::new(MemoryExportDirectoryStore::new()),
             events: bus,
+            jobs: Arc::new(InlineJobRunner),
         }
     }
 
@@ -245,12 +279,22 @@ impl Services {
             dialogs,
             export_dirs: Arc::new(MemoryExportDirectoryStore::new()),
             events,
+            jobs: Arc::new(InlineJobRunner),
         }
+    }
+
+    /// Replaces the job runner. The headless constructors default to
+    /// [`InlineJobRunner`]; real-engine tests opt back into threads.
+    pub fn with_jobs(mut self, jobs: Arc<dyn JobRunner>) -> Self {
+        self.jobs = jobs;
+        self
     }
 }
 
 /// Decodes a normalized WAV and computes the RMS frames used by the waveform.
-pub fn load_audio(path: impl AsRef<Path>) -> Result<(Arc<AudioBuffer>, Arc<Vec<RmsFrame>>), String> {
+pub fn load_audio(
+    path: impl AsRef<Path>,
+) -> Result<(Arc<AudioBuffer>, Arc<Vec<RmsFrame>>), String> {
     let buffer = AudioBuffer::decode_wav(path)?;
     let rms = analyze_rms(&buffer, RmsOptions::default());
     Ok((Arc::new(buffer), Arc::new(rms)))
@@ -273,7 +317,7 @@ pub mod config_paths {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_audio, MockDialogService, DialogService};
+    use super::{load_audio, DialogService, MockDialogService};
     use std::path::PathBuf;
 
     #[test]

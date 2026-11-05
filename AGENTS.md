@@ -51,9 +51,13 @@ RMS 静音检测、折叠已删除区、24-bit WAV 增量导出（`Export change
 | `DialogService`（文件对话框） | `RfdDialogService` | `MockDialogService` |
 | `ExportDirectoryStore`（导出目录记忆） | `FileExportDirectoryStore` | `MemoryExportDirectoryStore` |
 | `EventSink`（后台任务事件） | `EventBus` | `RecordingEventSink` |
+| `JobRunner`（后台任务执行） | `ThreadJobRunner` | `InlineJobRunner` |
 
 - 状态只在 `crates/app/src/update.rs` 的 `App::update` 中变更；后台线程只通过
-  `EventSink` 投递 `AppEvent`，UI 线程在 `Tick` 中消费。
+  `EventSink` 投递 `AppEvent`，UI 线程在 `Tick` 中消费（`Tick` 会一次排空事件链，
+  而不是每帧只处理一批）。
+- 测试默认使用 `InlineJobRunner`：任务在消息处理内同步完成，断言不再依赖
+  线程调度；真实链路测试需要异步时可显式换回 `ThreadJobRunner`。
 - 视图（`ui.rs`、`waveform.rs`）是纯函数，不持有可变全局状态。
 - 构建可通过 feature 关闭原生音频：`--no-default-features` 得到纯 mock 运行版。
 

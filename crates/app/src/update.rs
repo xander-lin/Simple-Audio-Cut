@@ -8,9 +8,7 @@ use simple_audio_cut_core::analysis::{
 };
 use simple_audio_cut_core::audio::ExportEdit;
 use simple_audio_cut_core::direct_edit::DirectRegionOperation;
-use simple_audio_cut_core::region::{
-    merge_regions, region_is_covered, subtract_region, EnvelopePoint, Region,
-};
+use simple_audio_cut_core::region::{merge_regions, subtract_region, EnvelopePoint, Region};
 use simple_audio_cut_core::timeline::{
     create_edited_buffer, edited_offset_at_original_time, kept_regions,
     original_time_at_edited_offset,
@@ -83,7 +81,8 @@ impl App {
         };
         let denoise = app.services.denoise.clone();
         let events = app.services.events.clone();
-        jobs::provider_status(denoise, events);
+        let jobs = app.services.jobs.clone();
+        jobs::provider_status(jobs, denoise, events);
         // The monitor size arrives asynchronously; until then the layout falls
         // back to an absolute width threshold.
         let monitor = iced::window::latest()
@@ -158,7 +157,8 @@ impl App {
                     "Blade active. Click the waveform to add an edit point; press A to return."
                         .into()
                 } else {
-                    "Direct editing active. Drag the waveform to select a range.".into()
+                    "Direct editing active. Left-drag mutes a range; right-drag deletes or restores."
+                        .into()
                 };
             }
             Message::Waveform { track, event } => self.waveform_event(track, event),
@@ -186,13 +186,8 @@ impl App {
                 self.ui.context_menu = None;
                 self.start_export(vec![id], true);
             }
-            Message::ContextMenu {
-                track,
-                kind,
-                x,
-                y,
-            } => {
-                self.select_track_for_interaction(track);
+            Message::ContextMenu { track, kind, x, y } => {
+                self.select_track(track);
                 self.ui.context_menu = Some(crate::model::ContextMenu {
                     track_id: track,
                     kind,
@@ -209,7 +204,11 @@ impl App {
                 // Re-seed from the saved configuration; unsaved edits are not
                 // carried across drawer visits.
                 self.ui.settings.draft = None;
-                jobs::provider_status(self.services.denoise.clone(), self.services.events.clone());
+                jobs::provider_status(
+                    self.services.jobs.clone(),
+                    self.services.denoise.clone(),
+                    self.services.events.clone(),
+                );
             }
             Message::CloseSettings => {
                 self.ui.settings_open = false;
@@ -253,6 +252,7 @@ impl App {
                     self.ui.settings.busy = true;
                     self.ui.settings.error = None;
                     jobs::inspect_config(
+                        self.services.jobs.clone(),
                         self.services.denoise.clone(),
                         self.services.events.clone(),
                         draft,
@@ -264,6 +264,7 @@ impl App {
                     self.ui.settings.busy = true;
                     self.ui.settings.error = None;
                     jobs::save_config(
+                        self.services.jobs.clone(),
                         self.services.denoise.clone(),
                         self.services.events.clone(),
                         draft,
@@ -271,12 +272,14 @@ impl App {
                 }
             }
             Message::PickExecutable => jobs::choose_file(
+                self.services.jobs.clone(),
                 self.services.dialogs.clone(),
                 self.services.events.clone(),
                 FileRequest::PythonExecutable,
                 "Choose the Python executable from your ClearVoice environment",
             ),
             Message::PickModelRoot => jobs::choose_folder(
+                self.services.jobs.clone(),
                 self.services.dialogs.clone(),
                 self.services.events.clone(),
                 FileRequest::ModelRoot,
@@ -330,11 +333,7 @@ impl App {
         if self.session.clip_by_id(id).is_none() {
             return;
         }
-        let restart = self
-            .ui
-            .rename
-            .as_ref()
-            .is_some_and(|draft| draft.id != id);
+        let restart = self.ui.rename.as_ref().is_some_and(|draft| draft.id != id);
         if restart {
             // Moving to another field commits the previous draft instead of
             // silently dropping the edit.
@@ -400,8 +399,20 @@ impl App {
     }
 
     fn tick(&mut self) {
-        for event in self.services.events.drain() {
-            self.apply_event(event);
+        // Drain follow-up events in the same tick. A dialog chain or an
+        // inline job emits more events while they are being applied; waiting
+        // for the next frame would add latency in production and turn every
+        // such chain into a polling loop in tests. The cap only protects
+        // against a handler that re-emits forever.
+        const MAX_EVENT_BATCHES: usize = 256;
+        for _ in 0..MAX_EVENT_BATCHES {
+            let events = self.services.events.drain();
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                self.apply_event(event);
+            }
         }
         if self.session.recording.is_some() {
             let seconds = self
@@ -449,7 +460,10 @@ impl App {
                 self.session.recording_seconds = 0.0;
                 self.ui.message = error;
             }
-            AppEvent::RecordingStopped { placeholder, result } => {
+            AppEvent::RecordingStopped {
+                placeholder,
+                result,
+            } => {
                 self.ui.recording_busy = false;
                 self.session.recording = None;
                 self.session.recording_seconds = 0.0;
@@ -501,16 +515,9 @@ impl App {
                 rms,
             } => {
                 let existed = self.session.clip_by_id(id).is_some();
-                self.apply_decoded(
-                    id,
-                    info.path.clone(),
-                    audio,
-                    rms,
-                    info.integrated_lufs,
-                );
+                self.apply_decoded(id, info.path.clone(), audio, rms, info.integrated_lufs);
                 if !existed {
-                    self.ui.message =
-                        "The imported media was removed before it finished.".into();
+                    self.ui.message = "The imported media was removed before it finished.".into();
                     return;
                 }
                 if let Some(clip) = self.session.editing_mut(id) {
@@ -554,7 +561,8 @@ impl App {
             }
             AppEvent::DenoiseStarted { id, task_id } => {
                 self.session.denoise_note = None;
-                self.session.mark_denoise(id, &task_id, crate::model::DenoiseStatus::Processing);
+                self.session
+                    .mark_denoise(id, &task_id, crate::model::DenoiseStatus::Processing);
             }
             AppEvent::DenoiseCompleted {
                 id,
@@ -631,8 +639,13 @@ impl App {
                 }
                 self.apply_decoded(id, path, audio, rms, None);
                 if let Some(clip) = self.session.editing_mut(id) {
-                    clip.denoise = crate::model::DenoiseState::skipped();
-                    clip.denoise.reason = Some("Using the normalized original audio.".into());
+                    // Restoring the source is a user choice: mark it as an
+                    // opt-out so an automatic policy cannot queue denoising
+                    // again behind their back.
+                    clip.denoise = crate::model::DenoiseState::skipped_because(Some(
+                        "Using the normalized original audio.".into(),
+                    ));
+                    clip.denoise.opted_out = true;
                 }
                 if was_selected {
                     self.refresh_silence_inputs();
@@ -771,8 +784,12 @@ impl App {
                         if self.ui.settings.draft.is_none() {
                             self.ui.settings.draft = Some(status.configured.clone());
                         }
-                        self.ui.settings.status = Some(status.clone());
-                        self.session.denoise_status = Some(status);
+                        self.ui.settings.status = Some(status);
+                        // Do not touch `session.denoise_status`: that one is
+                        // the *saved* configuration the denoising policy
+                        // runs against. Applying an unsaved draft here made
+                        // "Check setup" silently change how new takes are
+                        // handled.
                     }
                     Err(error) => self.ui.settings.error = Some(error),
                 }
@@ -958,6 +975,7 @@ impl App {
                 self.session.target_lufs
             );
             jobs::stop_recording(
+                self.services.jobs.clone(),
                 self.services.engine.clone(),
                 self.services.events.clone(),
                 recording.placeholder,
@@ -969,6 +987,7 @@ impl App {
         self.ui.recording_busy = true;
         self.ui.message = "Starting the microphone…".into();
         jobs::start_recording(
+            self.services.jobs.clone(),
             self.services.engine.clone(),
             self.services.events.clone(),
         );
@@ -977,6 +996,7 @@ impl App {
     fn import_audio(&mut self) {
         self.stop_playback(true);
         jobs::choose_import_files(
+            self.services.jobs.clone(),
             self.services.dialogs.clone(),
             self.services.events.clone(),
         );
@@ -992,11 +1012,14 @@ impl App {
         for path in &paths {
             let id = new_id();
             ids.push(id);
-            self.session.media.push(MediaClip::placeholder(id, path.clone()));
+            self.session
+                .media
+                .push(MediaClip::placeholder(id, path.clone()));
         }
         self.ui.message = simple_audio_cut_core::import_names::import_queued_summary(paths.len());
         for (id, path) in ids.into_iter().zip(paths) {
             jobs::import_media(
+                self.services.jobs.clone(),
                 self.services.engine.clone(),
                 self.services.events.clone(),
                 id,
@@ -1020,6 +1043,7 @@ impl App {
         }
         self.ui.message = format!("Retrying {name}");
         jobs::import_media(
+            self.services.jobs.clone(),
             self.services.engine.clone(),
             self.services.events.clone(),
             id,
@@ -1066,25 +1090,23 @@ impl App {
                     .session
                     .denoise_status
                     .as_ref()
-                    .map(|status| (status.provider_id != "disabled", status.summary.clone()))
+                    .map(|status| (status.has_provider(), status.summary.clone()))
                     .unwrap_or((false, String::new()));
                 if let Some(clip) = self.session.editing_mut(id) {
-                    if provider_usable {
-                        let mut skipped = crate::model::DenoiseState::skipped();
-                        skipped.reason = Some(
+                    clip.denoise = if provider_usable {
+                        crate::model::DenoiseState::skipped_because(Some(
                             "Automatic denoising is off. You can denoise this take manually."
                                 .into(),
-                        );
-                        clip.denoise = skipped;
+                        ))
                     } else {
-                        clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
-                        clip.denoise.task_id.clear();
-                        clip.denoise.reason = Some(if provider_summary.is_empty() {
-                            "Denoising is not available.".into()
-                        } else {
-                            provider_summary
-                        });
-                    }
+                        crate::model::DenoiseState::unavailable(Some(
+                            if provider_summary.is_empty() {
+                                "Denoising is not available.".into()
+                            } else {
+                                provider_summary
+                            },
+                        ))
+                    };
                 }
                 return;
             }
@@ -1106,6 +1128,7 @@ impl App {
             track.touch();
         }
         jobs::denoise_media(
+            self.services.jobs.clone(),
             self.services.engine.clone(),
             self.services.denoise.clone(),
             self.services.events.clone(),
@@ -1130,13 +1153,17 @@ impl App {
             .has_original_audio()
             .then(|| clip.normalized_path.clone());
         if !enabled {
-            if status == crate::model::DenoiseStatus::Skipped {
+            // A take skipped by the automatic policy still needs the explicit
+            // marker: otherwise a later policy run could turn denoising back
+            // on against the user's choice.
+            if status == crate::model::DenoiseStatus::Skipped && clip.denoise.opted_out {
                 return;
             }
             let was_denoised = status == crate::model::DenoiseStatus::Complete;
             if let Some(clip) = self.session.editing_mut(id) {
-                let mut skipped = crate::model::DenoiseState::skipped();
-                skipped.reason = Some("Denoising is off for this take.".into());
+                let mut skipped = crate::model::DenoiseState::skipped_because(Some(
+                    "Denoising is off for this take.".into(),
+                ));
                 skipped.opted_out = true;
                 clip.denoise = skipped;
             }
@@ -1148,7 +1175,12 @@ impl App {
                     // Swap the decoded buffer back to the normalized source in
                     // the background; the take stays visible meanwhile.
                     self.ui.message = format!("Restoring the original audio of {name}…");
-                    jobs::restore_original_audio(self.services.events.clone(), id, path);
+                    jobs::restore_original_audio(
+                        self.services.jobs.clone(),
+                        self.services.events.clone(),
+                        id,
+                        path,
+                    );
                 }
                 _ => {
                     self.ui.message = format!("{name} keeps its original audio.");
@@ -1183,42 +1215,21 @@ impl App {
         let Some(status) = self.session.denoise_status.clone() else {
             return;
         };
-        let automatic = status.effective.enabled;
-        let provider_usable = status.provider_id != "disabled";
-        let candidates: Vec<MediaId> = self
-            .session
-            .media
-            .iter()
-            .chain(self.session.tracks.iter().map(|track| &track.clip))
-            .filter(|clip| clip.ready())
-            .filter(|clip| !clip.denoise.opted_out)
-            .filter(|clip| {
-                matches!(
-                    clip.denoise.status,
-                    crate::model::DenoiseStatus::Unavailable
-                        | crate::model::DenoiseStatus::Failed
-                        | crate::model::DenoiseStatus::Skipped
-                )
-            })
-            .map(|clip| clip.id)
-            .collect();
-        for id in candidates {
+        let automatic = status.can_denoise_automatically();
+        for id in self.session.denoise_policy_candidates() {
             if automatic {
                 self.queue_denoise(id);
                 continue;
             }
+            // Explain the specific blocker (missing Python, model, device…)
+            // instead of a generic "not available".
+            let reason = status.blocking_reason();
             if let Some(clip) = self.session.editing_mut(id) {
-                if provider_usable {
-                    let mut skipped = crate::model::DenoiseState::skipped();
-                    skipped.reason = Some(
-                        "Automatic denoising is off. You can denoise this take manually.".into(),
-                    );
-                    clip.denoise = skipped;
+                clip.denoise = if status.has_provider() && !status.effective.enabled {
+                    crate::model::DenoiseState::skipped_because(Some(reason))
                 } else {
-                    clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
-                    clip.denoise.task_id.clear();
-                    clip.denoise.reason = Some(status.summary.clone());
-                }
+                    crate::model::DenoiseState::unavailable(Some(reason))
+                };
             }
         }
     }
@@ -1234,17 +1245,6 @@ impl App {
     }
 
     fn select_track(&mut self, id: MediaId) {
-        if self.session.selected_track == Some(id) {
-            return;
-        }
-        self.stop_playback(false);
-        self.session.selected_track = Some(id);
-        self.session.selected_media = None;
-        self.session.playhead = 0.0;
-        self.refresh_silence_inputs();
-    }
-
-    fn select_track_for_interaction(&mut self, id: MediaId) {
         if self.session.selected_track == Some(id) {
             return;
         }
@@ -1292,8 +1292,7 @@ impl App {
             })
             .collect();
         if accepted.is_empty() {
-            self.ui.message =
-                "Only audio or video files can be dropped here.".into();
+            self.ui.message = "Only audio or video files can be dropped here.".into();
             return;
         }
         self.import_paths(accepted);
@@ -1374,15 +1373,14 @@ impl App {
 
     fn scale_track(&mut self, id: MediaId, delta: f32) {
         if self.session.selected_track != Some(id) {
-            self.select_track_for_interaction(id);
+            self.select_track(id);
         }
         if let Some(track) = self.session.track_mut(id) {
             // Zooming from "fit" starts at the scale currently on screen, so
             // the first wheel tick feels continuous instead of snapping.
             if !track.zoom_locked {
-                let fit = track.effective_pixels_per_second(crate::ui::canvas_width(
-                    self.window_size.width,
-                ));
+                let fit = track
+                    .effective_pixels_per_second(crate::ui::canvas_width(self.window_size.width));
                 track.pixels_per_second = fit;
                 track.zoom_locked = true;
             }
@@ -1411,18 +1409,17 @@ impl App {
         }
         let duration = track.duration();
         let deleted = track.deleted();
-        let edited = create_edited_buffer(
-            track.audio(),
-            &deleted,
-            &track.envelope,
-            &track.muted,
-        );
+        let edited = create_edited_buffer(track.audio(), &deleted, &track.envelope, &track.muted);
         if edited.is_empty() {
             self.ui.message = "All audio has been removed from this recording.".into();
             return;
         }
         let kept = kept_regions(&deleted, duration);
-        let safe_offset = if offset >= duration { 0.0 } else { offset.max(0.0) };
+        let safe_offset = if offset >= duration {
+            0.0
+        } else {
+            offset.max(0.0)
+        };
         let mut edited_offset = edited_offset_at_original_time(safe_offset, &kept);
         if edited_offset >= edited.duration() {
             edited_offset = 0.0;
@@ -1490,41 +1487,58 @@ impl App {
         }
         if let Some(range) = range {
             self.ui.message = format!(
-                "Range selected: {}. M mutes it, Delete cuts it out.",
+                "Selected {}. M toggles mute, Delete cuts it out.",
                 format_time_standard(range.duration())
             );
         }
     }
 
     fn toggle_mute_range(&mut self) {
-        let Some((id, range, unmute)) = self.session.selected_track().and_then(|track| {
-            let range = track.selected_range?;
-            if track.collapsed {
-                return None;
-            }
-            Some((track.id(), range, region_is_covered(&track.muted, range)))
-        }) else {
+        let Some((id, range)) = self
+            .session
+            .selected_track()
+            .and_then(|track| track.selected_range.map(|range| (track.id(), range)))
+        else {
+            self.ui.message = "Drag across the waveform to select a range first.".into();
             return;
         };
-        self.stop_playback(false);
-        if let Some(track) = self.session.track_mut(id) {
-            track.muted = if unmute {
-                subtract_region(&track.muted, range)
-            } else {
-                merge_regions(&track.muted, range)
-            };
-            track.selected_range = None;
-            track.touch();
+        self.mute_range(id, range);
+    }
+
+    /// Toggles silence for `range` and keeps it selected, so pressing M or
+    /// Delete can act on the same range immediately. This is also the
+    /// left-drag gesture.
+    fn mute_range(&mut self, id: MediaId, range: Region) {
+        if self.session.track(id).is_none() {
+            return;
         }
-        self.ui.message = format!(
-            "{} {}",
-            if unmute {
-                "Restored sound to"
-            } else {
-                "Muted"
-            },
-            format_time_standard(range.duration())
-        );
+        if self.session.track(id).is_some_and(|track| track.collapsed) {
+            self.ui.message = "Show all edits to change a muted range.".into();
+            return;
+        }
+        self.stop_playback(false);
+        let range = range.normalized();
+        let now_muted = self
+            .session
+            .track_mut(id)
+            .map(|track| {
+                let muted = track.toggle_mute(range);
+                track.selected_range = Some(range);
+                track.touch();
+                muted
+            })
+            .unwrap_or(false);
+        self.ui.message = if now_muted {
+            format!(
+                "Muted {}. Press M to restore it or Delete to cut it out.",
+                format_time_standard(range.duration())
+            )
+        } else {
+            format!(
+                "Restored sound to {}",
+                format_time_standard(range.duration())
+            )
+        };
     }
 
     /// Cuts the selected range out of the timeline (unlike mute, the result is
@@ -1569,11 +1583,7 @@ impl App {
             return;
         };
         let collapsed = track.collapsed;
-        let kept = if collapsed {
-            track.kept()
-        } else {
-            Vec::new()
-        };
+        let kept = if collapsed { track.kept() } else { Vec::new() };
         let to_source = |time: f64| {
             if collapsed {
                 original_time_at_edited_offset(time, &kept)
@@ -1581,7 +1591,7 @@ impl App {
                 time
             }
         };
-        self.select_track_for_interaction(id);
+        self.select_track(id);
         match event {
             WaveformEvent::Seek(time) => {
                 let time = to_source(time);
@@ -1598,26 +1608,25 @@ impl App {
                     }
                 }
             }
-            WaveformEvent::Select(range) => self.set_selected_range(
-                range.map(|region| Region::new(to_source(region.start), to_source(region.end))),
-            ),
+            WaveformEvent::MuteRange(region) => {
+                let region = Region::new(to_source(region.start), to_source(region.end));
+                self.mute_range(id, region);
+            }
             WaveformEvent::DirectEdit { region, operation } => {
                 self.stop_playback(false);
                 let region = Region::new(to_source(region.start), to_source(region.end));
+                if self.session.track(id).is_some_and(|track| track.collapsed) {
+                    self.ui.message = "Show all edits to delete or restore audio.".into();
+                    return;
+                }
                 if let Some(track) = self.session.track_mut(id) {
-                    if track.collapsed {
-                        return;
-                    }
                     match operation {
                         DirectRegionOperation::Delete => {
-                            track.manual_deleted =
-                                merge_regions(&track.manual_deleted, region);
+                            track.manual_deleted = merge_regions(&track.manual_deleted, region);
                         }
                         DirectRegionOperation::Restore => {
-                            track.manual_deleted =
-                                subtract_region(&track.manual_deleted, region);
-                            track.silence_regions =
-                                subtract_region(&track.silence_regions, region);
+                            track.manual_deleted = subtract_region(&track.manual_deleted, region);
+                            track.silence_regions = subtract_region(&track.silence_regions, region);
                         }
                     }
                     track.selected_range = None;
@@ -1652,12 +1661,11 @@ impl App {
                 self.stop_playback(false);
                 if let Some(track) = self.session.track_mut(id) {
                     let duration = track.duration();
-                    track.edit_points =
-                        simple_audio_cut_core::direct_edit::add_edit_point(
-                            &track.edit_points,
-                            time,
-                            duration,
-                        );
+                    track.edit_points = simple_audio_cut_core::direct_edit::add_edit_point(
+                        &track.edit_points,
+                        time,
+                        duration,
+                    );
                     track.selected_range = None;
                     track.touch();
                 }
@@ -1675,11 +1683,7 @@ impl App {
             }
             WaveformEvent::EnvelopeAdd(point) => {
                 self.stop_playback(false);
-                let point = EnvelopePoint::new(
-                    point.id,
-                    to_source(point.time),
-                    point.gain,
-                );
+                let point = EnvelopePoint::new(point.id, to_source(point.time), point.gain);
                 if let Some(track) = self.session.track_mut(id) {
                     track.envelope.push(point);
                     track
@@ -1688,7 +1692,11 @@ impl App {
                     track.touch();
                 }
             }
-            WaveformEvent::EnvelopeMove { id: point_id, time, gain } => {
+            WaveformEvent::EnvelopeMove {
+                id: point_id,
+                time,
+                gain,
+            } => {
                 let time = to_source(time);
                 if let Some(track) = self.session.track_mut(id) {
                     let duration = track.duration();
@@ -1816,6 +1824,7 @@ impl App {
         self.pending_export = Some(PendingExport { edits, signatures });
         self.ui.message = "Choose a folder for the exported audio.".into();
         jobs::choose_folder(
+            self.services.jobs.clone(),
             self.services.dialogs.clone(),
             self.services.events.clone(),
             FileRequest::ExportFolder,
@@ -1840,6 +1849,7 @@ impl App {
         self.services.export_dirs.remember(&directory);
         let PendingExport { edits, signatures } = pending;
         jobs::export_tracks(
+            self.services.jobs.clone(),
             self.services.engine.clone(),
             self.services.events.clone(),
             edits,
@@ -1938,797 +1948,4 @@ pub fn track_signature(track: &Track) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::App;
-    use crate::events::{AppEvent, DecodedClip};
-    use crate::message::Message;
-    use crate::model::{MediaId, Track};
-    use crate::services::Services;
-    use simple_audio_cut_core::audio::ExportResult;
-
-    fn app() -> App {
-        let (app, _) = App::boot(Services::mock());
-        app
-    }
-
-    fn add_ready_media(app: &mut App, id: MediaId) {
-        use simple_audio_cut_core::audio::RecordingInfo;
-        app.session
-            .media
-            .push(crate::model::MediaClip::placeholder(id, "/tmp/voice.wav"));
-        let audio = std::sync::Arc::new(simple_audio_cut_core::buffer::AudioBuffer::new(
-            1_000,
-            vec![vec![0.1; 1_000]],
-        ));
-        let rms = std::sync::Arc::new(simple_audio_cut_core::analysis::analyze_rms(
-            &audio,
-            Default::default(),
-        ));
-        let info = RecordingInfo {
-            id: id.to_string(),
-            name: "Voice".into(),
-            path: "/tmp/voice.wav".into(),
-            duration_seconds: 1.0,
-            integrated_lufs: Some(-14.0),
-        };
-        app.services.events.emit(crate::events::AppEvent::ImportCompleted {
-            id,
-            info,
-            audio,
-            rms,
-        });
-        let _ = app.update(Message::Tick);
-    }
-
-    #[test]
-    fn selecting_a_pool_item_closes_the_track_editor_and_resets_the_playhead() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        add_ready_media(&mut app, 2);
-        let _ = app.update(Message::AddToTimeline(1));
-        app.session.playhead = 0.8;
-
-        let _ = app.update(Message::SelectMedia(2));
-
-        assert_eq!(app.session.selected_media, Some(2));
-        assert_eq!(app.session.selected_track, None);
-        assert_eq!(app.session.playhead, 0.0);
-    }
-
-    #[test]
-    fn imported_media_becomes_ready_and_selectable() {
-        let mut app = app();
-        add_ready_media(&mut app, 7);
-        let clip = app.session.media(7).expect("media");
-        assert!(clip.ready());
-        let _ = app.update(Message::AddToTimeline(7));
-        assert!(app.session.media(7).is_none());
-        assert_eq!(app.session.selected_track, Some(7));
-        assert_eq!(app.session.tracks.len(), 1);
-    }
-
-    #[test]
-    fn muting_a_range_marks_the_track_for_export() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        let track = app.session.track(1).expect("track");
-        assert_eq!(track.id(), 1);
-        app.session.track_mut(1).unwrap().last_export_signature =
-            Some(app.session.track(1).unwrap().signature());
-        assert!(!app.session.track(1).unwrap().needs_export());
-
-        let _ = app.update(Message::SelectRange(Some(
-            simple_audio_cut_core::region::Region::new(0.1, 0.2),
-        )));
-        let _ = app.update(Message::MuteRange);
-
-        let track: &Track = app.session.track(1).unwrap();
-        assert_eq!(track.muted.len(), 1);
-        assert!(track.needs_export());
-    }
-
-    #[test]
-    fn collapsed_tracks_map_display_time_back_to_source_time() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        {
-            let track = app.session.track_mut(1).unwrap();
-            track.manual_deleted = vec![simple_audio_cut_core::region::Region::new(0.2, 0.4)];
-            track.touch();
-            track.collapsed = true;
-            track.rebuild_collapsed();
-        }
-        let _ = app.update(Message::Waveform {
-            track: 1,
-            event: crate::message::WaveformEvent::Seek(0.5),
-        });
-        let playhead = app.session.playhead;
-        assert!((playhead - 0.7).abs() < 1e-6, "playhead {playhead}");
-    }
-
-    #[test]
-    fn export_without_changes_is_reported_instead_of_opening_a_dialog() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        app.session.track_mut(1).unwrap().mark_exported();
-        let _ = app.update(Message::ExportChanged);
-        assert_eq!(
-            app.ui.message,
-            "All editor tracks are already exported."
-        );
-    }
-
-    fn decoded_clip(id: MediaId) -> DecodedClip {
-        use simple_audio_cut_core::audio::RecordingInfo;
-        let audio = std::sync::Arc::new(simple_audio_cut_core::buffer::AudioBuffer::new(
-            1_000,
-            vec![vec![0.1; 1_000]],
-        ));
-        let rms = std::sync::Arc::new(simple_audio_cut_core::analysis::analyze_rms(
-            &audio,
-            Default::default(),
-        ));
-        DecodedClip {
-            info: RecordingInfo {
-                id: id.to_string(),
-                name: "Voice".into(),
-                path: "/tmp/voice.wav".into(),
-                duration_seconds: 1.0,
-                integrated_lufs: Some(-14.0),
-            },
-            audio,
-            rms,
-        }
-    }
-
-    #[test]
-    fn escape_closes_the_settings_drawer() {
-        let mut app = app();
-        let _ = app.update(Message::OpenSettings);
-        assert!(app.ui.settings_open);
-        let _ = app.update(Message::Dismiss);
-        assert!(!app.ui.settings_open);
-        assert!(!app.ui.settings.busy);
-    }
-
-    #[test]
-    fn escape_closes_the_context_menu_before_the_drawer() {
-        let mut app = app();
-        app.ui.settings_open = true;
-        app.ui.context_menu = Some(crate::model::ContextMenu {
-            track_id: 1,
-            kind: crate::model::ContextMenuKind::Actions,
-            x: 10.0,
-            y: 10.0,
-        });
-        let _ = app.update(Message::Dismiss);
-        assert!(app.ui.context_menu.is_none());
-        assert!(app.ui.settings_open);
-        let _ = app.update(Message::Dismiss);
-        assert!(!app.ui.settings_open);
-    }
-
-    #[test]
-    fn rename_commits_on_submit_and_ignores_an_empty_draft() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::RenameMedia(1, "Take two".into()));
-        let _ = app.update(Message::RenameCommit);
-        assert_eq!(app.session.clip_by_id(1).unwrap().name, "Take two");
-        assert!(app.ui.rename.is_none());
-
-        let _ = app.update(Message::RenameMedia(1, "   ".into()));
-        let _ = app.update(Message::RenameCommit);
-        assert_eq!(app.session.clip_by_id(1).unwrap().name, "Take two");
-    }
-
-    #[test]
-    fn rename_commits_when_another_interaction_starts() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        add_ready_media(&mut app, 2);
-        let _ = app.update(Message::RenameMedia(1, "Renamed".into()));
-        let _ = app.update(Message::SelectMedia(2));
-        assert_eq!(app.session.clip_by_id(1).unwrap().name, "Renamed");
-        assert!(app.ui.rename.is_none());
-    }
-
-    #[test]
-    fn starting_a_second_rename_commits_the_first_draft() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        add_ready_media(&mut app, 2);
-        let _ = app.update(Message::RenameMedia(1, "First".into()));
-        let _ = app.update(Message::RenameMedia(2, "Second".into()));
-        let _ = app.update(Message::RenameCommit);
-
-        assert_eq!(app.session.clip_by_id(1).unwrap().name, "First");
-        assert_eq!(app.session.clip_by_id(2).unwrap().name, "Second");
-    }
-
-    #[test]
-    fn escape_discards_an_uncommitted_rename() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let original = app.session.clip_by_id(1).unwrap().name.clone();
-        let _ = app.update(Message::RenameMedia(1, "Draft".into()));
-        let _ = app.update(Message::Dismiss);
-        assert!(app.ui.rename.is_none());
-        assert_eq!(app.session.clip_by_id(1).unwrap().name, original);
-    }
-
-    #[test]
-    fn renaming_a_collapsed_track_does_not_rebuild_the_collapsed_audio() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        {
-            let track = app.session.track_mut(1).unwrap();
-            track.manual_deleted = vec![simple_audio_cut_core::region::Region::new(0.2, 0.4)];
-            track.touch();
-            track.collapsed = true;
-            track.rebuild_collapsed();
-        }
-        let before = app
-            .session
-            .track(1)
-            .unwrap()
-            .collapsed_audio
-            .clone()
-            .expect("collapsed audio");
-        let revision = app.session.track(1).unwrap().revision;
-
-        let _ = app.update(Message::RenameMedia(1, "Renamed".into()));
-        let _ = app.update(Message::RenameCommit);
-
-        let track = app.session.track(1).unwrap();
-        assert_eq!(track.revision, revision);
-        let after = track.collapsed_audio.clone().expect("collapsed audio");
-        assert!(std::sync::Arc::ptr_eq(&before, &after));
-    }
-
-    #[test]
-    fn a_recording_deleted_while_finalizing_does_not_report_success() {
-        let mut app = app();
-        let placeholder = 7;
-        app.session.media.push(crate::model::MediaClip::recording_placeholder(
-            placeholder,
-            "Recording",
-        ));
-        app.session.recording = Some(crate::model::ActiveRecording {
-            placeholder,
-            started: std::time::Instant::now(),
-        });
-        let _ = app.update(Message::DeleteMedia(placeholder));
-        app.services.events.emit(AppEvent::RecordingStopped {
-            placeholder,
-            result: Ok(decoded_clip(placeholder)),
-        });
-        let _ = app.update(Message::Tick);
-
-        assert_eq!(
-            app.ui.message,
-            "The recording was discarded before it finished."
-        );
-        assert!(app.session.clip_by_id(placeholder).is_none());
-    }
-
-    #[test]
-    fn an_import_removed_before_completion_does_not_claim_success() {
-        let mut app = app();
-        let clip = decoded_clip(404);
-        app.services.events.emit(AppEvent::ImportCompleted {
-            id: 404,
-            info: clip.info,
-            audio: clip.audio,
-            rms: clip.rms,
-        });
-        let _ = app.update(Message::Tick);
-
-        assert_eq!(
-            app.ui.message,
-            "The imported media was removed before it finished."
-        );
-        assert!(app.session.clip_by_id(404).is_none());
-    }
-
-    fn add_track_for_export(app: &mut App, id: MediaId) {
-        add_ready_media(app, id);
-        let _ = app.update(Message::AddToTimeline(id));
-    }
-
-    fn completed_export(id: MediaId, signature: String) -> AppEvent {
-        AppEvent::ExportCompleted {
-            results: vec![ExportResult {
-                recording_id: id.to_string(),
-                path: Some("/tmp/export/voice.wav".into()),
-                error: None,
-            }],
-            signatures: vec![(id, signature)],
-        }
-    }
-
-    #[test]
-    fn a_track_that_changed_during_export_stays_queued() {
-        let mut app = app();
-        add_track_for_export(&mut app, 1);
-        let signature = app.session.track(1).unwrap().signature();
-        app.session.exporting = vec![1];
-        app.session.track_mut(1).unwrap().clip.name = "Renamed mid-export".into();
-
-        app.services
-            .events
-            .emit(completed_export(1, signature));
-        let _ = app.update(Message::Tick);
-
-        let track = app.session.track(1).unwrap();
-        assert!(track.needs_export());
-        assert!(app
-            .ui
-            .message
-            .contains("changed during export"));
-    }
-
-    #[test]
-    fn an_unchanged_export_marks_the_track_exported() {
-        let mut app = app();
-        add_track_for_export(&mut app, 1);
-        let signature = app.session.track(1).unwrap().signature();
-        app.session.exporting = vec![1];
-
-        app.services
-            .events
-            .emit(completed_export(1, signature));
-        let _ = app.update(Message::Tick);
-
-        assert!(!app.session.track(1).unwrap().needs_export());
-        assert!(app.session.failed_exports.is_empty());
-    }
-
-    #[test]
-    fn a_completed_export_keeps_failures_from_other_batches() {
-        let mut app = app();
-        add_track_for_export(&mut app, 1);
-        let signature = app.session.track(1).unwrap().signature();
-        app.session.exporting = vec![1];
-        app.session.failed_exports = vec![99];
-
-        app.services
-            .events
-            .emit(completed_export(1, signature));
-        let _ = app.update(Message::Tick);
-
-        assert_eq!(app.session.failed_exports, vec![99]);
-    }
-
-    #[test]
-    fn starting_a_second_export_reports_that_one_is_already_running() {
-        let mut app = app();
-        add_track_for_export(&mut app, 1);
-        app.session.exporting = vec![1];
-
-        let _ = app.update(Message::ExportChanged);
-
-        assert_eq!(app.ui.message, "An export is already running.");
-    }
-
-    #[test]
-    fn checking_the_setup_does_not_replace_the_draft() {
-        let mut app = app();
-        let mut status = app.services.denoise.status();
-        status.configured.executable_path = "/different/python".into();
-        app.ui.settings.draft = Some(app.services.denoise.status().configured);
-        app.ui.settings.busy = true;
-
-        app.services
-            .events
-            .emit(AppEvent::SettingsInspected(Ok(status)));
-        let _ = app.update(Message::Tick);
-
-        assert_eq!(
-            app.ui.settings.draft.as_ref().unwrap().executable_path,
-            app.services.denoise.status().configured.executable_path
-        );
-        assert!(!app.ui.settings.busy);
-    }
-
-    #[test]
-    fn stopping_when_idle_is_a_no_op() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        app.session.playhead = 0.3;
-
-        let _ = app.update(Message::StopPlayback);
-
-        assert!(app.session.playback.is_none());
-        assert!((app.session.playhead - 0.3).abs() < 1e-9);
-    }
-
-    #[test]
-    fn home_and_end_move_the_playhead_to_the_track_boundaries() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-
-        let _ = app.update(Message::JumpToEnd);
-        assert!((app.session.playhead - 1.0).abs() < 1e-9);
-        let _ = app.update(Message::JumpToStart);
-        assert_eq!(app.session.playhead, 0.0);
-    }
-
-    #[test]
-    fn clear_envelope_removes_every_keyframe_and_requeues_export() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        app.session.track_mut(1).unwrap().envelope = vec![
-            simple_audio_cut_core::region::EnvelopePoint::new("a", 0.2, 0.5),
-            simple_audio_cut_core::region::EnvelopePoint::new("b", 0.6, 1.4),
-        ];
-        app.session.track_mut(1).unwrap().mark_exported();
-        assert!(!app.session.track(1).unwrap().needs_export());
-
-        let _ = app.update(Message::ClearEnvelope);
-
-        let track = app.session.track(1).unwrap();
-        assert!(track.envelope.is_empty());
-        assert_eq!(app.ui.message, "Cleared the volume envelope.");
-    }
-
-    #[test]
-    fn zooming_changes_only_the_selected_track_scale() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        add_ready_media(&mut app, 2);
-        let _ = app.update(Message::AddToTimeline(1));
-        let _ = app.update(Message::AddToTimeline(2));
-        let _ = app.update(Message::SelectTrack(1));
-        let other = app.session.track(2).unwrap().pixels_per_second;
-        assert!(!app.session.track(1).unwrap().zoom_locked);
-
-        // The first zoom pins the current on-screen "fit" scale.
-        let _ = app.update(Message::ZoomSelected(true));
-        let pinned = app.session.track(1).unwrap().pixels_per_second;
-        assert!(app.session.track(1).unwrap().zoom_locked);
-        assert_eq!(app.session.track(2).unwrap().pixels_per_second, other);
-        assert!(!app.session.track(2).unwrap().zoom_locked);
-
-        let _ = app.update(Message::ZoomSelected(false));
-        let zoomed_out = app.session.track(1).unwrap().pixels_per_second;
-        assert!(zoomed_out < pinned);
-        let _ = app.update(Message::ZoomSelected(true));
-        assert!((app.session.track(1).unwrap().pixels_per_second - pinned).abs() < 1e-3);
-    }
-
-    #[test]
-    fn enter_moves_the_selected_library_item_onto_the_timeline() {
-        let mut app = app();
-        add_ready_media(&mut app, 5);
-        let _ = app.update(Message::SelectMedia(5));
-
-        let _ = app.update(Message::Shortcut(crate::message::Shortcut::AddSelected));
-
-        assert!(app.session.media(5).is_none());
-        assert!(app.session.track(5).is_some());
-    }
-
-    #[test]
-    fn dragging_a_library_take_onto_the_timeline_adds_a_track() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        assert!(app.session.tracks.is_empty());
-
-        let _ = app.update(Message::DragItem(1));
-        assert_eq!(app.ui.dragging, Some(1));
-        assert_eq!(app.session.selected_media, Some(1));
-
-        let _ = app.update(Message::DropItem);
-
-        assert!(app.ui.dragging.is_none());
-        assert!(app.session.track(1).is_some());
-        assert!(app.session.media(1).is_none());
-        assert_eq!(app.session.selected_track, Some(1));
-    }
-
-    #[test]
-    fn releasing_a_drag_away_from_the_timeline_cancels_it() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-
-        let _ = app.update(Message::DragItem(1));
-        let _ = app.update(Message::DragCancel);
-
-        assert!(app.ui.dragging.is_none());
-        assert!(app.session.media(1).is_some());
-        assert!(app.session.tracks.is_empty());
-    }
-
-    #[test]
-    fn a_pending_import_cannot_be_dragged_onto_the_timeline() {
-        let mut app = app();
-        app.session
-            .media
-            .push(crate::model::MediaClip::placeholder(2, "/tmp/pending.wav"));
-
-        let _ = app.update(Message::DragItem(2));
-
-        assert!(app.ui.dragging.is_none());
-        let _ = app.update(Message::DropItem);
-        assert!(app.session.tracks.is_empty());
-        assert!(app.session.media(2).is_some());
-    }
-
-    #[test]
-    fn dropping_files_imports_the_accepted_ones_only() {
-        let mut app = app();
-        let before = app.session.media.len();
-
-        let _ = app.update(Message::FilesDropped(vec![
-            std::path::PathBuf::from("/tmp/voice.WAV"),
-            std::path::PathBuf::from("/tmp/clip.mp4"),
-            std::path::PathBuf::from("/tmp/notes.txt"),
-        ]));
-
-        // Only the two audio/video files are queued.
-        assert_eq!(app.session.media.len(), before + 2);
-        assert!(app.ui.message.contains('2'));
-    }
-
-    #[test]
-    fn dropping_unsupported_files_explains_why_nothing_happened() {
-        let mut app = app();
-        let _ = app.update(Message::FilesDropped(vec![std::path::PathBuf::from(
-            "/tmp/notes.txt",
-        )]));
-
-        assert_eq!(
-            app.ui.message,
-            "Only audio or video files can be dropped here."
-        );
-        assert!(app.session.media.is_empty());
-    }
-
-    #[test]
-    fn escape_cancels_a_drag_before_closing_anything_else() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        app.ui.settings_open = true;
-
-        let _ = app.update(Message::DragItem(1));
-        let _ = app.update(Message::Dismiss);
-
-        assert!(app.ui.dragging.is_none());
-        assert!(app.ui.settings_open, "the drawer should stay open");
-    }
-
-    #[test]
-    fn an_unresolved_provider_status_does_not_start_denoising() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        // Simulate the race: the take exists while the provider status is
-        // still unknown (the boot job has not reported yet).
-        app.session.denoise_status = None;
-        if let Some(clip) = app.session.editing_mut(1) {
-            clip.denoise = crate::model::DenoiseState::default();
-        }
-
-        app.queue_denoise(1);
-
-        let status = app.session.clip_by_id(1).unwrap().denoise.status;
-        assert!(
-            !status.is_busy(),
-            "denoising started before the provider was known ({status:?})"
-        );
-    }
-
-    #[test]
-    fn resolving_the_status_applies_the_policy_to_already_imported_takes() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        // The take is sitting untouched, waiting for the provider status.
-        if let Some(clip) = app.session.editing_mut(1) {
-            clip.denoise = crate::model::DenoiseState::default();
-        }
-        let mut status = app.services.denoise.status();
-        status.effective.enabled = false;
-        status.configured.enabled = false;
-        app.session.denoise_status = Some(status);
-
-        app.apply_denoise_policy();
-
-        let clip = app.session.clip_by_id(1).unwrap();
-        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
-        assert!(clip.denoise.reason.is_some());
-        assert!(!clip.denoise.opted_out);
-    }
-
-    #[test]
-    fn the_policy_never_overrides_an_explicit_opt_out() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: false,
-        });
-        assert!(app.session.clip_by_id(1).unwrap().denoise.opted_out);
-        let mut status = app.services.denoise.status();
-        status.effective.enabled = true;
-        status.configured.enabled = true;
-        app.session.denoise_status = Some(status);
-
-        app.apply_denoise_policy();
-
-        let clip = app.session.clip_by_id(1).unwrap();
-        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
-        assert!(clip.denoise.opted_out);
-    }
-
-    #[test]
-    fn turning_denoising_off_keeps_the_take_editable_and_exportable() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: false,
-        });
-
-        let clip = app.session.clip_by_id(1).unwrap();
-        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
-        assert!(clip.ready());
-        assert!(app.ui.message.contains("original audio"));
-        // The take is still a normal timeline track that needs export.
-        assert!(app.session.track(1).unwrap().needs_export());
-        assert!(app.session.changed_tracks().contains(&1));
-    }
-
-    #[test]
-    fn automatic_off_marks_new_takes_as_original_audio() {
-        let mut app = app();
-        let mut config = app.services.denoise.status().configured;
-        config.enabled = false;
-        let status = app
-            .services
-            .denoise
-            .save_config(config)
-            .expect("disable automatic denoising");
-        app.session.denoise_status = Some(status);
-        add_ready_media(&mut app, 1);
-
-        let clip = app.session.clip_by_id(1).unwrap();
-        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
-        assert!(clip
-            .denoise
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Automatic denoising is off"));
-
-        // The take can still be denoised explicitly.
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: true,
-        });
-        assert!(matches!(
-            app.session.clip_by_id(1).unwrap().denoise.status,
-            crate::model::DenoiseStatus::Queued | crate::model::DenoiseStatus::Unavailable
-        ));
-    }
-
-    #[test]
-    fn opting_out_of_denoising_is_not_overridden_by_the_requeue_sweep() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: false,
-        });
-
-        app.apply_denoise_policy();
-
-        assert_eq!(
-            app.session.clip_by_id(1).unwrap().denoise.status,
-            crate::model::DenoiseStatus::Skipped
-        );
-    }
-
-    #[test]
-    fn re_enabling_denoising_clears_the_opt_out() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: false,
-        });
-
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: true,
-        });
-
-        let status = app.session.clip_by_id(1).unwrap().denoise.status;
-        assert!(matches!(
-            status,
-            crate::model::DenoiseStatus::Queued | crate::model::DenoiseStatus::Unavailable
-        ));
-    }
-
-    #[test]
-    fn an_unavailable_provider_records_the_reason_without_blocking_export() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        app.services.events.emit(AppEvent::DenoiseUnavailable {
-            id: 1,
-            reason: Some("ClearVoice is not configured.".into()),
-        });
-        let _ = app.update(Message::Tick);
-
-        let clip = app.session.clip_by_id(1).unwrap();
-        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Unavailable);
-        assert_eq!(
-            clip.denoise.reason.as_deref(),
-            Some("ClearVoice is not configured.")
-        );
-        assert!(clip.ready());
-        assert!(app.session.track(1).unwrap().needs_export());
-        // Nothing is left "processing", so quitting is not blocked by it.
-        assert_eq!(app.session.pending_denoise(), 0);
-    }
-
-    #[test]
-    fn a_denoised_take_can_be_switched_back_to_its_normalized_audio() {
-        let mut app = app();
-        add_ready_media(&mut app, 1);
-        let _ = app.update(Message::AddToTimeline(1));
-        {
-            let clip = app.session.editing_mut(1).unwrap();
-            clip.denoise.status = crate::model::DenoiseStatus::Complete;
-            clip.path = "/tmp/denoised.wav".into();
-        }
-        assert!(app.session.clip_by_id(1).unwrap().has_original_audio());
-
-        let _ = app.update(Message::SetDenoise {
-            id: 1,
-            enabled: false,
-        });
-        // The swap itself happens on a worker thread; simulate its result.
-        let clip = app.session.clip_by_id(1).unwrap();
-        let path = clip.normalized_path.clone();
-        let audio = clip.audio.clone().unwrap();
-        let rms = clip.rms.clone().unwrap();
-        app.services.events.emit(AppEvent::OriginalAudioRestored {
-            id: 1,
-            path: path.clone(),
-            audio,
-            rms,
-        });
-        let _ = app.update(Message::Tick);
-
-        let clip = app.session.clip_by_id(1).unwrap();
-        assert_eq!(clip.path, path);
-        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
-        assert!(!clip.has_original_audio());
-    }
-
-    #[test]
-    fn saving_settings_keeps_the_drawer_open() {
-        let mut app = app();
-        let _ = app.update(Message::OpenSettings);
-        let status = app.services.denoise.status();
-        app.ui.settings.draft = Some(status.configured.clone());
-
-        app.services.events.emit(AppEvent::SettingsSaved(Ok(status)));
-        let _ = app.update(Message::Tick);
-
-        assert!(app.ui.settings_open);
-        assert!(app.ui.settings.status.is_some());
-    }
-}
+mod tests;

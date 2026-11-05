@@ -188,3 +188,58 @@ cargo check --workspace --no-default-features                          passed
   重新开启会重新排队；provider 不可用时记录原因且不阻塞导出；
   已降噪素材切回原始音频。
 - workflow：全局关闭自动降噪时导入→编辑→播放→导出整条链路可用。
+
+---
+
+## 2026-11-05 左键默认静音 + 测试与可维护性
+
+### 交互变更
+
+- **左键拖动波形 = 静音**：拖动时预览为琥珀色，松手后立即把区间替换为等长静音，
+  选区保留；再次左键拖动同一段（或按 `M`）恢复声音。
+- **右键拖动保持原样**：向右删除、向左恢复（红色/绿色预览）。
+- 折叠视图下两种手势都会给出"Show all edits"提示，而不是静默无反应。
+
+### 修复的缺陷
+
+| 问题 | 位置 | 状态 |
+| --- | --- | --- |
+| **`Check setup` 会用未保存的草稿覆盖运行中的 provider 状态**：之后新素材会按草稿（可能不可用）处理，而不是已保存配置。 | `update.rs` `SettingsInspected` | **fixed** |
+| **恢复原始音频后丢失 `opted_out`**：自动降噪开启时会把用户刚恢复的音频再次降噪。 | `update.rs` `OriginalAudioRestored` | **fixed** |
+| **自动降噪关闭时 `Use original audio` 不记录用户选择**：`Skipped` 提前返回，`opted_out` 永远不置位，后续策略可能重新降噪。 | `update.rs` `set_denoise` | **fixed** |
+| **按 `M` 静音后选区被清空**：README 承诺"再按一次恢复"实际做不到，必须重新拖选。 | `update.rs` `toggle_mute_range` | **fixed** |
+| **折叠轨道上右键拖动完全无反馈**：手势被静默忽略。 | `update.rs` `waveform_event` | **fixed** |
+| **左键拖动预览使用删除的红色**：非破坏性选区看起来像要删除音频。 | `waveform.rs` | **fixed** |
+| **`select_track` 与 `select_track_for_interaction` 完全重复** | `update.rs` | **fixed**（合并） |
+| **降噪失败后没有重试入口**：检查器按钮显示 `Use original audio`，点了只会关闭降噪；失败素材无法重试。 | `ui.rs` | **fixed**（`Failed` → `Retry denoising`） |
+| **已知不可用的 provider 仍会被策略反复派发任务**：每次打开/保存设置都重新排队并立即失败。 | `update.rs` `apply_denoise_policy` | **fixed**（`ready` 为假时只记录具体阻塞项，不派发） |
+| **失败任务的阻塞原因只有笼统 summary**：用户看不到到底是 Python、模型还是设备的问题。 | `denoise/mod.rs` `blocking_reason` | **fixed**（取第一条 Error 检查的标签与详情） |
+
+### 测试与可维护性
+
+- 新增 `JobRunner` 接口：生产实现 `ThreadJobRunner`，测试默认 `InlineJobRunner`。
+  后台任务在消息处理内同步完成，**workflow 测试不再有 `sleep`、超时和轮询**。
+- `Tick` 一次排空整条事件链（对话框 → 导出 → 完成），不再每帧只处理一批事件。
+- `MockAudioEngine` 的录音/降噪改为同步且产出真实可解码 WAV；
+  `MockDenoiseProvider` 的输出改到临时目录，不在用户素材旁写文件。
+- `update.rs` / `ui.rs` / `waveform.rs` 的测试移到各自的 `tests.rs` 子模块。
+- 新增波形手势测试：左键静音、已静音时恢复预览、右键删除/恢复、刻度点击、
+  点击画布外忽略。
+- 新增状态测试：显式降噪失败后保留原音频、显式降噪→恢复原音的往返、
+  折叠轨道提示、`Check setup` 不改运行状态、自动关闭时 `Use original audio`
+  仍被记录。
+- `native_pipeline` 用 `mpsc::recv_timeout` 等待真实导入回调，替代 50ms 轮询。
+
+### 验证
+
+```text
+cargo test --workspace
+  core lib:         66 passed, 1 ignored
+  core integration:  2 passed
+  app unit:         79 passed
+  real audio:        1 passed
+  ui_view:           6 passed
+  workflow:         15 passed
+cargo clippy --workspace --all-targets --all-features -- -D warnings   passed
+cargo check --workspace --no-default-features                          passed
+```

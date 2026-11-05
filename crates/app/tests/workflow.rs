@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use simple_audio_cut_core::analysis::{analyze_rms, RmsOptions};
 use simple_audio_cut_core::audio::{AudioPlayer, MockAudioEngine, RecordingInfo};
@@ -59,26 +59,16 @@ fn harness() -> Harness {
     let player = Arc::new(simple_audio_cut_core::audio::MockAudioPlayer::deterministic());
     let dialogs = Arc::new(MockDialogService::new());
     let events: SharedSink = Arc::new(EventBus::new());
-    let services = Services::headless_with(
-        engine,
-        denoise,
-        player.clone(),
-        dialogs.clone(),
-        events,
-    );
+    let services =
+        Services::headless_with(engine, denoise, player.clone(), dialogs.clone(), events);
     let (mut app, _) = App::boot(services);
-    // The provider status is resolved by a background job. Wait for it so the
-    // denoising policy is known before the test imports anything; otherwise
-    // the outcome would depend on job scheduling.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while app.session.denoise_status.is_none() {
-        let _ = app.update(Message::Tick);
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the denoise provider status never resolved"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    // The mock services run jobs inline, so one tick settles the boot status
+    // and the denoising policy is known before anything is imported.
+    let _ = app.update(Message::Tick);
+    assert!(
+        app.session.denoise_status.is_some(),
+        "the denoise provider status never resolved"
+    );
     Harness {
         app,
         player,
@@ -92,18 +82,17 @@ impl Harness {
         let _ = self.app.update(Message::Tick);
     }
 
-    fn pump_until(&mut self, mut condition: impl FnMut(&App) -> bool, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
+    /// Pumps until `condition` holds. The inline job runner settles every
+    /// job (and the events it emits) within one tick; the cap catches a
+    /// regression without hiding it behind a timeout.
+    fn pump_until(&mut self, mut condition: impl FnMut(&App) -> bool) -> bool {
+        for _ in 0..8 {
             self.pump();
             if condition(&self.app) {
                 return true;
             }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
         }
+        false
     }
 
     fn import_ready(&mut self, id: MediaId, name: &str) -> PathBuf {
@@ -183,10 +172,13 @@ fn automatic_denoising_off_leaves_the_take_usable_and_exportable() {
     let id = 27;
     harness.import_ready(id, "voice");
     let _ = harness.app.update(Message::AddToTimeline(id));
-    assert!(harness.pump_until(
-        |app| !app.session.clip_by_id(id).unwrap().denoise.status.is_busy(),
-        Duration::from_secs(5)
-    ));
+    assert!(harness.pump_until(|app| !app
+        .session
+        .clip_by_id(id)
+        .unwrap()
+        .denoise
+        .status
+        .is_busy(),));
     let clip = harness.app.session.clip_by_id(id).unwrap();
     // Either the provider reports itself unusable, or automatic runs are off:
     // both must leave the take untouched and explain why.
@@ -222,7 +214,6 @@ fn automatic_denoising_off_leaves_the_take_usable_and_exportable() {
     assert!(
         harness.pump_until(
             |app| app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose"),
-            Duration::from_secs(30)
         ),
         "export did not finish: {}",
         harness.app.ui.message
@@ -237,10 +228,9 @@ fn a_take_can_opt_out_of_denoising_and_still_export() {
     let id = 28;
     harness.import_ready(id, "voice");
     let _ = harness.app.update(Message::AddToTimeline(id));
-    let _ = harness.app.update(Message::SetDenoise {
-        id,
-        enabled: false,
-    });
+    let _ = harness
+        .app
+        .update(Message::SetDenoise { id, enabled: false });
     assert_eq!(
         harness.app.session.clip_by_id(id).unwrap().denoise.status,
         simple_audio_cut_iced::model::DenoiseStatus::Skipped
@@ -252,7 +242,6 @@ fn a_take_can_opt_out_of_denoising_and_still_export() {
     assert!(
         harness.pump_until(
             |app| app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose"),
-            Duration::from_secs(30)
         ),
         "export did not finish: {}",
         harness.app.ui.message
@@ -317,12 +306,19 @@ fn export_changed_writes_only_changed_tracks_and_marks_them_exported() {
     harness.dialogs.queue_folder(Some(export_dir.clone()));
 
     let _ = harness.app.update(Message::ExportChanged);
-    let finished = harness.pump_until(
-        |app| app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose"),
-        Duration::from_secs(30),
+    let finished = harness.pump_until(|app| {
+        app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose")
+    });
+    assert!(
+        finished,
+        "export did not finish: {}",
+        harness.app.ui.message
     );
-    assert!(finished, "export did not finish: {}", harness.app.ui.message);
-    assert!(harness.app.ui.message.starts_with("Exported"), "{}", harness.app.ui.message);
+    assert!(
+        harness.app.ui.message.starts_with("Exported"),
+        "{}",
+        harness.app.ui.message
+    );
 
     let exported: Vec<_> = std::fs::read_dir(&export_dir)
         .expect("export directory")
@@ -343,8 +339,7 @@ fn cancelling_the_export_dialog_leaves_tracks_pending() {
     harness.dialogs.queue_folder(None);
 
     let _ = harness.app.update(Message::ExportChanged);
-    let finished = harness
-        .pump_until(|app| app.session.exporting.is_empty(), Duration::from_secs(5));
+    let finished = harness.pump_until(|app| app.session.exporting.is_empty());
     assert!(finished);
     assert_eq!(harness.app.ui.message, "Export cancelled");
     assert!(harness.app.session.track(id).expect("track").needs_export());
@@ -412,4 +407,89 @@ fn playback_uses_the_selected_track_not_the_last_one() {
         last_call.starts_with("play 1000 Hz"),
         "player received {last_call}"
     );
+}
+
+#[test]
+fn recording_stops_into_a_ready_take() {
+    let mut harness = harness();
+
+    let _ = harness.app.update(Message::RecordToggle);
+    harness.pump();
+    assert!(harness.app.session.recording.is_some());
+
+    let _ = harness.app.update(Message::RecordToggle);
+    harness.pump();
+
+    let clip = harness.app.session.media.first().expect("recorded take");
+    assert!(clip.ready(), "{}", harness.app.ui.message);
+    assert!(clip.duration > 0.1);
+    assert_eq!(
+        harness.app.ui.message,
+        "Recording is ready in the media pool."
+    );
+    let recorded_path = clip.path.clone();
+    let _ = std::fs::remove_file(recorded_path);
+}
+
+#[test]
+fn left_drag_mutes_without_shortening_the_timeline() {
+    let mut harness = harness();
+    let id = 101;
+    harness.import_ready(id, "voice");
+    let _ = harness.app.update(Message::AddToTimeline(id));
+    let before = harness.app.session.track(id).unwrap().edited_duration();
+
+    let _ = harness.app.update(Message::Waveform {
+        track: id,
+        event: simple_audio_cut_iced::message::WaveformEvent::MuteRange(
+            simple_audio_cut_core::region::Region::new(0.2, 0.5),
+        ),
+    });
+
+    let track = harness.app.session.track(id).expect("track");
+    assert_eq!(track.muted.len(), 1);
+    assert_eq!(
+        track.selected_range,
+        Some(simple_audio_cut_core::region::Region::new(0.2, 0.5))
+    );
+    assert!((track.edited_duration() - before).abs() < 1e-9);
+    assert!(track.needs_export());
+    assert!(harness.app.ui.message.starts_with("Muted"));
+
+    // The right-drag remains the destructive gesture.
+    let _ = harness.app.update(Message::Waveform {
+        track: id,
+        event: simple_audio_cut_iced::message::WaveformEvent::DirectEdit {
+            region: simple_audio_cut_core::region::Region::new(0.6, 0.8),
+            operation: simple_audio_cut_core::direct_edit::DirectRegionOperation::Delete,
+        },
+    });
+    assert!(
+        (harness.app.session.track(id).unwrap().edited_duration() - (before - 0.2)).abs() < 1e-9
+    );
+}
+
+#[test]
+fn a_failed_export_keeps_the_track_pending_and_names_the_reason() {
+    let mut harness = harness();
+    let id = 111;
+    harness.import_ready(id, "voice");
+    let _ = harness.app.update(Message::AddToTimeline(id));
+
+    // A regular file cannot become the export directory, so the engine has to
+    // report a failure instead of silently dropping the track.
+    let not_a_directory = harness.root.join("not-a-directory");
+    std::fs::write(&not_a_directory, b"x").expect("create blocking file");
+    harness.dialogs.queue_folder(Some(not_a_directory));
+
+    let _ = harness.app.update(Message::ExportChanged);
+    assert!(harness.pump_until(|app| app.session.exporting.is_empty()));
+
+    assert!(
+        harness.app.ui.message.contains("failed"),
+        "{}",
+        harness.app.ui.message
+    );
+    assert!(harness.app.session.track(id).expect("track").needs_export());
+    assert!(harness.app.session.failed_exports.contains(&id));
 }

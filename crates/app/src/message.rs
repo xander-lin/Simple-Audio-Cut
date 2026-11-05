@@ -28,7 +28,9 @@ pub enum Shortcut {
 #[derive(Clone, Debug, PartialEq)]
 pub enum WaveformEvent {
     Seek(f64),
-    Select(Option<Region>),
+    /// Left-drag on the waveform: mutes the range, or restores it when the
+    /// range is already fully muted. The range stays selected.
+    MuteRange(Region),
     DirectEdit {
         region: Region,
         operation: simple_audio_cut_core::direct_edit::DirectRegionOperation,

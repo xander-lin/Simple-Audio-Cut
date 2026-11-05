@@ -14,8 +14,10 @@ use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
 
 use simple_audio_cut_core::analysis::{amplitude_to_dbfs, RmsFrame};
 use simple_audio_cut_core::buffer::AudioBuffer;
-use simple_audio_cut_core::direct_edit::{direct_region_edit, DirectRegionOperation};
-use simple_audio_cut_core::region::{envelope_gain_at_time, EnvelopePoint, Region};
+use simple_audio_cut_core::direct_edit::direct_region_edit;
+use simple_audio_cut_core::region::{
+    envelope_gain_at_time, region_is_covered, EnvelopePoint, Region,
+};
 
 use crate::message::{Message, WaveformEvent};
 use crate::model::MediaId;
@@ -229,7 +231,11 @@ impl<'a> TrackCanvas<'a> {
         index as f32 * (ROW_HEIGHT + ROW_GAP)
     }
 
-    fn row_at(bounds: Rectangle, rows: &[RowLayout], position: Point) -> Option<(RowLayout, Point)> {
+    fn row_at(
+        bounds: Rectangle,
+        rows: &[RowLayout],
+        position: Point,
+    ) -> Option<(RowLayout, Point)> {
         for (index, row) in rows.iter().enumerate() {
             let top = Self::row_top(index);
             if position.y >= top && position.y <= top + ROW_HEIGHT {
@@ -254,7 +260,9 @@ impl<'a> TrackCanvas<'a> {
     fn cache_key(&self) -> u64 {
         let mut key = self.revision;
         key = key.wrapping_mul(31).wrapping_add(self.selected as u64);
-        key = key.wrapping_mul(31).wrapping_add(self.show_threshold as u64);
+        key = key
+            .wrapping_mul(31)
+            .wrapping_add(self.show_threshold as u64);
         key = key
             .wrapping_mul(31)
             .wrapping_add((self.threshold_db * 100.0) as i64 as u64);
@@ -270,10 +278,8 @@ impl<'a> TrackCanvas<'a> {
         };
         for row in rows {
             let top = Self::row_top(row.index);
-            let row_rect = Rectangle::new(
-                Point::new(0.0, top),
-                Size::new(bounds.width, ROW_HEIGHT),
-            );
+            let row_rect =
+                Rectangle::new(Point::new(0.0, top), Size::new(bounds.width, ROW_HEIGHT));
             frame.fill_rectangle(row_rect.position(), row_rect.size(), background);
 
             self.draw_ruler(frame, &row, top, bounds.width);
@@ -288,9 +294,9 @@ impl<'a> TrackCanvas<'a> {
             self.draw_peaks(frame, &row, top);
             self.draw_rms(frame, &row, top);
             if self.show_threshold {
-                let radius = Self::rms_radius(
-                    simple_audio_cut_core::analysis::dbfs_to_amplitude(self.threshold_db),
-                );
+                let radius = Self::rms_radius(simple_audio_cut_core::analysis::dbfs_to_amplitude(
+                    self.threshold_db,
+                ));
                 let color = Color::from_rgba(0.84, 0.74, 0.35, 0.82);
                 // The original editor drew the threshold as a dashed guide.
                 draw_dashed_rule(
@@ -486,10 +492,7 @@ impl<'a> TrackCanvas<'a> {
                 builder.line_to(Point::new(row.leading + x as f32, center + max * half));
             }
         });
-        frame.stroke(
-            &path,
-            Stroke::default().with_color(color).with_width(1.0),
-        );
+        frame.stroke(&path, Stroke::default().with_color(color).with_width(1.0));
     }
 
     fn draw_overlays(&self, frame: &mut Frame, bounds: Rectangle, state: &CanvasState) {
@@ -661,19 +664,16 @@ impl<'a> TrackCanvas<'a> {
             }
 
             if let Some(drag) = &state.drag {
-                if let Some(preview) = drag.preview() {
+                if let Some(preview) = drag.preview(&self.muted) {
                     let start = preview.start.max(row.start);
                     let end = preview.end.min(row.end);
                     if end > start {
                         let left = Self::x_at_time(row, start);
                         let width = (Self::x_at_time(row, end) - left).max(1.0);
                         let color = match preview.operation {
-                            DirectRegionOperation::Delete => {
-                                Color::from_rgba(0.88, 0.46, 0.42, 0.30)
-                            }
-                            DirectRegionOperation::Restore => {
-                                Color::from_rgba(0.35, 0.66, 0.47, 0.32)
-                            }
+                            PreviewOperation::Mute => Color::from_rgba(0.94, 0.72, 0.30, 0.28),
+                            PreviewOperation::Delete => Color::from_rgba(0.88, 0.46, 0.42, 0.30),
+                            PreviewOperation::Restore => Color::from_rgba(0.35, 0.66, 0.47, 0.32),
                         };
                         frame.fill_rectangle(
                             Point::new(left, content_top),
@@ -802,8 +802,7 @@ fn deleted_at_time(regions: &[Region], time: f64) -> Option<Region> {
 /// [`RULER_MIN_LABEL_GAP`] pixels apart.
 pub fn ruler_step(pixels_per_second: f32) -> f64 {
     const STEPS: [f64; 15] = [
-        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
-        3600.0,
+        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
     ];
     let pps = pixels_per_second.max(0.25) as f64;
     for step in STEPS {
@@ -832,41 +831,50 @@ pub struct CanvasState {
 
 #[derive(Clone, Debug)]
 enum Drag {
-    Range {
-        start: f64,
-        current: f64,
-    },
-    Direct {
-        start: f64,
-        current: f64,
-    },
-    Envelope {
-        id: String,
-    },
+    Range { start: f64, current: f64 },
+    Direct { start: f64, current: f64 },
+    Envelope { id: String },
+}
+
+/// What the drag would do if it were released now. The colour of the preview
+/// follows this, so a left-drag no longer looks like a destructive edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewOperation {
+    Mute,
+    Restore,
+    Delete,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Preview {
     start: f64,
     end: f64,
-    operation: DirectRegionOperation,
+    operation: PreviewOperation,
 }
 
 impl Drag {
-    fn preview(&self) -> Option<Preview> {
+    fn preview(&self, muted: &[Region]) -> Option<Preview> {
         match self {
-            Self::Range { start, current } => Some(Preview {
-                start: start.min(*current),
-                end: start.max(*current),
-                operation: DirectRegionOperation::Delete,
-            }),
+            Self::Range { start, current } => {
+                let region = Region::new(start.min(*current), start.max(*current));
+                Some(Preview {
+                    start: region.start,
+                    end: region.end,
+                    // A left-drag toggles: dragging over silence restores it.
+                    operation: if region_is_covered(muted, region) {
+                        PreviewOperation::Restore
+                    } else {
+                        PreviewOperation::Mute
+                    },
+                })
+            }
             Self::Direct { start, current } => Some(Preview {
                 start: start.min(*current),
                 end: start.max(*current),
                 operation: if current >= start {
-                    DirectRegionOperation::Delete
+                    PreviewOperation::Delete
                 } else {
-                    DirectRegionOperation::Restore
+                    PreviewOperation::Restore
                 },
             }),
             Self::Envelope { .. } => None,
@@ -1022,10 +1030,13 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                             .unwrap_or(current);
                         let minimum = (3.0 / self.pixels_per_second).max(0.01) as f64;
                         if (current - start).abs() > minimum {
-                            publish(WaveformEvent::Select(Some(Region::new(
+                            // Left-drag is the "mute this range" gesture. The
+                            // selection is kept so M can restore it and Delete
+                            // can cut it out.
+                            publish(WaveformEvent::MuteRange(Region::new(
                                 start.min(current),
                                 start.max(current),
-                            ))))
+                            )))
                         } else {
                             publish(WaveformEvent::Seek(start))
                         }
@@ -1154,14 +1165,7 @@ fn draw_dashed_rule(frame: &mut Frame, x: f32, y: f32, length: f32, color: Color
 }
 
 /// Diagonal hatching that marks audio removed from the output.
-fn draw_hatch(
-    frame: &mut Frame,
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
-    color: Color,
-) {
+fn draw_hatch(frame: &mut Frame, left: f32, top: f32, width: f32, height: f32, color: Color) {
     const SPACING: f32 = 9.0;
     let mut offset = -height;
     while offset < width {
@@ -1176,99 +1180,11 @@ fn draw_hatch(
                     start_y + visible.min(height - (-offset).max(0.0)),
                 ));
             });
-            frame.stroke(
-                &path,
-                Stroke::default().with_color(color).with_width(1.0),
-            );
+            frame.stroke(&path, Stroke::default().with_color(color).with_width(1.0));
         }
         offset += SPACING;
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        canvas_height, deleted_at_time, layout_rows, rms_columns, ruler_step, ROW_GAP, ROW_HEIGHT,
-    };
-    use simple_audio_cut_core::analysis::RmsFrame;
-    use simple_audio_cut_core::region::Region;
-
-    #[test]
-    fn wraps_long_audio_into_multiple_rows() {
-        let rows = layout_rows(500.0, 30.0, 48.0);
-        assert!(rows.len() >= 3);
-        assert_eq!(rows[0].start, 0.0);
-        assert!((rows.last().unwrap().end - 30.0).abs() < 1e-6);
-        for pair in rows.windows(2) {
-            assert!((pair[0].end - pair[1].start).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn short_audio_keeps_edge_padding_on_both_sides() {
-        let rows = layout_rows(800.0, 1.0, 48.0);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].leading > 0.0);
-        assert!(rows[0].trailing > 0.0);
-        assert!(rows[0].width < 800.0);
-    }
-
-    #[test]
-    fn canvas_height_matches_the_rows_it_returns() {
-        assert_eq!(canvas_height(400.0, 0.0, 48.0), ROW_HEIGHT);
-        let rows = layout_rows(400.0, 200.0, 48.0).len();
-        assert_eq!(
-            canvas_height(400.0, 200.0, 48.0),
-            rows as f32 * ROW_HEIGHT + (rows.saturating_sub(1)) as f32 * ROW_GAP
-        );
-    }
-
-    #[test]
-    fn rms_columns_keep_the_quietest_and_loudest_frame_per_pixel() {
-        let rms = vec![
-            RmsFrame { time: 0.05, amplitude: 0.2 },
-            RmsFrame { time: 0.08, amplitude: 0.8 },
-            RmsFrame { time: 0.15, amplitude: 0.4 },
-        ];
-        let columns = rms_columns(&rms, 0.0, 0.3, 3);
-
-        assert_eq!(columns.len(), 3);
-        // The first column holds both low and high frames.
-        assert!((columns[0].min - 0.2).abs() < 1e-9);
-        assert!((columns[0].max - 0.8).abs() < 1e-9);
-        assert!((columns[1].min - 0.4).abs() < 1e-9);
-        assert!((columns[1].max - 0.4).abs() < 1e-9);
-        // Columns with no frames reuse the previous amplitude.
-        assert!((columns[2].min - 0.4).abs() < 1e-9);
-        assert!((columns[2].max - 0.4).abs() < 1e-9);
-    }
-
-    #[test]
-    fn rms_columns_are_empty_without_analysis_or_duration() {
-        assert!(rms_columns(&[], 0.0, 1.0, 35).is_empty());
-        assert!(rms_columns(&[RmsFrame { time: 0.0, amplitude: 0.1 }], 1.0, 1.0, 10).is_empty());
-        assert!(rms_columns(&[RmsFrame { time: 0.0, amplitude: 0.1 }], 0.0, 1.0, 0).is_empty());
-    }
-
-    #[test]
-    fn deleted_regions_use_a_half_open_right_edge() {
-        let regions = vec![Region::new(1.0, 2.0)];
-        assert_eq!(deleted_at_time(&regions, 1.0), Some(Region::new(1.0, 2.0)));
-        assert_eq!(deleted_at_time(&regions, 1.5), Some(Region::new(1.0, 2.0)));
-        assert_eq!(deleted_at_time(&regions, 2.0), None);
-    }
-
-    #[test]
-    fn ruler_step_keeps_labels_readable_at_every_zoom_level() {
-        for pps in [0.25_f32, 4.0, 12.0, 48.0, 120.0, 400.0] {
-            let step = ruler_step(pps) as f32;
-            assert!(
-                step * pps >= 64.0,
-                "labels would collide at {pps} px/s (step {step})"
-            );
-        }
-        // Zooming in must never make the interval coarser.
-        assert!(ruler_step(400.0) <= ruler_step(48.0));
-        assert!(ruler_step(48.0) <= ruler_step(1.0));
-    }
-}
+mod tests;

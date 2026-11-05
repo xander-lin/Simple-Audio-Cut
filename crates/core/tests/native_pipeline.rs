@@ -5,8 +5,8 @@
 #![cfg(feature = "native-audio")]
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use simple_audio_cut_core::analysis::{analyze_rms, RmsOptions};
@@ -54,8 +54,9 @@ fn imports_normalizes_and_decodes_a_real_file() {
     let denoise: Arc<dyn DenoiseProvider> = Arc::new(MockDenoiseProvider::new());
     let engine = NativeAudioEngine::new(root.join("session"), denoise).expect("engine");
 
-    let results = Arc::new(Mutex::new(Vec::new()));
-    let sink = results.clone();
+    // Wake on the completion callback instead of polling: the job is genuinely
+    // asynchronous (FFmpeg runs off-thread), but no sleep is needed.
+    let (tx, rx) = mpsc::channel();
     engine
         .start_import_audio(
             "1".into(),
@@ -63,29 +64,15 @@ fn imports_normalizes_and_decodes_a_real_file() {
             -14.0,
             Box::new(move |update| {
                 if let simple_audio_cut_core::audio::ImportUpdate::Complete { info } = update {
-                    sink.lock().expect("results").push(info);
+                    let _ = tx.send(info);
                 }
             }),
         )
         .expect("start import");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if !results.lock().expect("results").is_empty() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "import did not finish in time"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let info = results
-        .lock()
-        .expect("results")
-        .first()
-        .cloned()
-        .expect("imported info");
+    let info = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("import did not finish in time");
 
     let buffer = AudioBuffer::decode_wav(&info.path).expect("decode normalized output");
     assert!(

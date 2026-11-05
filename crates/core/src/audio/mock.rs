@@ -4,6 +4,63 @@ use super::{
 };
 use crate::denoise::{DenoiseAvailability, DenoiseProvider};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Writes a short WAV that the rest of the pipeline can decode. The mock must
+/// return a real file, otherwise "record → stop" would look broken in every
+/// test that only swaps the audio engine.
+fn write_mock_wav(path: &std::path::Path, seconds: f64) -> Result<RecordingInfo, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create the mock recording folder: {error}"))?;
+    }
+    let sample_rate = 48_000_u32;
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|error| format!("Unable to create the mock recording: {error}"))?;
+    let frames = (seconds * sample_rate as f64) as usize;
+    for index in 0..frames {
+        let phase = index as f32 / sample_rate as f32 * 220.0 * std::f32::consts::TAU;
+        writer
+            .write_sample((phase.sin() * 0.2 * i16::MAX as f32) as i16)
+            .map_err(|error| format!("Unable to write the mock recording: {error}"))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| format!("Unable to finish the mock recording: {error}"))?;
+    Ok(RecordingInfo {
+        id: "mock-recording".into(),
+        name: "Mock recording".into(),
+        path: path.display().to_string(),
+        duration_seconds: frames as f64 / sample_rate as f64,
+        integrated_lufs: Some(-14.0),
+    })
+}
+
+/// Mock artefacts live in one temp folder that is emptied once per process,
+/// so a test run does not leave a growing pile of WAV files behind.
+fn mock_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("simple-audio-cut-mock");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+fn unique_mock_path(label: &str) -> std::path::PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    mock_dir().join(format!("{label}-{stamp}.wav"))
+}
 
 pub struct MockAudioEngine {
     denoise_provider: Arc<dyn DenoiseProvider>,
@@ -21,16 +78,9 @@ impl AudioEngine for MockAudioEngine {
     }
 
     fn stop_recording(&self, target_lufs: f64) -> Result<RecordingInfo, String> {
-        Ok(RecordingInfo {
-            id: "mock-recording".into(),
-            name: "Mock recording".into(),
-            path: std::env::temp_dir()
-                .join("simple-audio-cut/mock.wav")
-                .display()
-                .to_string(),
-            duration_seconds: 0.0,
-            integrated_lufs: Some(target_lufs),
-        })
+        let mut info = write_mock_wav(&unique_mock_path("recording"), 0.5)?;
+        info.integrated_lufs = Some(target_lufs);
+        Ok(info)
     }
 
     fn start_import_audio(
@@ -85,27 +135,24 @@ impl AudioEngine for MockAudioEngine {
             recording_id: recording_id.clone(),
             task_id: task_id.clone(),
         });
-        std::thread::spawn(move || {
-            let output = std::path::Path::new(&source)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(format!("simple-audio-cut-{task_id}-mock-denoise.wav"));
-            match session.enhance(std::path::Path::new(&source), &output) {
-                Ok(()) => completion(DenoiseUpdate::Complete {
-                    result: DenoiseResult {
-                        recording_id,
-                        task_id,
-                        path: output.display().to_string(),
-                        integrated_lufs: Some(target_lufs),
-                    },
-                }),
-                Err(error) => completion(DenoiseUpdate::Failed {
+        // The caller already runs this on a worker thread; a second thread
+        // only makes tests non-deterministic without adding realism.
+        let output = unique_mock_path(&format!("{task_id}-mock-denoise"));
+        match session.enhance(std::path::Path::new(&source), &output) {
+            Ok(()) => completion(DenoiseUpdate::Complete {
+                result: DenoiseResult {
                     recording_id,
                     task_id,
-                    error,
-                }),
-            }
-        });
+                    path: output.display().to_string(),
+                    integrated_lufs: Some(target_lufs),
+                },
+            }),
+            Err(error) => completion(DenoiseUpdate::Failed {
+                recording_id,
+                task_id,
+                error,
+            }),
+        }
         Ok(())
     }
 
@@ -171,5 +218,60 @@ impl AudioEngine for MockAudioEngine {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{write_mock_wav, MockAudioEngine};
+    use crate::audio::{AudioEngine, DenoiseUpdate};
+    use crate::denoise::MockDenoiseProvider;
+    use std::sync::Arc;
+
+    fn engine() -> MockAudioEngine {
+        MockAudioEngine::new(Arc::new(MockDenoiseProvider::new()))
+    }
+
+    #[test]
+    fn stopping_a_mock_recording_returns_a_decodable_file() {
+        let info = engine().stop_recording(-14.0).expect("stop recording");
+        assert!(info.duration_seconds > 0.1, "{info:?}");
+        let buffer = crate::buffer::AudioBuffer::decode_wav(&info.path).expect("decode mock");
+        assert!((buffer.duration() - info.duration_seconds).abs() < 0.01);
+        let _ = std::fs::remove_file(&info.path);
+    }
+
+    #[test]
+    fn mock_denoising_reports_processing_then_completion_for_existing_input() {
+        let source = super::unique_mock_path("denoise-source");
+        write_mock_wav(&source, 0.2).expect("write source");
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = updates.clone();
+        let completion = Box::new(move |update: DenoiseUpdate| {
+            sink.lock().unwrap().push(update);
+        });
+
+        engine()
+            .start_denoise(
+                "take".into(),
+                "task".into(),
+                source.display().to_string(),
+                48_000,
+                -14.0,
+                completion,
+            )
+            .expect("start denoise");
+
+        let updates = updates.lock().unwrap();
+        assert!(matches!(updates[0], DenoiseUpdate::Processing { .. }));
+        match &updates[1] {
+            DenoiseUpdate::Complete { result } => {
+                assert!(std::path::Path::new(&result.path).is_file());
+                let _ = std::fs::remove_file(&result.path);
+            }
+            other => panic!("unexpected update: {other:?}"),
+        }
+        drop(updates);
+        let _ = std::fs::remove_file(&source);
     }
 }

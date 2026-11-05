@@ -59,12 +59,7 @@ fn imports_edits_plays_and_exports_with_the_production_services() {
     let player = Arc::new(CpalAudioPlayer::new());
     let dialogs = Arc::new(MockDialogService::new());
     let events: SharedSink = Arc::new(EventBus::new());
-    let services = Services::headless(
-        engine,
-        player.clone(),
-        dialogs.clone(),
-        events.clone(),
-    );
+    let services = Services::headless(engine, player.clone(), dialogs.clone(), events.clone());
     let services = Services {
         denoise,
         ..services
@@ -75,23 +70,16 @@ fn imports_edits_plays_and_exports_with_the_production_services() {
     dialogs.queue_files(vec![source.clone()]);
     dialogs.queue_folder(Some(exports.clone()));
 
+    // The headless services run jobs inline, so the import (including the
+    // real FFmpeg call) completes during the tick that drains the dialog
+    // result. No polling and no arbitrary wait.
     let _ = app.update(Message::ImportPressed);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let _ = app.update(Message::Tick);
-        if let Some(clip) = app.session.media.first() {
-            if clip.ready() {
-                break;
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "import never became ready: {}",
-            app.ui.message
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let _ = app.update(Message::Tick);
+    assert!(
+        app.session.media.first().is_some_and(|clip| clip.ready()),
+        "import never became ready: {}",
+        app.ui.message
+    );
 
     let id = app.session.media[0].id;
     let duration = app.session.media[0].duration;
@@ -136,19 +124,9 @@ fn imports_edits_plays_and_exports_with_the_production_services() {
     }
 
     let _ = app.update(Message::ExportChanged);
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let _ = app.update(Message::Tick);
-        if app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose") {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "export never finished: {}",
-            app.ui.message
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let _ = app.update(Message::Tick);
+    assert!(app.session.exporting.is_empty(), "export never finished");
+    assert_ne!(app.ui.message, "Export cancelled");
 
     let exported: Vec<PathBuf> = std::fs::read_dir(&exports)
         .expect("export directory")
