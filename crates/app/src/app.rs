@@ -102,13 +102,42 @@ pub fn run() -> iced::Result {
     .run()
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
+fn subscription(app: &App) -> Subscription<Message> {
+    // While a name field is focused, iced's text input captures `Escape` to
+    // drop focus; the captured event never reaches the global shortcut mapper.
+    // Renaming still has to honour "Escape discards the draft", so a second,
+    // draft-aware listener maps that key explicitly.
+    let events = if app.ui.rename.is_some() {
+        iced::event::listen_with(rename_aware_event)
+    } else {
+        iced::event::listen_with(global_event)
+    };
     Subscription::batch([
         iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
-        iced::event::listen_with(global_event),
+        events,
         window::close_requests().map(|_| Message::CloseRequested),
         window::resize_events().map(|(_, size)| Message::WindowResized(size)),
     ])
+}
+
+/// Event mapper used while a rename draft is open.
+fn rename_aware_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    window: window::Id,
+) -> Option<Message> {
+    if status == iced::event::Status::Captured
+        && matches!(
+            event,
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            })
+        )
+    {
+        return Some(Message::Dismiss);
+    }
+    global_event(event, status, window)
 }
 
 /// Maps runtime events that are not widget-specific.
@@ -176,7 +205,6 @@ fn keyboard_shortcut(
         Key::Character("k" | "K") => Shortcut::TogglePlayback,
         Key::Character("j" | "J") => Shortcut::Back,
         Key::Character("l" | "L") => Shortcut::Forward,
-        Key::Character("m" | "M") => Shortcut::MuteRange,
         Key::Character("[" | "{") => Shortcut::ZoomOut,
         Key::Character("]" | "}") => Shortcut::ZoomIn,
         Key::Character("b" | "B") | Key::Character("c" | "C") => Shortcut::Blade,
@@ -226,10 +254,8 @@ mod tests {
             press(Key::Character("j".into())),
             Some(Message::Shortcut(Shortcut::Back))
         ));
-        assert!(matches!(
-            press(Key::Character("m".into())),
-            Some(Message::Shortcut(Shortcut::MuteRange))
-        ));
+        // `M` is no longer a mute shortcut: muting is a waveform gesture.
+        assert!(press(Key::Character("m".into())).is_none());
         assert!(matches!(
             press(Key::Named(keyboard::key::Named::Escape)),
             Some(Message::Dismiss)
@@ -254,5 +280,27 @@ mod tests {
             window::Id::unique(),
         );
         assert!(message.is_none());
+    }
+
+    #[test]
+    fn escape_discards_a_rename_even_though_the_field_captures_it() {
+        let escape = iced::Event::Keyboard(Event::KeyPressed {
+            key: Key::Named(keyboard::key::Named::Escape),
+            modified_key: Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        });
+
+        // The text field captures Escape to drop focus; the draft-aware mapper
+        // still turns that into a dismiss so the rename can be abandoned.
+        assert!(matches!(
+            super::rename_aware_event(escape, event::Status::Captured, window::Id::unique()),
+            Some(Message::Dismiss)
+        ));
     }
 }

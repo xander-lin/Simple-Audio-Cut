@@ -76,6 +76,19 @@ fn library_rows_and_track_rows_build() {
 }
 
 #[test]
+fn inline_rename_view_builds_without_a_field_box() {
+    let mut app = boot();
+    ready_media(&mut app, 6, "voice");
+    let _ = app.update(Message::AddToTimeline(6));
+    let _ = app.update(Message::BeginRename(6));
+
+    // The row must remember the draft even before the window exists; the
+    // focus task is a no-op in this headless test.
+    assert!(app.ui.rename.is_some());
+    let _ = app.view();
+}
+
+#[test]
 fn collapsed_track_builds() {
     let mut app = boot();
     ready_media(&mut app, 3, "voice");

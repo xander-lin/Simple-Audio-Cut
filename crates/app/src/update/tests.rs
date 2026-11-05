@@ -228,6 +228,51 @@ fn rename_commits_when_another_interaction_starts() {
 }
 
 #[test]
+fn begin_rename_opens_an_inline_draft_without_changing_the_name() {
+    let mut app = app();
+    add_ready_media(&mut app, 1);
+    add_ready_media(&mut app, 2);
+    let _ = app.update(Message::AddToTimeline(1));
+
+    let original = app.session.clip_by_id(1).unwrap().name.clone();
+    let _ = app.update(Message::BeginRename(1));
+
+    assert_eq!(app.session.selected_track, Some(1));
+    let draft = app.ui.rename.as_ref().expect("inline draft");
+    assert_eq!(draft.id, 1);
+    assert_eq!(draft.value, original);
+    // The field is prefilled but nothing is committed until the user types.
+    assert_eq!(app.session.clip_by_id(1).unwrap().name, original);
+
+    // Typing then submitting commits exactly like the library field.
+    let _ = app.update(Message::RenameMedia(1, "Narration".into()));
+    let _ = app.update(Message::RenameCommit);
+    assert_eq!(app.session.clip_by_id(1).unwrap().name, "Narration");
+    assert!(app.ui.rename.is_none());
+}
+
+#[test]
+fn renaming_from_the_track_menu_closes_it_and_opens_the_inline_field() {
+    let mut app = app();
+    add_ready_media(&mut app, 1);
+    let _ = app.update(Message::AddToTimeline(1));
+    let _ = app.update(Message::ContextMenu {
+        track: 1,
+        kind: crate::model::ContextMenuKind::Actions,
+        x: 40.0,
+        y: 90.0,
+    });
+    assert!(app.ui.context_menu.is_some());
+
+    let _ = app.update(Message::BeginRename(1));
+
+    assert!(app.ui.context_menu.is_none());
+    let draft = app.ui.rename.as_ref().expect("inline draft");
+    assert_eq!(draft.id, 1);
+    assert_eq!(draft.value, app.session.clip_by_id(1).unwrap().name);
+}
+
+#[test]
 fn starting_a_second_rename_commits_the_first_draft() {
     let mut app = app();
     add_ready_media(&mut app, 1);
@@ -610,7 +655,7 @@ fn an_unresolved_provider_status_does_not_start_denoising() {
 }
 
 #[test]
-fn left_drag_mute_keeps_the_selection_so_it_can_be_restored_or_cut() {
+fn left_drag_mute_leaves_no_selection_behind() {
     let mut app = app();
     add_ready_media(&mut app, 1);
     let _ = app.update(Message::AddToTimeline(1));
@@ -618,25 +663,31 @@ fn left_drag_mute_keeps_the_selection_so_it_can_be_restored_or_cut() {
     let range = simple_audio_cut_core::region::Region::new(0.2, 0.6);
     let _ = app.update(Message::Waveform {
         track: 1,
-        event: crate::message::WaveformEvent::MuteRange(range),
+        event: crate::message::WaveformEvent::MuteEdit {
+            region: range,
+            operation: simple_audio_cut_core::direct_edit::MuteRegionOperation::Mute,
+        },
     });
 
     let track = app.session.track(1).expect("track");
     assert_eq!(track.muted, vec![range]);
-    assert_eq!(track.selected_range, Some(range));
+    // Like the right-drag delete gesture, the edit is the whole interaction;
+    // no marquee is left behind for operations the user did not ask for.
+    assert_eq!(track.selected_range, None);
     assert!(track.needs_export());
     assert!(app.ui.message.starts_with("Muted "), "{}", app.ui.message);
-    assert!(
-        app.ui.message.contains("Press M to restore"),
-        "{}",
-        app.ui.message
-    );
 
-    // The same selection can be restored with M, without re-selecting.
-    let _ = app.update(Message::MuteRange);
+    // Dragging back over the same range restores the sound.
+    let _ = app.update(Message::Waveform {
+        track: 1,
+        event: crate::message::WaveformEvent::MuteEdit {
+            region: range,
+            operation: simple_audio_cut_core::direct_edit::MuteRegionOperation::Restore,
+        },
+    });
     let track = app.session.track(1).expect("track");
     assert!(track.muted.is_empty());
-    assert_eq!(track.selected_range, Some(range));
+    assert_eq!(track.selected_range, None);
     assert!(
         app.ui.message.starts_with("Restored sound"),
         "{}",
@@ -668,9 +719,10 @@ fn range_edits_on_a_collapsed_track_explain_why_they_do_nothing() {
 
     let _ = app.update(Message::Waveform {
         track: 1,
-        event: crate::message::WaveformEvent::MuteRange(
-            simple_audio_cut_core::region::Region::new(0.2, 0.6),
-        ),
+        event: crate::message::WaveformEvent::MuteEdit {
+            region: simple_audio_cut_core::region::Region::new(0.2, 0.6),
+            operation: simple_audio_cut_core::direct_edit::MuteRegionOperation::Mute,
+        },
     });
     assert!(app.session.track(1).unwrap().muted.is_empty());
     assert!(

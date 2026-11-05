@@ -195,7 +195,7 @@ fn ruler_step_keeps_labels_readable_at_every_zoom_level() {
 }
 
 #[test]
-fn left_drag_mutes_the_range_instead_of_deleting_it() {
+fn left_drag_mutes_forward_and_restores_backward() {
     let cache = WaveformCache::new();
     let canvas = test_canvas(&cache);
     let mut state = super::CanvasState::default();
@@ -204,16 +204,32 @@ fn left_drag_mutes_the_range_instead_of_deleting_it() {
     let message = drag(&canvas, &mut state, mouse::Button::Left, 130.0, 330.0);
 
     match message_event(message) {
-        Some(WaveformEvent::MuteRange(region)) => {
+        Some(WaveformEvent::MuteEdit { region, operation }) => {
             assert!((region.start - 1.0).abs() < 1e-6, "{region:?}");
             assert!((region.end - 3.0).abs() < 1e-6, "{region:?}");
+            assert_eq!(
+                operation,
+                simple_audio_cut_core::direct_edit::MuteRegionOperation::Mute
+            );
         }
-        other => panic!("left-drag must publish a mute, got {other:?}"),
+        other => panic!("left-drag forward must mute, got {other:?}"),
+    }
+
+    let message = drag(&canvas, &mut state, mouse::Button::Left, 330.0, 130.0);
+    match message_event(message) {
+        Some(WaveformEvent::MuteEdit { region, operation }) => {
+            assert_eq!(region, Region::new(1.0, 3.0));
+            assert_eq!(
+                operation,
+                simple_audio_cut_core::direct_edit::MuteRegionOperation::Restore
+            );
+        }
+        other => panic!("left-drag backward must restore, got {other:?}"),
     }
 }
 
 #[test]
-fn left_drag_previews_amber_mute_and_green_restore() {
+fn left_drag_previews_amber_forward_and_green_backward() {
     let cache = WaveformCache::new();
     let canvas = test_canvas(&cache);
     let mut state = super::CanvasState::default();
@@ -233,11 +249,19 @@ fn left_drag_previews_amber_mute_and_green_restore() {
         cursor(330.0, 80.0),
     );
     let drag = state.drag.as_ref().expect("drag started");
-    let preview = drag.preview(&[]).expect("preview");
+    let preview = drag.preview().expect("preview");
     assert_eq!(preview.operation, PreviewOperation::Mute);
-    let preview = drag
-        .preview(&[Region::new(1.0, 3.0)])
-        .expect("preview over muted audio");
+
+    // Direction decides the operation, not whether the range is already muted.
+    let _ = canvas::Program::<Message>::update(
+        &canvas,
+        &mut state,
+        &moved(),
+        BOUNDS,
+        cursor(90.0, 80.0),
+    );
+    let drag = state.drag.as_ref().expect("drag started");
+    let preview = drag.preview().expect("preview");
     assert_eq!(preview.operation, PreviewOperation::Restore);
 }
 

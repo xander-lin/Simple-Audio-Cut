@@ -7,7 +7,7 @@ use simple_audio_cut_core::analysis::{
     dbfs_to_amplitude, detect_silence_from_analysis, SilenceOptions,
 };
 use simple_audio_cut_core::audio::ExportEdit;
-use simple_audio_cut_core::direct_edit::DirectRegionOperation;
+use simple_audio_cut_core::direct_edit::{DirectRegionOperation, MuteRegionOperation};
 use simple_audio_cut_core::region::{merge_regions, subtract_region, EnvelopePoint, Region};
 use simple_audio_cut_core::timeline::{
     create_edited_buffer, edited_offset_at_original_time, kept_regions,
@@ -113,6 +113,33 @@ impl App {
             Message::SelectTrack(id) => self.select_track(id),
             Message::RenameMedia(id, name) => self.edit_rename(id, name),
             Message::RenameCommit => self.commit_rename(),
+            Message::BeginRename(id) => {
+                // Rename a take or a track in place, opened by right-clicking
+                // its name (library row, library chip, track label) or from the
+                // ••• menu. The name becomes an inline field; no dialog.
+                if self.session.clip_by_id(id).is_none() {
+                    return Task::none();
+                }
+                self.ui.context_menu = None;
+                if self.session.media(id).is_some() {
+                    self.select_media(id);
+                } else {
+                    self.select_track(id);
+                }
+                // A second right-click inside an already open field should not
+                // restart the draft (it would discard typing).
+                if self.ui.rename.as_ref().is_some_and(|draft| draft.id == id) {
+                    return Task::none();
+                }
+                self.begin_rename(id);
+                // Focus and pre-select the whole name, so typing replaces it
+                // the way a normal "rename" gesture is expected to behave.
+                let field = crate::ui::name_input_id(id);
+                return Task::batch([
+                    iced::widget::operation::focus(field.clone()),
+                    iced::widget::operation::select_all(field),
+                ]);
+            }
             Message::Dismiss => self.dismiss(),
             Message::AddToTimeline(id) => self.add_to_timeline(id),
             Message::DragItem(id) => self.begin_drag(id),
@@ -157,7 +184,7 @@ impl App {
                     "Blade active. Click the waveform to add an edit point; press A to return."
                         .into()
                 } else {
-                    "Direct editing active. Left-drag mutes a range; right-drag deletes or restores."
+                    "Direct editing active. Left-drag forward mutes, backward restores; right-drag deletes or restores."
                         .into()
                 };
             }
@@ -322,7 +349,11 @@ impl App {
         }
         if matches!(
             message,
-            Message::Tick | Message::RenameMedia(..) | Message::RenameCommit | Message::Dismiss
+            Message::Tick
+                | Message::RenameMedia(..)
+                | Message::RenameCommit
+                | Message::BeginRename(..)
+                | Message::Dismiss
         ) {
             return;
         }
@@ -330,9 +361,9 @@ impl App {
     }
 
     fn edit_rename(&mut self, id: MediaId, value: String) {
-        if self.session.clip_by_id(id).is_none() {
+        let Some(original) = self.session.clip_by_id(id).map(|clip| clip.name.clone()) else {
             return;
-        }
+        };
         let restart = self.ui.rename.as_ref().is_some_and(|draft| draft.id != id);
         if restart {
             // Moving to another field commits the previous draft instead of
@@ -340,11 +371,6 @@ impl App {
             self.commit_rename();
         }
         if self.ui.rename.as_ref().is_none_or(|draft| draft.id != id) {
-            let original = self
-                .session
-                .clip_by_id(id)
-                .map(|clip| clip.name.clone())
-                .unwrap_or_default();
             self.ui.rename = Some(crate::model::RenameDraft {
                 id,
                 original,
@@ -354,6 +380,23 @@ impl App {
         if let Some(draft) = &mut self.ui.rename {
             draft.value = value;
         }
+    }
+
+    /// Opens a rename draft without typing anything yet. Used by the
+    /// double-click gesture on a track name.
+    fn begin_rename(&mut self, id: MediaId) {
+        let Some(original) = self.session.clip_by_id(id).map(|clip| clip.name.clone()) else {
+            return;
+        };
+        if self.ui.rename.as_ref().is_some_and(|draft| draft.id == id) {
+            return;
+        }
+        self.commit_rename();
+        self.ui.rename = Some(crate::model::RenameDraft {
+            id,
+            original: original.clone(),
+            value: original,
+        });
     }
 
     fn commit_rename(&mut self) {
@@ -1487,7 +1530,7 @@ impl App {
         }
         if let Some(range) = range {
             self.ui.message = format!(
-                "Selected {}. M toggles mute, Delete cuts it out.",
+                "Selected {}. Delete cuts it out.",
                 format_time_standard(range.duration())
             );
         }
@@ -1506,9 +1549,19 @@ impl App {
     }
 
     /// Toggles silence for `range` and keeps it selected, so pressing M or
-    /// Delete can act on the same range immediately. This is also the
-    /// left-drag gesture.
+    /// Delete can act on the same range immediately.
     fn mute_range(&mut self, id: MediaId, range: Region) {
+        let Some(track) = self.session.track(id) else {
+            return;
+        };
+        let mute = !simple_audio_cut_core::region::region_is_covered(&track.muted, range);
+        self.apply_mute(id, range, mute);
+    }
+
+    /// Applies `mute` to `range` unconditionally. The left-drag passes its
+    /// direction here (forward = mute, backward = restore). Selection is the
+    /// caller's business: the drag clears it, the inspector button keeps it.
+    fn apply_mute(&mut self, id: MediaId, range: Region, mute: bool) {
         if self.session.track(id).is_none() {
             return;
         }
@@ -1518,21 +1571,12 @@ impl App {
         }
         self.stop_playback(false);
         let range = range.normalized();
-        let now_muted = self
-            .session
-            .track_mut(id)
-            .map(|track| {
-                let muted = track.toggle_mute(range);
-                track.selected_range = Some(range);
-                track.touch();
-                muted
-            })
-            .unwrap_or(false);
-        self.ui.message = if now_muted {
-            format!(
-                "Muted {}. Press M to restore it or Delete to cut it out.",
-                format_time_standard(range.duration())
-            )
+        if let Some(track) = self.session.track_mut(id) {
+            track.set_mute(range, mute);
+            track.touch();
+        }
+        self.ui.message = if mute {
+            format!("Muted {}", format_time_standard(range.duration()))
         } else {
             format!(
                 "Restored sound to {}",
@@ -1608,9 +1652,15 @@ impl App {
                     }
                 }
             }
-            WaveformEvent::MuteRange(region) => {
+            WaveformEvent::MuteEdit { region, operation } => {
                 let region = Region::new(to_source(region.start), to_source(region.end));
-                self.mute_range(id, region);
+                let mute = matches!(operation, MuteRegionOperation::Mute);
+                self.apply_mute(id, region, mute);
+                // Same as the right-drag: the drag is the whole interaction, so
+                // no selection marquee stays behind on the waveform.
+                if let Some(track) = self.session.track_mut(id) {
+                    track.selected_range = None;
+                }
             }
             WaveformEvent::DirectEdit { region, operation } => {
                 self.stop_playback(false);
@@ -1885,11 +1935,6 @@ impl App {
                     if playing {
                         self.start_playback(next);
                     }
-                }
-            }
-            Shortcut::MuteRange => {
-                if !self.ui.settings_open {
-                    self.toggle_mute_range();
                 }
             }
             Shortcut::Blade => {

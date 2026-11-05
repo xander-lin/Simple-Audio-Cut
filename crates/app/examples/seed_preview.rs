@@ -113,6 +113,21 @@ fn seed() -> App {
             y: 150.0,
         });
     }
+    if std::env::var_os("PREVIEW_RENAME").is_some() {
+        // Inline rename field on the library take, as opened by a right click.
+        // Set the draft directly: the preview boots before the window exists,
+        // so the "focus the field" task would have nothing to focus yet.
+        let name = app
+            .session
+            .clip_by_id(3)
+            .map(|clip| clip.name.clone())
+            .unwrap_or_default();
+        app.ui.rename = Some(simple_audio_cut_iced::model::RenameDraft {
+            id: 3,
+            original: name.clone(),
+            value: name,
+        });
+    }
     if std::env::var_os("PREVIEW_SETTINGS").is_some() {
         let _ = app.update(Message::OpenSettings);
         let _ = app.update(Message::Tick);

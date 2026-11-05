@@ -13,7 +13,7 @@ use simple_audio_cut_core::buffer::AudioBuffer;
 use simple_audio_cut_core::denoise::{DenoiseAvailability, DenoiseConfig, DenoiseProviderStatus};
 use simple_audio_cut_core::export_state::{export_signature, ExportableTrack};
 use simple_audio_cut_core::region::{
-    combine_regions, merge_regions, region_is_covered, subtract_region, EnvelopePoint, Region,
+    combine_regions, merge_regions, subtract_region, EnvelopePoint, Region,
 };
 use simple_audio_cut_core::timeline::{create_edited_buffer, edited_duration, kept_regions};
 
@@ -390,18 +390,16 @@ impl Track {
         self.last_export_signature = Some(self.signature());
     }
 
-    /// Toggles silence for `range`: mutes it unless it is already fully
-    /// muted, in which case the silence is removed. Returns whether the range
-    /// is muted afterwards.
-    pub fn toggle_mute(&mut self, range: Region) -> bool {
+    /// Applies `mute` to `range` unconditionally and keeps it selected. The
+    /// left-drag passes its direction here (forward = mute, backward =
+    /// restore), so the gesture never depends on the current state.
+    pub fn set_mute(&mut self, range: Region, mute: bool) {
         let range = range.normalized();
-        let mute = !region_is_covered(&self.muted, range);
         self.muted = if mute {
             merge_regions(&self.muted, range)
         } else {
             subtract_region(&self.muted, range)
         };
-        mute
     }
 
     /// Signals that the cached waveform geometry must be rebuilt.
@@ -797,19 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn toggle_mute_merges_overlapping_ranges_and_splits_on_restore() {
+    fn set_mute_merges_overlapping_ranges_and_splits_on_restore() {
         let mut track = Track::from_clip(clip_with_audio(1, 1_000));
         track.muted = vec![Region::new(0.1, 0.2)];
 
-        assert!(track.toggle_mute(Region::new(0.15, 0.3)));
+        track.set_mute(Region::new(0.15, 0.3), true);
         assert_eq!(track.muted, vec![Region::new(0.1, 0.3)]);
 
-        // Fully covered: a second toggle restores exactly that inside range.
-        assert!(!track.toggle_mute(Region::new(0.15, 0.25)));
+        // Restoring is unconditional: it splits the covered range even when
+        // the caller asked for it while the range was already muted.
+        track.set_mute(Region::new(0.15, 0.25), false);
         assert_eq!(
             track.muted,
             vec![Region::new(0.1, 0.15), Region::new(0.25, 0.3)]
         );
+
+        // Muting again over the same span merges it back.
+        track.set_mute(Region::new(0.15, 0.25), true);
+        assert_eq!(track.muted, vec![Region::new(0.1, 0.3)]);
     }
 
     #[test]

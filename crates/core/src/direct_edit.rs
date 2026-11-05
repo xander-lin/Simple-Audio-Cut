@@ -14,6 +14,33 @@ pub struct DirectRegionEdit {
     pub operation: DirectRegionOperation,
 }
 
+/// Silence applied by a left-button drag. Same sweep semantics as the
+/// right-button delete gesture: forward silences, backward restores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MuteRegionOperation {
+    Mute,
+    Restore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MuteRegionEdit {
+    pub region: Region,
+    pub operation: MuteRegionOperation,
+}
+
+/// The normalized range covered by a drag plus its direction. Returns `None`
+/// for a tap (and for non-finite input), so a click still seeks.
+fn swept_region(start: f64, current: f64, minimum_duration: f64) -> Option<(Region, bool)> {
+    let delta = current - start;
+    if !delta.is_finite() || delta.abs() <= minimum_duration {
+        return None;
+    }
+    Some((
+        Region::new(start.min(current), start.max(current)),
+        delta > 0.0,
+    ))
+}
+
 /// Maps a right-button drag to the original delete/restore gestures: dragging
 /// forward deletes, dragging backward restores.
 pub fn direct_region_edit(
@@ -21,16 +48,32 @@ pub fn direct_region_edit(
     current: f64,
     minimum_duration: f64,
 ) -> Option<DirectRegionEdit> {
-    let delta = current - start;
-    if !delta.is_finite() || delta.abs() <= minimum_duration {
-        return None;
-    }
+    let (region, forward) = swept_region(start, current, minimum_duration)?;
     Some(DirectRegionEdit {
-        region: Region::new(start.min(current), start.max(current)),
-        operation: if delta > 0.0 {
+        region,
+        operation: if forward {
             DirectRegionOperation::Delete
         } else {
             DirectRegionOperation::Restore
+        },
+    })
+}
+
+/// Maps a left-button drag to the mute/restore gestures, mirroring the
+/// delete gesture: dragging forward silences the swept range, dragging
+/// backward un-silences it.
+pub fn mute_region_edit(
+    start: f64,
+    current: f64,
+    minimum_duration: f64,
+) -> Option<MuteRegionEdit> {
+    let (region, forward) = swept_region(start, current, minimum_duration)?;
+    Some(MuteRegionEdit {
+        region,
+        operation: if forward {
+            MuteRegionOperation::Mute
+        } else {
+            MuteRegionOperation::Restore
         },
     })
 }
@@ -74,7 +117,8 @@ pub fn add_edit_point(points: &[f64], time: f64, duration: f64) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_edit_point, direct_region_edit, segment_at_time, DirectRegionOperation,
+        add_edit_point, direct_region_edit, mute_region_edit, segment_at_time,
+        DirectRegionOperation, MuteRegionOperation,
     };
     use crate::region::Region;
 
@@ -90,6 +134,22 @@ mod tests {
 
         assert!(direct_region_edit(2.0, 2.005, 0.01).is_none());
         assert!(direct_region_edit(2.0, 5.0, 12.0).is_none());
+    }
+
+    #[test]
+    fn maps_left_button_drag_direction_to_mute_and_restore() {
+        let mute = mute_region_edit(2.0, 6.0, 0.01).expect("mute edit");
+        assert_eq!(mute.region, Region::new(2.0, 6.0));
+        assert_eq!(mute.operation, MuteRegionOperation::Mute);
+
+        let restore = mute_region_edit(6.0, 2.0, 0.01).expect("restore edit");
+        assert_eq!(restore.region, Region::new(2.0, 6.0));
+        assert_eq!(restore.operation, MuteRegionOperation::Restore);
+
+        // A tap (or a sub-pixel wiggle) is a seek, not a mute.
+        assert!(mute_region_edit(2.0, 2.005, 0.01).is_none());
+        assert!(mute_region_edit(2.0, 2.0, 0.0).is_none());
+        assert!(mute_region_edit(f64::NAN, 2.0, 0.0).is_none());
     }
 
     #[test]

@@ -9,7 +9,6 @@ pub enum Shortcut {
     TogglePlayback,
     Back,
     Forward,
-    MuteRange,
     Blade,
     DirectEdit,
     Settings,
@@ -28,9 +27,12 @@ pub enum Shortcut {
 #[derive(Clone, Debug, PartialEq)]
 pub enum WaveformEvent {
     Seek(f64),
-    /// Left-drag on the waveform: mutes the range, or restores it when the
-    /// range is already fully muted. The range stays selected.
-    MuteRange(Region),
+    /// Left-drag on the waveform: dragging forward silences the swept range,
+    /// dragging backward un-silences it. The range stays selected.
+    MuteEdit {
+        region: Region,
+        operation: simple_audio_cut_core::direct_edit::MuteRegionOperation,
+    },
     DirectEdit {
         region: Region,
         operation: simple_audio_cut_core::direct_edit::DirectRegionOperation,
@@ -58,6 +60,9 @@ pub enum Message {
     SelectTrack(MediaId),
     RenameMedia(MediaId, String),
     RenameCommit,
+    /// Double-click a track name to rename it inline. Starts the draft and
+    /// focuses the inline field.
+    BeginRename(MediaId),
     /// Escape: dismiss the innermost transient layer (rename, menu, drawer).
     Dismiss,
     AddToTimeline(MediaId),

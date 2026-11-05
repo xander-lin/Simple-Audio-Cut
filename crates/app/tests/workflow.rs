@@ -441,20 +441,42 @@ fn left_drag_mutes_without_shortening_the_timeline() {
 
     let _ = harness.app.update(Message::Waveform {
         track: id,
-        event: simple_audio_cut_iced::message::WaveformEvent::MuteRange(
-            simple_audio_cut_core::region::Region::new(0.2, 0.5),
-        ),
+        event: simple_audio_cut_iced::message::WaveformEvent::MuteEdit {
+            region: simple_audio_cut_core::region::Region::new(0.2, 0.5),
+            operation: simple_audio_cut_core::direct_edit::MuteRegionOperation::Mute,
+        },
     });
 
     let track = harness.app.session.track(id).expect("track");
     assert_eq!(track.muted.len(), 1);
-    assert_eq!(
-        track.selected_range,
-        Some(simple_audio_cut_core::region::Region::new(0.2, 0.5))
-    );
+    // The gesture is the whole interaction: no selection marquee is left over.
+    assert_eq!(track.selected_range, None);
     assert!((track.edited_duration() - before).abs() < 1e-9);
     assert!(track.needs_export());
     assert!(harness.app.ui.message.starts_with("Muted"));
+
+    // Drag direction decides: forward mutes, backward restores. Dragging back
+    // over the same range must un-mute it even though it is fully muted.
+    let _ = harness.app.update(Message::Waveform {
+        track: id,
+        event: simple_audio_cut_iced::message::WaveformEvent::MuteEdit {
+            region: simple_audio_cut_core::region::Region::new(0.2, 0.5),
+            operation: simple_audio_cut_core::direct_edit::MuteRegionOperation::Restore,
+        },
+    });
+    let track = harness.app.session.track(id).expect("track");
+    assert!(track.muted.is_empty());
+    assert_eq!(track.selected_range, None);
+    assert!(harness.app.ui.message.starts_with("Restored"));
+
+    // Re-mute so the destructive right-drag check below still has content.
+    let _ = harness.app.update(Message::Waveform {
+        track: id,
+        event: simple_audio_cut_iced::message::WaveformEvent::MuteEdit {
+            region: simple_audio_cut_core::region::Region::new(0.2, 0.5),
+            operation: simple_audio_cut_core::direct_edit::MuteRegionOperation::Mute,
+        },
+    });
 
     // The right-drag remains the destructive gesture.
     let _ = harness.app.update(Message::Waveform {

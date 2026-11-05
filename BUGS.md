@@ -195,9 +195,18 @@ cargo check --workspace --no-default-features                          passed
 
 ### 交互变更
 
-- **左键拖动波形 = 静音**：拖动时预览为琥珀色，松手后立即把区间替换为等长静音，
-  选区保留；再次左键拖动同一段（或按 `M`）恢复声音。
+- **左键拖动波形 = 静音/取消静音，沿用右键的方向规则**：向右滑静音扫过的范围
+  （琥珀色预览），向左滑取消静音（绿色预览）。手势不再依赖"这段是否已经静音"
+  判断，方向就是操作本身；手势结束即完成，不在波形上留下选区框。
 - **右键拖动保持原样**：向右删除、向左恢复（红色/绿色预览）。
+- **右键点击名字 = 就地改名**（库行、半屏素材条、时间线轨道名都支持，`•••` 菜单里
+  也有 `Rename track`）：名字变成无边框、无底色、无描边的内联输入框
+  （`theme::inline_input_style`），进入时全选原名，`Enter`/失焦提交，`Esc` 放弃。
+  左键仍是选中/拖拽入轨。**刻意不绑定双击**：双击依赖点击计时，本机无法稳定自动验证，
+  而右键在任何情况下都只有一种解释。库行以前常驻一个 `text_input`（自带边框，像卡片），
+  现在只有改名期间才换成输入框。
+- **轨道名称栏收窄**：`LABEL_WIDTH` 从 184px 改为 144px，把宽度留给波形；
+  名称单行不换行，超长裁切。
 - 折叠视图下两种手势都会给出"Show all edits"提示，而不是静默无反应。
 
 ### 修复的缺陷
@@ -207,7 +216,6 @@ cargo check --workspace --no-default-features                          passed
 | **`Check setup` 会用未保存的草稿覆盖运行中的 provider 状态**：之后新素材会按草稿（可能不可用）处理，而不是已保存配置。 | `update.rs` `SettingsInspected` | **fixed** |
 | **恢复原始音频后丢失 `opted_out`**：自动降噪开启时会把用户刚恢复的音频再次降噪。 | `update.rs` `OriginalAudioRestored` | **fixed** |
 | **自动降噪关闭时 `Use original audio` 不记录用户选择**：`Skipped` 提前返回，`opted_out` 永远不置位，后续策略可能重新降噪。 | `update.rs` `set_denoise` | **fixed** |
-| **按 `M` 静音后选区被清空**：README 承诺"再按一次恢复"实际做不到，必须重新拖选。 | `update.rs` `toggle_mute_range` | **fixed** |
 | **折叠轨道上右键拖动完全无反馈**：手势被静默忽略。 | `update.rs` `waveform_event` | **fixed** |
 | **左键拖动预览使用删除的红色**：非破坏性选区看起来像要删除音频。 | `waveform.rs` | **fixed** |
 | **`select_track` 与 `select_track_for_interaction` 完全重复** | `update.rs` | **fixed**（合并） |

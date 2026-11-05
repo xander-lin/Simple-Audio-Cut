@@ -14,26 +14,24 @@ use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
 
 use simple_audio_cut_core::analysis::{amplitude_to_dbfs, RmsFrame};
 use simple_audio_cut_core::buffer::AudioBuffer;
-use simple_audio_cut_core::direct_edit::direct_region_edit;
-use simple_audio_cut_core::region::{
-    envelope_gain_at_time, region_is_covered, EnvelopePoint, Region,
-};
+use simple_audio_cut_core::direct_edit::{direct_region_edit, mute_region_edit};
+use simple_audio_cut_core::region::{envelope_gain_at_time, EnvelopePoint, Region};
 
 use crate::message::{Message, WaveformEvent};
 use crate::model::MediaId;
 use crate::theme;
 use crate::ui::{format_ruler_time, format_time_precise};
 
-pub const ROW_HEIGHT: f32 = 136.0;
+pub const ROW_HEIGHT: f32 = 184.0;
 pub const ROW_GAP: f32 = 10.0;
 /// Height of the time ruler at the top of every row.
-pub const RULER_HEIGHT: f32 = 17.0;
+pub const RULER_HEIGHT: f32 = 22.0;
 const EDGE_MIN: f32 = 24.0;
 const HIT_RADIUS: f32 = 14.0;
 const LINE_HIT_RADIUS: f32 = 8.0;
 const EDIT_POINT_HIT: f32 = 6.0;
 /// Minimum horizontal distance between ruler labels.
-const RULER_MIN_LABEL_GAP: f32 = 64.0;
+const RULER_MIN_LABEL_GAP: f32 = 84.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowLayout {
@@ -289,15 +287,15 @@ impl<'a> TrackCanvas<'a> {
             frame.fill_rectangle(
                 Point::new(row.leading, center),
                 Size::new(row.timeline_width(), 1.0),
-                Color::from_rgba(0.30, 0.36, 0.40, 0.55),
+                Color { a: 0.06, ..theme::TEXT },
             );
-            self.draw_peaks(frame, &row, top);
             self.draw_rms(frame, &row, top);
+            self.draw_peaks(frame, &row, top);
             if self.show_threshold {
                 let radius = Self::rms_radius(simple_audio_cut_core::analysis::dbfs_to_amplitude(
                     self.threshold_db,
                 ));
-                let color = Color::from_rgba(0.84, 0.74, 0.35, 0.82);
+                let color = Color { a: 0.28, ..theme::ACCENT };
                 // The original editor drew the threshold as a dashed guide.
                 draw_dashed_rule(
                     frame,
@@ -320,8 +318,8 @@ impl<'a> TrackCanvas<'a> {
     /// 16px ruler: background, tick marks, faint grid in the body and labels.
     fn draw_ruler(&self, frame: &mut Frame, row: &RowLayout, top: f32, width: f32) {
         frame.fill_rectangle(
-            Point::new(0.0, top),
-            Size::new(width, RULER_HEIGHT),
+            Point::new(0.0, top + RULER_HEIGHT - 1.0),
+            Size::new(width, 1.0),
             theme::RULER_BG,
         );
         let step = ruler_step(self.pixels_per_second);
@@ -331,10 +329,10 @@ impl<'a> TrackCanvas<'a> {
         while time <= row.end && guard < 4096 {
             guard += 1;
             let x = Self::x_at_time(row, time);
-            let tick_top = top + RULER_HEIGHT - 5.0;
+            let tick_top = top + RULER_HEIGHT - 6.0;
             frame.fill_rectangle(
                 Point::new(x, tick_top),
-                Size::new(1.0, 4.0),
+                Size::new(1.0, 5.0),
                 theme::RULER_TICK,
             );
             // Faint grid line through the waveform body, so time is readable
@@ -342,14 +340,14 @@ impl<'a> TrackCanvas<'a> {
             frame.fill_rectangle(
                 Point::new(x, Self::content_top(top)),
                 Size::new(1.0, Self::content_height()),
-                Color::from_rgba(0.55, 0.62, 0.66, 0.07),
+                theme::GRID,
             );
             if self.ruler_label_fits(row, x) {
                 frame.fill_text(Text {
                     content: format_ruler_time(time, step),
-                    position: Point::new(x + 4.0, top + 2.0),
+                    position: Point::new(x + 5.0, top + 4.0),
                     color: theme::RULER_TEXT,
-                    size: 9.0.into(),
+                    size: 10.0.into(),
                     ..Text::default()
                 });
             }
@@ -358,9 +356,9 @@ impl<'a> TrackCanvas<'a> {
         // Row end label, right-aligned in the ruler.
         frame.fill_text(Text {
             content: format_ruler_time(row.end, step),
-            position: Point::new((width - 44.0).max(0.0), top + 2.0),
+            position: Point::new((width - 44.0).max(0.0), top + 4.0),
             color: theme::RULER_TEXT,
-            size: 9.0.into(),
+            size: 10.0.into(),
             ..Text::default()
         });
     }
@@ -407,40 +405,10 @@ impl<'a> TrackCanvas<'a> {
         frame.fill(
             &band,
             Color {
-                a: if self.selected { 0.20 } else { 0.16 },
+                a: if self.selected { 0.14 } else { 0.08 },
                 ..theme::RMS_FILL
             },
         );
-        frame.stroke(
-            &band,
-            Stroke::default()
-                .with_color(Color {
-                    a: if self.selected { 0.55 } else { 0.25 },
-                    ..theme::RMS_EDGE
-                })
-                .with_width(1.0),
-        );
-
-        // Quiet contour: a single soft line at the softest RMS per column,
-        // matching the original editor's white minimum-level trace.
-        if self.selected {
-            let min_line: Vec<f32> = columns
-                .iter()
-                .map(|column| center - Self::rms_radius(column.min))
-                .collect();
-            let contour = Path::new(|builder| {
-                builder.move_to(Point::new(row.leading, min_line[0]));
-                for (index, y) in min_line.iter().enumerate().skip(1) {
-                    builder.line_to(Point::new(row.leading + index as f32, *y));
-                }
-            });
-            frame.stroke(
-                &contour,
-                Stroke::default()
-                    .with_color(Color::from_rgba(0.93, 0.96, 0.95, 0.35))
-                    .with_width(1.0),
-            );
-        }
     }
 
     fn draw_peaks(&self, frame: &mut Frame, row: &RowLayout, top: f32) {
@@ -457,7 +425,7 @@ impl<'a> TrackCanvas<'a> {
         let half = Self::content_height() / 2.0;
         let color = if self.selected {
             Color {
-                a: 0.78,
+                a: 0.95,
                 ..theme::WAVE_FILL
             }
         } else {
@@ -513,7 +481,7 @@ impl<'a> TrackCanvas<'a> {
                 frame.fill_rectangle(
                     Point::new(left, content_top),
                     Size::new(width, Self::content_height()),
-                    Color::from_rgba(0.05, 0.06, 0.07, 0.78),
+                    Color { a: 0.82, ..theme::BG },
                 );
                 draw_hatch(
                     frame,
@@ -547,23 +515,23 @@ impl<'a> TrackCanvas<'a> {
                 frame.fill_rectangle(
                     Point::new(left, content_top),
                     Size::new(width, Self::content_height()),
-                    Color::from_rgba(0.84, 0.74, 0.35, 0.14),
+                    Color { a: 0.10, ..theme::ACCENT },
                 );
                 frame.fill_rectangle(
                     Point::new(left, content_top),
                     Size::new(1.0, Self::content_height()),
-                    Color::from_rgba(0.84, 0.74, 0.35, 0.45),
+                    Color { a: 0.45, ..theme::ACCENT },
                 );
                 frame.fill_rectangle(
                     Point::new(left + width - 1.0, content_top),
                     Size::new(1.0, Self::content_height()),
-                    Color::from_rgba(0.84, 0.74, 0.35, 0.45),
+                    Color { a: 0.45, ..theme::ACCENT },
                 );
                 if width > 46.0 {
                     frame.fill_text(Text {
                         content: "Muted".into(),
                         position: Point::new(left + 8.0, center - 7.0),
-                        color: Color::from_rgba(0.90, 0.81, 0.47, 0.9),
+                        color: Color { a: 0.9, ..theme::ACCENT },
                         size: 10.0.into(),
                         ..Text::default()
                     });
@@ -579,24 +547,24 @@ impl<'a> TrackCanvas<'a> {
                     frame.fill_rectangle(
                         Point::new(left, content_top),
                         Size::new(width, Self::content_height()),
-                        Color::from_rgba(0.37, 0.75, 0.68, 0.20),
+                        Color { a: 0.10, ..theme::SELECTION },
                     );
                     // Solid edges plus a bar under the ruler make the range
                     // readable even when it sits on top of a deleted region.
                     frame.fill_rectangle(
                         Point::new(left, content_top),
                         Size::new(1.5, Self::content_height()),
-                        theme::CYAN,
+                        theme::SELECTION,
                     );
                     frame.fill_rectangle(
                         Point::new(left + width - 1.5, content_top),
                         Size::new(1.5, Self::content_height()),
-                        theme::CYAN,
+                        theme::SELECTION,
                     );
                     frame.fill_rectangle(
                         Point::new(left, top + RULER_HEIGHT - 2.0),
                         Size::new(width, 2.0),
-                        theme::CYAN,
+                        theme::SELECTION,
                     );
                 }
             }
@@ -623,7 +591,13 @@ impl<'a> TrackCanvas<'a> {
                     &path,
                     Stroke::default()
                         .with_color(Color {
-                            a: if self.show_envelope { 0.92 } else { 0.45 },
+                            a: if self.envelope.is_empty() {
+                                0.22
+                            } else if self.show_envelope {
+                                0.9
+                            } else {
+                                0.4
+                            },
                             ..theme::ACCENT
                         })
                         .with_width(1.6),
@@ -634,11 +608,11 @@ impl<'a> TrackCanvas<'a> {
                         content_top + Self::y_at_gain(point.gain),
                     );
                     let circle = Path::circle(center, 4.5);
-                    frame.fill(&circle, Color::from_rgba(0.95, 0.86, 0.52, 0.95));
+                    frame.fill(&circle, theme::ACCENT);
                     frame.stroke(
                         &circle,
                         Stroke::default()
-                            .with_color(Color::from_rgba(0.13, 0.15, 0.14, 0.9))
+                            .with_color(theme::BG)
                             .with_width(1.0),
                     );
                 }
@@ -652,7 +626,7 @@ impl<'a> TrackCanvas<'a> {
                 frame.fill_rectangle(
                     Point::new(x - 0.5, content_top),
                     Size::new(1.0, Self::content_height()),
-                    Color::from_rgba(0.37, 0.75, 0.68, 0.85),
+                    Color { a: 0.55, ..theme::SELECTION },
                 );
                 let marker = Path::new(|builder| {
                     builder.move_to(Point::new(x - 4.0, top + RULER_HEIGHT - 8.0));
@@ -660,11 +634,11 @@ impl<'a> TrackCanvas<'a> {
                     builder.line_to(Point::new(x, top + RULER_HEIGHT));
                     builder.close();
                 });
-                frame.fill(&marker, Color::from_rgba(0.37, 0.75, 0.68, 0.95));
+                frame.fill(&marker, Color { a: 0.8, ..theme::SELECTION });
             }
 
             if let Some(drag) = &state.drag {
-                if let Some(preview) = drag.preview(&self.muted) {
+                if let Some(preview) = drag.preview() {
                     let start = preview.start.max(row.start);
                     let end = preview.end.min(row.end);
                     if end > start {
@@ -742,13 +716,13 @@ impl<'a> TrackCanvas<'a> {
                 frame.fill_rectangle(
                     Point::new(left, bounds.height - 16.0),
                     Size::new(width, 14.0),
-                    Color::from_rgba(0.06, 0.07, 0.08, 0.88),
+                    theme::RAISED,
                 );
                 frame.fill_text(Text {
                     content: label,
                     position: Point::new(left + 5.0, bounds.height - 15.0),
                     color: theme::TEXT_SOFT,
-                    size: 9.0.into(),
+                    size: 10.0.into(),
                     ..Text::default()
                 });
             }
@@ -853,18 +827,19 @@ struct Preview {
 }
 
 impl Drag {
-    fn preview(&self, muted: &[Region]) -> Option<Preview> {
+    fn preview(&self) -> Option<Preview> {
         match self {
             Self::Range { start, current } => {
                 let region = Region::new(start.min(*current), start.max(*current));
                 Some(Preview {
                     start: region.start,
                     end: region.end,
-                    // A left-drag toggles: dragging over silence restores it.
-                    operation: if region_is_covered(muted, region) {
-                        PreviewOperation::Restore
-                    } else {
+                    // Same sweep semantics as the destructive right-drag:
+                    // forward silences, backward restores.
+                    operation: if current >= start {
                         PreviewOperation::Mute
+                    } else {
+                        PreviewOperation::Restore
                     },
                 })
             }
@@ -1029,16 +1004,16 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                             .map(|(row, local)| Self::time_at_x(&row, local.x))
                             .unwrap_or(current);
                         let minimum = (3.0 / self.pixels_per_second).max(0.01) as f64;
-                        if (current - start).abs() > minimum {
-                            // Left-drag is the "mute this range" gesture. The
-                            // selection is kept so M can restore it and Delete
-                            // can cut it out.
-                            publish(WaveformEvent::MuteRange(Region::new(
-                                start.min(current),
-                                start.max(current),
-                            )))
-                        } else {
-                            publish(WaveformEvent::Seek(start))
+                        match mute_region_edit(start, current, minimum) {
+                            // Left-drag mirrors the delete gesture: forward
+                            // silences the swept range, backward restores it.
+                            // The selection is kept so M can toggle it and
+                            // Delete can cut it out.
+                            Some(edit) => publish(WaveformEvent::MuteEdit {
+                                region: edit.region,
+                                operation: edit.operation,
+                            }),
+                            None => publish(WaveformEvent::Seek(start)),
                         }
                     }
                     (Drag::Direct { start, current }, mouse::Button::Right) => {
@@ -1086,15 +1061,6 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
         });
         let mut overlay = Frame::new(renderer, bounds.size());
         self.draw_overlays(&mut overlay, bounds, state);
-        if self.selected {
-            overlay.stroke_rectangle(
-                Point::ORIGIN,
-                bounds.size(),
-                Stroke::default()
-                    .with_color(Color::from_rgba(0.37, 0.75, 0.68, 0.35))
-                    .with_width(1.0),
-            );
-        }
         vec![base, overlay.into_geometry()]
     }
 
