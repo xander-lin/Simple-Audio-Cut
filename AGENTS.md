@@ -23,8 +23,9 @@ Simple Audio Cut 是一个面向录音口播的本地桌面剪辑工具，使用
 - 播放：CPAL 输出流（`crates/core/src/audio/player.rs`），不再有 WebAudio。
 - 波形：iced canvas 自绘（`crates/app/src/waveform.rs`），不再有 Canvas2D/DOM。
 
-迁移分支保留了旧版 `src/`（React）与 `src-tauri/`（Tauri 壳），仅用于对比，
-不参与 workspace 构建与打包；确认新实现完整后可在后续提交中移除。
+`main` 分支自 0.2 起就是 iced 版本；旧版 `src/`（React）与 `src-tauri/`
+（Tauri 壳）仅作为历史参考留在树中，`src-tauri` 被 workspace 排除，
+不参与构建、测试与打包。
 
 ## 产品哲学
 

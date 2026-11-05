@@ -4,10 +4,10 @@ Simple Audio Cut 是一个面向录音口播的本地桌面剪辑工具。它适
 
 程序使用 **iced（Rust 原生 GUI）** 构建，不再包含 WebView。录音、响度归一化、媒体解码、播放、波形渲染、转换与导出全部在本机 Rust/FFmpeg/CPAL 链路内完成；音频不会上传到网络。新素材会先按可调目标响度归一化（默认 `-14 LUFS`），再由用户配置的降噪提供方在后台处理，随后去除短促尖锐的毛刺噪声并再次归一化到目标响度，不阻塞继续录音和编辑。
 
-> 迁移说明：0.2 起从 Tauri 2 + React + WebKitGTK 迁移到 iced。旧版前端仍保留在
-> `src/` 与 `src-tauri/` 中仅用于对比，不参与构建与打包。迁移原因是 WebKitGTK
-> 的音频链路在长期使用后会出现 `AudioContext.resume()` 长时间不结算的静默卡死，
-> 且解码依赖系统 GStreamer 插件。
+> 迁移说明：0.2 起从 Tauri 2 + React + WebKitGTK 迁移到 iced，`main` 即为 iced
+> 版本。旧版前端仍保留在 `src/` 与 `src-tauri/` 中仅作历史参考，`src-tauri` 不参与
+> workspace 构建、测试与打包。迁移原因是 WebKitGTK 的音频链路在长期使用后会出现
+> `AudioContext.resume()` 长时间不结算的静默卡死，且解码依赖系统 GStreamer 插件。
 
 ## 适用场景
 

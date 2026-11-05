@@ -1,4 +1,4 @@
-# 已知缺陷清单（native-gui-iced 迁移）
+# 已知缺陷清单（iced 版本）
 
 审计方式：逐行对照旧版 `src/`（React）实现、阅读 iced 版 `crates/app`、并用
 `seed_preview` 实机截图 + 集成测试复核。以下全部是我在代码里确认过的问题，
@@ -64,7 +64,7 @@
 | 32 | **会话音频写在 `/tmp/simple-audio-cut-recordings-*`**，进程崩溃不清理；`Drop` 只在正常退出时删。旧版也是 temp，但迁移后没有恢复"上次会话"的能力。 | `crates/core/src/audio/native.rs` | open |
 | 33 | **`makepkg` 打印 `libfakeroot internal error: payload not recognized!`**，包仍生成成功；未实际 `pacman -U` 安装验证过。 | 打包环境 | open（待验证） |
 | 34 | **`PLAYBACK_BUG_ANALYSIS.md` 仍描述 WebKit 问题**，未更新或移除。 | 仓库根 | **fixed**（2026-11-05：已标注为历史文档） |
-| 35 | **`src/`、`src-tauri/` 仍留在仓库**（约 1.1 MB），未决定是否删除。 | 仓库根 | open（待决定；本轮未改动旧目录） |
+| 35 | **`src/`、`src-tauri/` 仍留在仓库**（约 1.1 MB）。`main` 已是 iced 版本，这两个目录只剩历史参考价值；`src-tauri` 被 workspace 排除，不再构建或打包。 | 仓库根 | open（保留作对照；删除需显式确认） |
 
 ## 六、测试覆盖缺口
 
