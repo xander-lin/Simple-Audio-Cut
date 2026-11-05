@@ -58,6 +58,23 @@ pub fn original_time_at_edited_offset(offset: f64, kept: &[Region]) -> f64 {
     kept.last().map(|region| region.end).unwrap_or(0.0)
 }
 
+/// Scale that makes `duration` fit on a single row of `width` pixels,
+/// accounting for the edge gutter the waveform layout adds on both sides.
+///
+/// The gutter grows with the scale (`0.3 * pps`) up to a quarter of the row,
+/// so the fit has to solve `duration * pps + 2 * gutter == width`. Taking the
+/// minimum of the flat-gutter and proportional-gutter solutions always fits.
+pub fn fit_pixels_per_second(width: f32, duration: f64) -> Option<f32> {
+    if !width.is_finite() || width <= 8.0 || !duration.is_finite() || duration <= 0.0 {
+        return None;
+    }
+    let width = width as f64;
+    let flat = (width - 48.0).max(1.0) / duration;
+    let proportional = width / (duration + 0.6);
+    let pps = flat.min(proportional).clamp(0.25, 400.0);
+    Some(pps as f32)
+}
+
 pub fn edited_duration(kept: &[Region]) -> f64 {
     kept.iter().map(Region::duration).sum()
 }
@@ -190,6 +207,31 @@ mod tests {
         assert_eq!(edited_offset_at_original_time(5.0, &kept), 3.0);
         assert_eq!(original_time_at_edited_offset(3.0, &kept), 5.0);
         assert_eq!(original_time_at_edited_offset(9.0, &kept), 6.0);
+    }
+
+    #[test]
+    fn fit_scale_keeps_audio_on_a_single_row() {
+        for width in [320.0_f32, 640.0, 900.0, 1400.0, 2200.0] {
+            for duration in [0.4_f64, 3.2, 6.0, 26.0, 120.0] {
+                let pps = super::fit_pixels_per_second(width, duration).expect("fit scale");
+                assert!(pps.is_finite() && pps > 0.0);
+                // Reconstruct the layout rule: edge grows with the scale but
+                // is capped at a quarter of the width.
+                let edge = (pps * 0.3).max(24.0).min((width * 0.25).max(24.0));
+                let needed = duration as f32 * pps + 2.0 * edge;
+                assert!(
+                    needed <= width + 0.5,
+                    "fit overflows: width {width}, duration {duration}, pps {pps}, needed {needed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_scale_rejects_unusable_inputs() {
+        assert!(super::fit_pixels_per_second(0.0, 1.0).is_none());
+        assert!(super::fit_pixels_per_second(800.0, 0.0).is_none());
+        assert!(super::fit_pixels_per_second(f32::NAN, 1.0).is_none());
     }
 
     #[test]

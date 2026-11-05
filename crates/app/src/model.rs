@@ -36,12 +36,15 @@ pub fn new_id() -> MediaId {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DenoiseStatus {
+    /// No provider is configured; the normalized source is used as-is.
     #[default]
     Unavailable,
     Queued,
     Processing,
     Complete,
     Failed,
+    /// The user explicitly chose to keep the original audio for this take.
+    Skipped,
 }
 
 impl DenoiseStatus {
@@ -52,7 +55,13 @@ impl DenoiseStatus {
             Self::Processing => "Denoising",
             Self::Complete => "ClearVoice",
             Self::Failed => "Denoise failed",
+            Self::Skipped => "Original audio",
         }
+    }
+
+    /// True while a background task owns this take.
+    pub fn is_busy(self) -> bool {
+        matches!(self, Self::Queued | Self::Processing)
     }
 }
 
@@ -60,6 +69,19 @@ impl DenoiseStatus {
 pub struct DenoiseState {
     pub status: DenoiseStatus,
     pub task_id: String,
+    /// Why denoising did not run. Shown in the inspector so "No denoise" is
+    /// never a dead end.
+    pub reason: Option<String>,
+}
+
+impl DenoiseState {
+    pub fn skipped() -> Self {
+        Self {
+            status: DenoiseStatus::Skipped,
+            task_id: String::new(),
+            reason: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,7 +96,11 @@ pub enum ClipStatus {
 pub struct MediaClip {
     pub id: MediaId,
     pub name: String,
+    /// Path of the audio currently shown/exported (may be denoised).
     pub path: String,
+    /// Path of the normalized source before denoising. Kept so a take can be
+    /// switched back to its original audio at any time.
+    pub normalized_path: String,
     pub source_path: Option<String>,
     pub duration: f64,
     pub lufs: Option<f64>,
@@ -96,6 +122,7 @@ impl MediaClip {
                 name
             },
             path: source_path.clone(),
+            normalized_path: String::new(),
             source_path: Some(source_path),
             duration: 0.0,
             lufs: None,
@@ -111,6 +138,7 @@ impl MediaClip {
             id,
             name: name.into(),
             path: "recording.wav".into(),
+            normalized_path: String::new(),
             source_path: None,
             duration: 0.0,
             lufs: None,
@@ -119,6 +147,20 @@ impl MediaClip {
             status: ClipStatus::Normalizing,
             denoise: DenoiseState::default(),
         }
+    }
+
+    /// Path denoising should read from: always the normalized source.
+    pub fn denoise_source(&self) -> &str {
+        if self.normalized_path.is_empty() {
+            &self.path
+        } else {
+            &self.normalized_path
+        }
+    }
+
+    /// True when the take can be switched back to non-denoised audio.
+    pub fn has_original_audio(&self) -> bool {
+        !self.normalized_path.is_empty() && self.normalized_path != self.path
     }
 
     pub fn ready(&self) -> bool {
@@ -157,6 +199,10 @@ impl MediaClip {
     }
 
     pub fn apply_audio(&mut self, path: String, duration: f64, lufs: Option<f64>, audio: Arc<AudioBuffer>, rms: Arc<Vec<RmsFrame>>) {
+        if self.normalized_path.is_empty() {
+            // First decoded audio for this take is the normalized source.
+            self.normalized_path = path.clone();
+        }
         self.path = path;
         self.duration = duration;
         self.lufs = lufs;
@@ -171,6 +217,9 @@ impl MediaClip {
 pub struct Track {
     pub clip: MediaClip,
     pub pixels_per_second: f32,
+    /// True once the user zoomed this track explicitly. Until then the row
+    /// stretches the take to the available width ("fit").
+    pub zoom_locked: bool,
     pub manual_deleted: Vec<Region>,
     pub silence_regions: Vec<Region>,
     pub muted: Vec<Region>,
@@ -192,6 +241,7 @@ impl Track {
         Self {
             clip,
             pixels_per_second: DEFAULT_PIXELS_PER_SECOND,
+            zoom_locked: false,
             manual_deleted: Vec::new(),
             silence_regions: Vec::new(),
             muted: Vec::new(),
@@ -211,6 +261,17 @@ impl Track {
 
     pub fn id(&self) -> MediaId {
         self.clip.id
+    }
+
+    /// Pixels per second used for layout: the user's zoom if pinned,
+    /// otherwise the densest scale that still fits the take on one screen of
+    /// `available_width` pixels.
+    pub fn effective_pixels_per_second(&self, available_width: f32) -> f32 {
+        if self.zoom_locked {
+            return self.pixels_per_second;
+        }
+        simple_audio_cut_core::timeline::fit_pixels_per_second(available_width, self.duration())
+            .unwrap_or(self.pixels_per_second)
     }
 
     pub fn audio(&self) -> &Arc<AudioBuffer> {
@@ -576,6 +637,9 @@ impl Session {
         if let Some(clip) = self.editing_mut(id) {
             if clip.denoise.task_id == task_id {
                 clip.denoise.status = status;
+                if status != DenoiseStatus::Failed {
+                    clip.denoise.reason = None;
+                }
             }
         }
     }

@@ -59,7 +59,13 @@ fn harness() -> Harness {
     let player = Arc::new(simple_audio_cut_core::audio::MockAudioPlayer::deterministic());
     let dialogs = Arc::new(MockDialogService::new());
     let events: SharedSink = Arc::new(EventBus::new());
-    let services = Services::headless(engine, player.clone(), dialogs.clone(), events);
+    let services = Services::headless_with(
+        engine,
+        denoise,
+        player.clone(),
+        dialogs.clone(),
+        events,
+    );
     let (app, _) = App::boot(services);
     Harness {
         app,
@@ -155,6 +161,113 @@ fn playback_advances_the_playhead_in_source_time() {
     assert!(harness.app.session.playback.is_none());
     assert!((harness.app.session.playhead - 0.25).abs() < 1e-6);
     assert_eq!(harness.player.position(), None);
+}
+
+#[test]
+fn automatic_denoising_off_leaves_the_take_usable_and_exportable() {
+    // The harness turns automatic denoising off, which is the same end state as
+    // an unconfigured ClearVoice install: no denoising, everything else works.
+    let mut harness = harness();
+    let id = 27;
+    harness.import_ready(id, "voice");
+    let _ = harness.app.update(Message::AddToTimeline(id));
+    assert!(harness.pump_until(
+        |app| !app.session.clip_by_id(id).unwrap().denoise.status.is_busy(),
+        Duration::from_secs(5)
+    ));
+    let clip = harness.app.session.clip_by_id(id).unwrap();
+    // Either the provider reports itself unusable, or automatic runs are off:
+    // both must leave the take untouched and explain why.
+    assert!(
+        matches!(
+            clip.denoise.status,
+            simple_audio_cut_iced::model::DenoiseStatus::Skipped
+                | simple_audio_cut_iced::model::DenoiseStatus::Unavailable
+        ),
+        "unexpected status {:?}",
+        clip.denoise.status
+    );
+    assert!(clip.denoise.reason.is_some());
+    assert!(clip.ready());
+
+    // Editing and playback still work.
+    let _ = harness.app.update(Message::PlayPause);
+    assert!(harness.app.session.playback.is_some());
+    let _ = harness.app.update(Message::StopPlayback);
+    let _ = harness.app.update(Message::Waveform {
+        track: id,
+        event: simple_audio_cut_iced::message::WaveformEvent::DirectEdit {
+            region: simple_audio_cut_core::region::Region::new(0.1, 0.2),
+            operation: simple_audio_cut_core::direct_edit::DirectRegionOperation::Delete,
+        },
+    });
+    assert!(harness.app.session.track(id).unwrap().needs_export());
+
+    // And the changed track still exports.
+    let export_dir = harness.root.join("exports-without-denoise");
+    harness.dialogs.queue_folder(Some(export_dir.clone()));
+    let _ = harness.app.update(Message::ExportChanged);
+    assert!(
+        harness.pump_until(
+            |app| app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose"),
+            Duration::from_secs(30)
+        ),
+        "export did not finish: {}",
+        harness.app.ui.message
+    );
+    assert!(harness.app.ui.message.starts_with("Exported"));
+    assert!(std::fs::read_dir(&export_dir).unwrap().next().is_some());
+}
+
+#[test]
+fn a_take_can_opt_out_of_denoising_and_still_export() {
+    let mut harness = harness();
+    let id = 28;
+    harness.import_ready(id, "voice");
+    let _ = harness.app.update(Message::AddToTimeline(id));
+    let _ = harness.app.update(Message::SetDenoise {
+        id,
+        enabled: false,
+    });
+    assert_eq!(
+        harness.app.session.clip_by_id(id).unwrap().denoise.status,
+        simple_audio_cut_iced::model::DenoiseStatus::Skipped
+    );
+
+    let export_dir = harness.root.join("exports-opted-out");
+    harness.dialogs.queue_folder(Some(export_dir.clone()));
+    let _ = harness.app.update(Message::ExportChanged);
+    assert!(
+        harness.pump_until(
+            |app| app.session.exporting.is_empty() && !app.ui.message.starts_with("Choose"),
+            Duration::from_secs(30)
+        ),
+        "export did not finish: {}",
+        harness.app.ui.message
+    );
+    assert!(harness.app.ui.message.starts_with("Exported"));
+}
+
+#[test]
+fn stop_halts_playback_and_holds_the_current_position() {
+    let mut harness = harness();
+    let id = 25;
+    harness.import_ready(id, "voice");
+    let _ = harness.app.update(Message::AddToTimeline(id));
+    let _ = harness.app.update(Message::PlayPause);
+    harness.player.advance(0.4);
+    harness.pump();
+    assert!((harness.app.session.playhead - 0.4).abs() < 1e-6);
+
+    let _ = harness.app.update(Message::StopPlayback);
+
+    assert!(harness.app.session.playback.is_none());
+    assert!((harness.app.session.playhead - 0.4).abs() < 1e-6);
+    assert_eq!(harness.player.position(), None);
+
+    // Pressing stop again must not disturb the held position.
+    let _ = harness.app.update(Message::StopPlayback);
+    assert!((harness.app.session.playhead - 0.4).abs() < 1e-6);
 }
 
 #[test]

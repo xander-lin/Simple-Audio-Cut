@@ -389,11 +389,15 @@ impl ClearVoiceProvider {
         let mut options = vec![
             DenoiseDeviceInfo {
                 id: "auto".into(),
-                label: "Automatic".into(),
+                label: "Automatic (GPU if available)".into(),
             },
             DenoiseDeviceInfo {
                 id: "cpu".into(),
                 label: "CPU".into(),
+            },
+            DenoiseDeviceInfo {
+                id: "cuda".into(),
+                label: "GPU (default CUDA device)".into(),
             },
         ];
         if !python.is_file() {
@@ -1003,9 +1007,8 @@ impl DenoiseProvider for ClearVoiceProvider {
         }
         let configured = self.configured();
         let (effective, _) = Self::effective_config(&configured);
-        if !effective.enabled {
-            return Err("Automatic denoising is turned off.".into());
-        }
+        // `enabled` only controls automatic runs for new media. A take can
+        // still be denoised explicitly from the inspector when it is off.
         let python = PathBuf::from(&effective.executable_path);
         if !python.is_file() {
             return Err(
@@ -1123,6 +1126,41 @@ mod tests {
             serde_json::from_str::<Vec<String>>(payload).expect("parse devices"),
             vec!["GPU 0", "GPU 1"]
         );
+    }
+
+    #[test]
+    fn cpu_is_always_selectable_and_gpu_aliases_normalize() {
+        // CPU must work without any GPU present.
+        assert_eq!(
+            ClearVoiceProvider::normalize_device("cpu"),
+            Ok("cpu".into())
+        );
+        // "gpu" is an alias for the default CUDA device.
+        assert_eq!(
+            ClearVoiceProvider::normalize_device("GPU"),
+            Ok("cuda".into())
+        );
+        assert_eq!(
+            ClearVoiceProvider::normalize_device("cuda:1"),
+            Ok("cuda:1".into())
+        );
+        assert_eq!(
+            ClearVoiceProvider::normalize_device(""),
+            Ok("auto".into())
+        );
+        assert!(ClearVoiceProvider::normalize_device("tpu").is_err());
+        assert!(ClearVoiceProvider::normalize_device("cuda:").is_err());
+    }
+
+    #[test]
+    fn device_options_offer_automatic_cpu_and_gpu_even_without_cuda() {
+        let provider = ClearVoiceProvider::new(test_root("devices").join("denoise.json"));
+        let options = provider.device_options(&std::path::PathBuf::from(""));
+
+        let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+        assert!(ids.contains(&"auto"));
+        assert!(ids.contains(&"cpu"));
+        assert!(ids.contains(&"cuda"));
     }
 
     #[test]

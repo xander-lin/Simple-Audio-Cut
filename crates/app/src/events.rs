@@ -85,6 +85,18 @@ pub enum AppEvent {
         task_id: String,
         error: String,
     },
+    /// Result of loading the pre-denoise audio when the user turns denoising
+    /// off for a take that was already denoised.
+    OriginalAudioRestored {
+        id: MediaId,
+        path: String,
+        audio: Arc<AudioBuffer>,
+        rms: Arc<Vec<RmsFrame>>,
+    },
+    OriginalAudioRestoreFailed {
+        id: MediaId,
+        error: String,
+    },
     ExportCompleted {
         results: Vec<ExportResult>,
         signatures: Vec<(MediaId, String)>,

@@ -14,6 +14,14 @@ pub enum Shortcut {
     DirectEdit,
     Settings,
     Import,
+    /// Enter: move the selected library item onto the timeline.
+    AddSelected,
+    /// Delete: cut the selected range out of the timeline.
+    DeleteSelection,
+    JumpStart,
+    JumpEnd,
+    ZoomIn,
+    ZoomOut,
 }
 
 /// Canvas-level gestures, in display time (collapsed or original timeline).
@@ -53,13 +61,23 @@ pub enum Message {
     AddToTimeline(MediaId),
     DeleteMedia(MediaId),
     RetryImport(MediaId),
+    /// Turn denoising on or off for one take.
+    SetDenoise {
+        id: MediaId,
+        enabled: bool,
+    },
     RemoveTrack(MediaId),
     ReturnTrackToPool(MediaId),
     ToggleCollapse(MediaId),
     PlayPause,
+    StopPlayback,
     Seek(f64),
+    JumpToStart,
+    JumpToEnd,
     SelectRange(Option<Region>),
     MuteRange,
+    DeleteRange,
+    ClearEnvelope,
     SetBlade(bool),
     Waveform {
         track: MediaId,
@@ -73,6 +91,7 @@ pub enum Message {
     ClearSilence,
     ExportChanged,
     ExportTrack(MediaId),
+    ZoomSelected(bool),
     ContextMenu {
         track: MediaId,
         kind: ContextMenuKind,
@@ -97,4 +116,6 @@ pub enum Message {
     CancelQuit,
     Shortcut(Shortcut),
     WindowResized(iced::Size),
+    /// Logical size of the monitor hosting the window, resolved once at boot.
+    MonitorResolved(Option<iced::Size>),
 }

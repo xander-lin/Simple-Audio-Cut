@@ -37,6 +37,12 @@ pub struct App {
     pub ui: UiState,
     pub services: Services,
     pub window_size: Size,
+    /// Size of the monitor the window lives on. Used to decide whether the
+    /// window is effectively full screen (columns) or half screen (stacked).
+    pub monitor_size: Option<Size>,
+    /// Set by the preview binary when the simulated monitor size must win over
+    /// the real one.
+    pub monitor_size_forced: bool,
     pending_export: Option<PendingExport>,
     /// Whether the in-flight export was started from a single track. Kept
     /// apart from [`PendingExport`] so the dispatched request never has to
@@ -54,14 +60,21 @@ impl App {
             session: Session::default(),
             ui: UiState::default(),
             services,
-            window_size: Size::new(1100.0, 760.0),
+            window_size: crate::app::DEFAULT_WINDOW_SIZE,
+            monitor_size: None,
+            monitor_size_forced: false,
             pending_export: None,
             export_single: false,
         };
         let denoise = app.services.denoise.clone();
         let events = app.services.events.clone();
         jobs::provider_status(denoise, events);
-        (app, Task::none())
+        // The monitor size arrives asynchronously; until then the layout falls
+        // back to an absolute width threshold.
+        let monitor = iced::window::latest()
+            .and_then(iced::window::monitor_size)
+            .map(Message::MonitorResolved);
+        (app, monitor)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -90,13 +103,34 @@ impl App {
             Message::AddToTimeline(id) => self.add_to_timeline(id),
             Message::DeleteMedia(id) => self.delete_media(id),
             Message::RetryImport(id) => self.retry_import(id),
+            Message::SetDenoise { id, enabled } => self.set_denoise(id, enabled),
             Message::RemoveTrack(id) => self.remove_track(id),
             Message::ReturnTrackToPool(id) => self.return_track_to_pool(id),
             Message::ToggleCollapse(id) => self.toggle_collapse(id),
             Message::PlayPause => self.toggle_playback(),
+            Message::StopPlayback => {
+                if self.session.playback.is_some() {
+                    self.stop_playback(true);
+                }
+            }
             Message::Seek(time) => self.seek(time),
+            Message::JumpToStart => self.seek(0.0),
+            Message::JumpToEnd => {
+                let duration = self.session.selected_track().map(Track::duration);
+                if let Some(duration) = duration {
+                    self.seek(duration);
+                }
+            }
             Message::SelectRange(range) => self.set_selected_range(range),
             Message::MuteRange => self.toggle_mute_range(),
+            Message::DeleteRange => self.delete_selected_range(),
+            Message::ClearEnvelope => self.clear_envelope(),
+            Message::ZoomSelected(closer) => {
+                if let Some(id) = self.session.selected_track {
+                    let delta = if closer { -1.0 } else { 1.0 };
+                    self.scale_track(id, delta);
+                }
+            }
             Message::SetBlade(active) => {
                 self.ui.blade_mode = active;
                 self.ui.message = if active {
@@ -247,6 +281,11 @@ impl App {
             Message::CancelQuit => self.ui.confirm_quit = false,
             Message::Shortcut(shortcut) => self.shortcut(shortcut),
             Message::WindowResized(size) => self.window_size = size,
+            Message::MonitorResolved(size) => {
+                if !self.monitor_size_forced {
+                    self.monitor_size = size;
+                }
+            }
         }
         Task::none()
     }
@@ -274,8 +313,13 @@ impl App {
             .ui
             .rename
             .as_ref()
-            .is_none_or(|draft| draft.id != id);
+            .is_some_and(|draft| draft.id != id);
         if restart {
+            // Moving to another field commits the previous draft instead of
+            // silently dropping the edit.
+            self.commit_rename();
+        }
+        if self.ui.rename.as_ref().is_none_or(|draft| draft.id != id) {
             let original = self
                 .session
                 .clip_by_id(id)
@@ -471,7 +515,11 @@ impl App {
             }
             AppEvent::DenoiseUnavailable { id, reason } => {
                 if let Some(clip) = self.session.editing_mut(id) {
+                    // A missing/broken provider only means "no denoise"; the
+                    // take stays editable and exportable.
                     clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
+                    clip.denoise.task_id.clear();
+                    clip.denoise.reason = reason.clone();
                 }
                 // Ambient state, not an action result: surface it in the
                 // settings drawer instead of overwriting the status bar.
@@ -510,6 +558,7 @@ impl App {
                 self.apply_decoded(id, path, audio, rms, lufs);
                 if let Some(clip) = self.session.editing_mut(id) {
                     clip.denoise.status = crate::model::DenoiseStatus::Complete;
+                    clip.denoise.reason = None;
                 }
                 self.session.denoise_note = None;
                 if was_selected {
@@ -532,11 +581,49 @@ impl App {
                 }
                 if let Some(clip) = self.session.editing_mut(id) {
                     clip.denoise.status = crate::model::DenoiseStatus::Failed;
+                    clip.denoise.task_id.clear();
+                    clip.denoise.reason = Some(error.clone());
                 }
                 // Background denoise failures are ambient: the row badge and
                 // the drawer already show them, so do not overwrite the status
                 // bar result of whatever the user just did.
                 self.session.denoise_note = Some(error);
+            }
+            AppEvent::OriginalAudioRestored {
+                id,
+                path,
+                audio,
+                rms,
+            } => {
+                let was_selected = self.session.selected_track == Some(id);
+                if self
+                    .session
+                    .playback
+                    .as_ref()
+                    .is_some_and(|playback| playback.track_id == id)
+                {
+                    self.stop_playback(true);
+                }
+                self.apply_decoded(id, path, audio, rms, None);
+                if let Some(clip) = self.session.editing_mut(id) {
+                    clip.denoise = crate::model::DenoiseState::skipped();
+                    clip.denoise.reason = Some("Using the normalized original audio.".into());
+                }
+                if was_selected {
+                    self.refresh_silence_inputs();
+                }
+                let name = self
+                    .session
+                    .clip_by_id(id)
+                    .map(|clip| clip.name.clone())
+                    .unwrap_or_default();
+                self.ui.message = format!("{name} now plays its original audio.");
+            }
+            AppEvent::OriginalAudioRestoreFailed { id, error } => {
+                self.ui.message = format!("Unable to restore the original audio: {error}");
+                if let Some(clip) = self.session.editing_mut(id) {
+                    clip.denoise.reason = Some(error);
+                }
             }
             AppEvent::ExportCompleted {
                 results,
@@ -915,25 +1002,75 @@ impl App {
         );
     }
 
+    /// Queues denoising for `id` unless the user opted out or a task is
+    /// already running. Manual requests (`force`) bypass the automatic switch.
     fn queue_denoise(&mut self, id: MediaId) {
+        self.queue_denoise_inner(id, false)
+    }
+
+    fn queue_denoise_forced(&mut self, id: MediaId) {
+        self.queue_denoise_inner(id, true)
+    }
+
+    fn queue_denoise_inner(&mut self, id: MediaId, force: bool) {
         let Some(clip) = self.session.clip_by_id(id) else {
             return;
         };
-        if matches!(
-            clip.denoise.status,
-            crate::model::DenoiseStatus::Queued | crate::model::DenoiseStatus::Processing
-        ) {
+        if clip.denoise.status.is_busy()
+            || (!force && clip.denoise.status == crate::model::DenoiseStatus::Skipped)
+        {
             return;
+        }
+        if !force {
+            // The global switch means "denoise new media automatically". When
+            // it is off the take keeps its normalized audio and the inspector
+            // can still trigger it explicitly.
+            let automatic = self
+                .session
+                .denoise_status
+                .as_ref()
+                .map(|status| status.effective.enabled)
+                .unwrap_or(true);
+            if !automatic {
+                // A build without a provider cannot denoise at all; anything
+                // else is a user preference that can be overridden per take.
+                let (provider_usable, provider_summary) = self
+                    .session
+                    .denoise_status
+                    .as_ref()
+                    .map(|status| (status.provider_id != "disabled", status.summary.clone()))
+                    .unwrap_or((false, String::new()));
+                if let Some(clip) = self.session.editing_mut(id) {
+                    if provider_usable {
+                        let mut skipped = crate::model::DenoiseState::skipped();
+                        skipped.reason = Some(
+                            "Automatic denoising is off. You can denoise this take manually."
+                                .into(),
+                        );
+                        clip.denoise = skipped;
+                    } else {
+                        clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
+                        clip.denoise.task_id.clear();
+                        clip.denoise.reason = Some(if provider_summary.is_empty() {
+                            "Denoising is not available.".into()
+                        } else {
+                            provider_summary
+                        });
+                    }
+                }
+                return;
+            }
         }
         let Some(audio) = clip.audio.clone() else {
             return;
         };
-        let path = clip.path.clone();
+        let path = clip.denoise_source().to_string();
         let task_id = new_id().to_string();
         if let Some(clip) = self.session.editing_mut(id) {
             clip.denoise = crate::model::DenoiseState {
                 status: crate::model::DenoiseStatus::Queued,
                 task_id: task_id.clone(),
+                reason: None,
             };
         }
         if let Some(track) = self.session.track_mut(id) {
@@ -949,6 +1086,62 @@ impl App {
             self.session.target_lufs,
             task_id,
         );
+    }
+
+    /// Per-take denoising switch. Turning it off keeps the normalized source
+    /// (the take stays fully editable and exportable); turning it back on
+    /// queues a new task unless one is already running.
+    fn set_denoise(&mut self, id: MediaId, enabled: bool) {
+        let Some(clip) = self.session.clip_by_id(id) else {
+            return;
+        };
+        let name = clip.name.clone();
+        let status = clip.denoise.status;
+        let restore_path = clip
+            .has_original_audio()
+            .then(|| clip.normalized_path.clone());
+        if !enabled {
+            if status == crate::model::DenoiseStatus::Skipped {
+                return;
+            }
+            let was_denoised = status == crate::model::DenoiseStatus::Complete;
+            if let Some(clip) = self.session.editing_mut(id) {
+                let mut skipped = crate::model::DenoiseState::skipped();
+                skipped.reason = Some("Denoising is off for this take.".into());
+                clip.denoise = skipped;
+            }
+            if let Some(track) = self.session.track_mut(id) {
+                track.touch();
+            }
+            match restore_path {
+                Some(path) if was_denoised => {
+                    // Swap the decoded buffer back to the normalized source in
+                    // the background; the take stays visible meanwhile.
+                    self.ui.message = format!("Restoring the original audio of {name}…");
+                    jobs::restore_original_audio(self.services.events.clone(), id, path);
+                }
+                _ => {
+                    self.ui.message = format!("{name} keeps its original audio.");
+                }
+            }
+            return;
+        }
+        if status.is_busy() {
+            return;
+        }
+        if status == crate::model::DenoiseStatus::Complete {
+            self.ui.message = format!("{name} is already denoised.");
+            return;
+        }
+        if let Some(clip) = self.session.editing_mut(id) {
+            // Clear the opt-out/failure marker so `queue_denoise` accepts the
+            // take again; it re-checks provider availability itself.
+            clip.denoise.status = crate::model::DenoiseStatus::Unavailable;
+            clip.denoise.task_id.clear();
+            clip.denoise.reason = None;
+        }
+        self.ui.message = format!("Queuing denoising for {name}.");
+        self.queue_denoise_forced(id);
     }
 
     fn requeue_denoise_candidates(&mut self) {
@@ -1082,6 +1275,15 @@ impl App {
             self.select_track_for_interaction(id);
         }
         if let Some(track) = self.session.track_mut(id) {
+            // Zooming from "fit" starts at the scale currently on screen, so
+            // the first wheel tick feels continuous instead of snapping.
+            if !track.zoom_locked {
+                let fit = track.effective_pixels_per_second(crate::ui::canvas_width(
+                    self.window_size.width,
+                ));
+                track.pixels_per_second = fit;
+                track.zoom_locked = true;
+            }
             let factor = if delta < 0.0 { 1.15 } else { 1.0 / 1.15 };
             track.pixels_per_second = (track.pixels_per_second * factor).clamp(0.25, 400.0);
             track.bump_revision();
@@ -1186,7 +1388,7 @@ impl App {
         }
         if let Some(range) = range {
             self.ui.message = format!(
-                "Range selected: {}. Press M to mute or restore sound.",
+                "Range selected: {}. M mutes it, Delete cuts it out.",
                 format_time_standard(range.duration())
             );
         }
@@ -1221,6 +1423,43 @@ impl App {
             },
             format_time_standard(range.duration())
         );
+    }
+
+    /// Cuts the selected range out of the timeline (unlike mute, the result is
+    /// shorter). Reversible with the region's Restore action or a left-drag
+    /// while holding the right button.
+    fn delete_selected_range(&mut self) {
+        let Some((id, range)) = self
+            .session
+            .selected_track()
+            .and_then(|track| track.selected_range.map(|range| (track.id(), range)))
+        else {
+            return;
+        };
+        if self
+            .session
+            .selected_track()
+            .is_some_and(|track| track.collapsed)
+        {
+            return;
+        }
+        self.stop_playback(false);
+        let mut removed_duration = range.duration();
+        if let Some(track) = self.session.track_mut(id) {
+            let before = track.edited_duration();
+            track.manual_deleted = merge_regions(&track.manual_deleted, range);
+            track.selected_range = None;
+            track.touch();
+            removed_duration = (before - track.edited_duration()).max(0.0);
+        }
+        self.ui.message = if removed_duration > 0.001 {
+            format!(
+                "Cut {} out of the timeline",
+                format_time_standard(removed_duration)
+            )
+        } else {
+            "That range was already removed.".into()
+        };
     }
 
     fn waveform_event(&mut self, id: MediaId, event: WaveformEvent) {
@@ -1408,6 +1647,18 @@ impl App {
         self.ui.message = "Cleared automatic silence cuts.".into();
     }
 
+    fn clear_envelope(&mut self) {
+        let Some(track) = self.session.selected_track_mut() else {
+            return;
+        };
+        if track.envelope.is_empty() {
+            return;
+        }
+        track.envelope.clear();
+        track.touch();
+        self.ui.message = "Cleared the volume envelope.".into();
+    }
+
     fn start_export(&mut self, ids: Vec<MediaId>, single: bool) {
         if !self.session.exporting.is_empty() {
             self.ui.message = "An export is already running.".into();
@@ -1540,6 +1791,28 @@ impl App {
             }
             Shortcut::Import => {
                 let _ = self.update(Message::ImportPressed);
+            }
+            Shortcut::DeleteSelection => {
+                if !self.ui.settings_open {
+                    let _ = self.update(Message::DeleteRange);
+                }
+            }
+            Shortcut::AddSelected => {
+                if let Some(id) = self.session.selected_media {
+                    self.add_to_timeline(id);
+                }
+            }
+            Shortcut::JumpStart => {
+                let _ = self.update(Message::JumpToStart);
+            }
+            Shortcut::JumpEnd => {
+                let _ = self.update(Message::JumpToEnd);
+            }
+            Shortcut::ZoomIn => {
+                let _ = self.update(Message::ZoomSelected(true));
+            }
+            Shortcut::ZoomOut => {
+                let _ = self.update(Message::ZoomSelected(false));
             }
         }
     }
@@ -1762,6 +2035,19 @@ mod tests {
     }
 
     #[test]
+    fn starting_a_second_rename_commits_the_first_draft() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        add_ready_media(&mut app, 2);
+        let _ = app.update(Message::RenameMedia(1, "First".into()));
+        let _ = app.update(Message::RenameMedia(2, "Second".into()));
+        let _ = app.update(Message::RenameCommit);
+
+        assert_eq!(app.session.clip_by_id(1).unwrap().name, "First");
+        assert_eq!(app.session.clip_by_id(2).unwrap().name, "Second");
+    }
+
+    #[test]
     fn escape_discards_an_uncommitted_rename() {
         let mut app = app();
         add_ready_media(&mut app, 1);
@@ -1945,6 +2231,238 @@ mod tests {
             app.services.denoise.status().configured.executable_path
         );
         assert!(!app.ui.settings.busy);
+    }
+
+    #[test]
+    fn stopping_when_idle_is_a_no_op() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        app.session.playhead = 0.3;
+
+        let _ = app.update(Message::StopPlayback);
+
+        assert!(app.session.playback.is_none());
+        assert!((app.session.playhead - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn home_and_end_move_the_playhead_to_the_track_boundaries() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+
+        let _ = app.update(Message::JumpToEnd);
+        assert!((app.session.playhead - 1.0).abs() < 1e-9);
+        let _ = app.update(Message::JumpToStart);
+        assert_eq!(app.session.playhead, 0.0);
+    }
+
+    #[test]
+    fn clear_envelope_removes_every_keyframe_and_requeues_export() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        app.session.track_mut(1).unwrap().envelope = vec![
+            simple_audio_cut_core::region::EnvelopePoint::new("a", 0.2, 0.5),
+            simple_audio_cut_core::region::EnvelopePoint::new("b", 0.6, 1.4),
+        ];
+        app.session.track_mut(1).unwrap().mark_exported();
+        assert!(!app.session.track(1).unwrap().needs_export());
+
+        let _ = app.update(Message::ClearEnvelope);
+
+        let track = app.session.track(1).unwrap();
+        assert!(track.envelope.is_empty());
+        assert_eq!(app.ui.message, "Cleared the volume envelope.");
+    }
+
+    #[test]
+    fn zooming_changes_only_the_selected_track_scale() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        add_ready_media(&mut app, 2);
+        let _ = app.update(Message::AddToTimeline(1));
+        let _ = app.update(Message::AddToTimeline(2));
+        let _ = app.update(Message::SelectTrack(1));
+        let other = app.session.track(2).unwrap().pixels_per_second;
+        assert!(!app.session.track(1).unwrap().zoom_locked);
+
+        // The first zoom pins the current on-screen "fit" scale.
+        let _ = app.update(Message::ZoomSelected(true));
+        let pinned = app.session.track(1).unwrap().pixels_per_second;
+        assert!(app.session.track(1).unwrap().zoom_locked);
+        assert_eq!(app.session.track(2).unwrap().pixels_per_second, other);
+        assert!(!app.session.track(2).unwrap().zoom_locked);
+
+        let _ = app.update(Message::ZoomSelected(false));
+        let zoomed_out = app.session.track(1).unwrap().pixels_per_second;
+        assert!(zoomed_out < pinned);
+        let _ = app.update(Message::ZoomSelected(true));
+        assert!((app.session.track(1).unwrap().pixels_per_second - pinned).abs() < 1e-3);
+    }
+
+    #[test]
+    fn enter_moves_the_selected_library_item_onto_the_timeline() {
+        let mut app = app();
+        add_ready_media(&mut app, 5);
+        let _ = app.update(Message::SelectMedia(5));
+
+        let _ = app.update(Message::Shortcut(crate::message::Shortcut::AddSelected));
+
+        assert!(app.session.media(5).is_none());
+        assert!(app.session.track(5).is_some());
+    }
+
+    #[test]
+    fn turning_denoising_off_keeps_the_take_editable_and_exportable() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: false,
+        });
+
+        let clip = app.session.clip_by_id(1).unwrap();
+        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
+        assert!(clip.ready());
+        assert!(app.ui.message.contains("original audio"));
+        // The take is still a normal timeline track that needs export.
+        assert!(app.session.track(1).unwrap().needs_export());
+        assert!(app.session.changed_tracks().contains(&1));
+    }
+
+    #[test]
+    fn automatic_off_marks_new_takes_as_original_audio() {
+        let mut app = app();
+        let mut config = app.services.denoise.status().configured;
+        config.enabled = false;
+        let status = app
+            .services
+            .denoise
+            .save_config(config)
+            .expect("disable automatic denoising");
+        app.session.denoise_status = Some(status);
+        add_ready_media(&mut app, 1);
+
+        let clip = app.session.clip_by_id(1).unwrap();
+        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
+        assert!(clip
+            .denoise
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Automatic denoising is off"));
+
+        // The take can still be denoised explicitly.
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: true,
+        });
+        assert!(matches!(
+            app.session.clip_by_id(1).unwrap().denoise.status,
+            crate::model::DenoiseStatus::Queued | crate::model::DenoiseStatus::Unavailable
+        ));
+    }
+
+    #[test]
+    fn opting_out_of_denoising_is_not_overridden_by_the_requeue_sweep() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: false,
+        });
+
+        app.requeue_denoise_candidates();
+
+        assert_eq!(
+            app.session.clip_by_id(1).unwrap().denoise.status,
+            crate::model::DenoiseStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn re_enabling_denoising_clears_the_opt_out() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: false,
+        });
+
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: true,
+        });
+
+        let status = app.session.clip_by_id(1).unwrap().denoise.status;
+        assert!(matches!(
+            status,
+            crate::model::DenoiseStatus::Queued | crate::model::DenoiseStatus::Unavailable
+        ));
+    }
+
+    #[test]
+    fn an_unavailable_provider_records_the_reason_without_blocking_export() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        app.services.events.emit(AppEvent::DenoiseUnavailable {
+            id: 1,
+            reason: Some("ClearVoice is not configured.".into()),
+        });
+        let _ = app.update(Message::Tick);
+
+        let clip = app.session.clip_by_id(1).unwrap();
+        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Unavailable);
+        assert_eq!(
+            clip.denoise.reason.as_deref(),
+            Some("ClearVoice is not configured.")
+        );
+        assert!(clip.ready());
+        assert!(app.session.track(1).unwrap().needs_export());
+        // Nothing is left "processing", so quitting is not blocked by it.
+        assert_eq!(app.session.pending_denoise(), 0);
+    }
+
+    #[test]
+    fn a_denoised_take_can_be_switched_back_to_its_normalized_audio() {
+        let mut app = app();
+        add_ready_media(&mut app, 1);
+        let _ = app.update(Message::AddToTimeline(1));
+        {
+            let clip = app.session.editing_mut(1).unwrap();
+            clip.denoise.status = crate::model::DenoiseStatus::Complete;
+            clip.path = "/tmp/denoised.wav".into();
+        }
+        assert!(app.session.clip_by_id(1).unwrap().has_original_audio());
+
+        let _ = app.update(Message::SetDenoise {
+            id: 1,
+            enabled: false,
+        });
+        // The swap itself happens on a worker thread; simulate its result.
+        let clip = app.session.clip_by_id(1).unwrap();
+        let path = clip.normalized_path.clone();
+        let audio = clip.audio.clone().unwrap();
+        let rms = clip.rms.clone().unwrap();
+        app.services.events.emit(AppEvent::OriginalAudioRestored {
+            id: 1,
+            path: path.clone(),
+            audio,
+            rms,
+        });
+        let _ = app.update(Message::Tick);
+
+        let clip = app.session.clip_by_id(1).unwrap();
+        assert_eq!(clip.path, path);
+        assert_eq!(clip.denoise.status, crate::model::DenoiseStatus::Skipped);
+        assert!(!clip.has_original_audio());
     }
 
     #[test]

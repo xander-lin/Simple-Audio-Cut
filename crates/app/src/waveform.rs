@@ -1,5 +1,9 @@
 //! Waveform canvas: one canvas per timeline track, internally wrapped into
 //! rows the same way the original editor wrapped long audio.
+//!
+//! Each row is split into a 16px time ruler and the waveform body below it.
+//! The ruler makes navigation precise without hovering, and gives the playhead
+//! a handle to grab visually.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -16,14 +20,18 @@ use simple_audio_cut_core::region::{envelope_gain_at_time, EnvelopePoint, Region
 use crate::message::{Message, WaveformEvent};
 use crate::model::MediaId;
 use crate::theme;
-use crate::ui::format_time_compact;
+use crate::ui::{format_ruler_time, format_time_precise};
 
-pub const ROW_HEIGHT: f32 = 120.0;
+pub const ROW_HEIGHT: f32 = 136.0;
 pub const ROW_GAP: f32 = 10.0;
+/// Height of the time ruler at the top of every row.
+pub const RULER_HEIGHT: f32 = 17.0;
 const EDGE_MIN: f32 = 24.0;
 const HIT_RADIUS: f32 = 14.0;
 const LINE_HIT_RADIUS: f32 = 8.0;
 const EDIT_POINT_HIT: f32 = 6.0;
+/// Minimum horizontal distance between ruler labels.
+const RULER_MIN_LABEL_GAP: f32 = 64.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowLayout {
@@ -114,7 +122,6 @@ impl WaveformCache {
             revision: Cell::new(u64::MAX),
         }
     }
-
 }
 
 /// Everything the waveform needs to draw itself.
@@ -181,6 +188,18 @@ impl<'a> TrackCanvas<'a> {
         }
     }
 
+    fn content_height() -> f32 {
+        ROW_HEIGHT - RULER_HEIGHT
+    }
+
+    fn content_top(top: f32) -> f32 {
+        top + RULER_HEIGHT
+    }
+
+    fn content_center(top: f32) -> f32 {
+        Self::content_top(top) + Self::content_height() / 2.0
+    }
+
     fn x_at_time(row: &RowLayout, time: f64) -> f32 {
         let progress = if row.end > row.start {
             ((time - row.start) / (row.end - row.start)).clamp(0.0, 1.0)
@@ -195,12 +214,15 @@ impl<'a> TrackCanvas<'a> {
         row.start + progress as f64 * (row.end - row.start)
     }
 
+    /// Vertical position of `gain` inside the waveform body of a row.
     fn y_at_gain(gain: f64) -> f32 {
-        (ROW_HEIGHT as f64 * (1.0 - gain / 2.0)) as f32
+        let height = Self::content_height() as f64;
+        (height * (1.0 - gain / 2.0)) as f32
     }
 
     fn gain_at_y(y: f32) -> f64 {
-        (2.0 * (1.0 - y as f64 / ROW_HEIGHT as f64)).clamp(0.0, 2.0)
+        let height = Self::content_height() as f64;
+        (2.0 * (1.0 - y as f64 / height)).clamp(0.0, 2.0)
     }
 
     fn row_top(index: usize) -> f32 {
@@ -226,23 +248,45 @@ impl<'a> TrackCanvas<'a> {
             .collect()
     }
 
+    /// Cache key for the static layer. Selection and threshold rendering live
+    /// in the cached frame, so they must invalidate it too — otherwise
+    /// selecting a track would keep the previous track's guidelines.
+    fn cache_key(&self) -> u64 {
+        let mut key = self.revision;
+        key = key.wrapping_mul(31).wrapping_add(self.selected as u64);
+        key = key.wrapping_mul(31).wrapping_add(self.show_threshold as u64);
+        key = key
+            .wrapping_mul(31)
+            .wrapping_add((self.threshold_db * 100.0) as i64 as u64);
+        key
+    }
+
     fn draw_base(&self, frame: &mut Frame, bounds: Rectangle) {
         let rows = layout_rows(bounds.width, self.duration, self.pixels_per_second);
+        let background = if self.selected {
+            theme::WAVE_SELECTED_BG
+        } else {
+            theme::WAVE_BG
+        };
         for row in rows {
             let top = Self::row_top(row.index);
             let row_rect = Rectangle::new(
                 Point::new(0.0, top),
                 Size::new(bounds.width, ROW_HEIGHT),
             );
-            frame.fill_rectangle(row_rect.position(), row_rect.size(), Color::from_rgb(0.102, 0.129, 0.122));
+            frame.fill_rectangle(row_rect.position(), row_rect.size(), background);
+
+            self.draw_ruler(frame, &row, top, bounds.width);
+
+            let center = Self::content_center(top);
             // Center line.
             frame.fill_rectangle(
-                Point::new(row.leading, top + ROW_HEIGHT / 2.0),
+                Point::new(row.leading, center),
                 Size::new(row.timeline_width(), 1.0),
-                Color::from_rgb(0.22, 0.27, 0.25),
+                Color::from_rgba(0.30, 0.36, 0.40, 0.55),
             );
-            self.draw_rms(frame, &row, top);
             self.draw_peaks(frame, &row, top);
+            self.draw_rms(frame, &row, top);
             if self.show_threshold {
                 let radius = Self::rms_radius(
                     simple_audio_cut_core::analysis::dbfs_to_amplitude(self.threshold_db),
@@ -252,34 +296,77 @@ impl<'a> TrackCanvas<'a> {
                 draw_dashed_rule(
                     frame,
                     row.leading,
-                    top + ROW_HEIGHT / 2.0 - radius,
+                    center - radius,
                     row.timeline_width(),
                     color,
                 );
                 draw_dashed_rule(
                     frame,
                     row.leading,
-                    top + ROW_HEIGHT / 2.0 + radius,
+                    center + radius,
                     row.timeline_width(),
                     color,
                 );
             }
-            frame.fill_text(Text {
-                content: format_time_compact(row.end),
-                position: Point::new(
-                    (bounds.width - 6.0f32).max(0.0),
-                    top + ROW_HEIGHT - 16.0,
-                ),
-                color: Color::from_rgba(0.55, 0.64, 0.60, 0.8),
-                size: 10.0.into(),
-                ..Text::default()
-            });
         }
+    }
+
+    /// 16px ruler: background, tick marks, faint grid in the body and labels.
+    fn draw_ruler(&self, frame: &mut Frame, row: &RowLayout, top: f32, width: f32) {
+        frame.fill_rectangle(
+            Point::new(0.0, top),
+            Size::new(width, RULER_HEIGHT),
+            theme::RULER_BG,
+        );
+        let step = ruler_step(self.pixels_per_second);
+        let first = (row.start / step).ceil() * step;
+        let mut time = first;
+        let mut guard = 0;
+        while time <= row.end && guard < 4096 {
+            guard += 1;
+            let x = Self::x_at_time(row, time);
+            let tick_top = top + RULER_HEIGHT - 5.0;
+            frame.fill_rectangle(
+                Point::new(x, tick_top),
+                Size::new(1.0, 4.0),
+                theme::RULER_TICK,
+            );
+            // Faint grid line through the waveform body, so time is readable
+            // without counting ticks.
+            frame.fill_rectangle(
+                Point::new(x, Self::content_top(top)),
+                Size::new(1.0, Self::content_height()),
+                Color::from_rgba(0.55, 0.62, 0.66, 0.07),
+            );
+            if self.ruler_label_fits(row, x) {
+                frame.fill_text(Text {
+                    content: format_ruler_time(time, step),
+                    position: Point::new(x + 4.0, top + 2.0),
+                    color: theme::RULER_TEXT,
+                    size: 9.0.into(),
+                    ..Text::default()
+                });
+            }
+            time += step;
+        }
+        // Row end label, right-aligned in the ruler.
+        frame.fill_text(Text {
+            content: format_ruler_time(row.end, step),
+            position: Point::new((width - 44.0).max(0.0), top + 2.0),
+            color: theme::RULER_TEXT,
+            size: 9.0.into(),
+            ..Text::default()
+        });
+    }
+
+    fn ruler_label_fits(&self, row: &RowLayout, x: f32) -> bool {
+        let end = x + 34.0;
+        end < row.leading + row.timeline_width() + row.trailing - 44.0
     }
 
     fn rms_radius(amplitude: f64) -> f32 {
         let normalized = ((amplitude_to_dbfs(amplitude, -70.0) + 70.0) / 70.0).clamp(0.0, 1.0);
-        (normalized as f32) * (ROW_HEIGHT / 2.0 - 4.0)
+        (normalized as f32) * (Self::content_height() / 2.0 - 4.0)
     }
 
     fn draw_rms(&self, frame: &mut Frame, row: &RowLayout, top: f32) {
@@ -291,7 +378,7 @@ impl<'a> TrackCanvas<'a> {
         if columns.is_empty() {
             return;
         }
-        let center = top + ROW_HEIGHT / 2.0;
+        let center = Self::content_center(top);
         let max_upper: Vec<f32> = columns
             .iter()
             .map(|column| center - Self::rms_radius(column.max))
@@ -300,7 +387,7 @@ impl<'a> TrackCanvas<'a> {
             .iter()
             .map(|column| center + Self::rms_radius(column.max))
             .collect();
-        // Filled band: the loudest RMS in every pixel column.
+        // The RMS band is a quiet underlay: peaks above it stay the focus.
         let band = Path::new(|builder| {
             builder.move_to(Point::new(row.leading, max_upper[0]));
             for (index, y) in max_upper.iter().enumerate().skip(1) {
@@ -311,40 +398,43 @@ impl<'a> TrackCanvas<'a> {
             }
             builder.close();
         });
-        frame.fill(&band, Color::from_rgba(0.41, 0.58, 0.67, 0.24));
+        frame.fill(
+            &band,
+            Color {
+                a: if self.selected { 0.20 } else { 0.16 },
+                ..theme::RMS_FILL
+            },
+        );
         frame.stroke(
             &band,
             Stroke::default()
-                .with_color(Color::from_rgba(0.52, 0.69, 0.78, 0.72))
+                .with_color(Color {
+                    a: if self.selected { 0.55 } else { 0.25 },
+                    ..theme::RMS_EDGE
+                })
                 .with_width(1.0),
         );
 
-        // Quiet contour: the softest RMS in every pixel column, drawn as the
-        // two symmetric guides the old canvas used.
-        let min_upper: Vec<f32> = columns
-            .iter()
-            .map(|column| center - Self::rms_radius(column.min))
-            .collect();
-        let min_lower: Vec<f32> = columns
-            .iter()
-            .map(|column| center + Self::rms_radius(column.min))
-            .collect();
-        let contour = Path::new(|builder| {
-            builder.move_to(Point::new(row.leading, min_upper[0]));
-            for (index, y) in min_upper.iter().enumerate().skip(1) {
-                builder.line_to(Point::new(row.leading + index as f32, *y));
-            }
-            builder.move_to(Point::new(row.leading, min_lower[0]));
-            for (index, y) in min_lower.iter().enumerate().skip(1) {
-                builder.line_to(Point::new(row.leading + index as f32, *y));
-            }
-        });
-        frame.stroke(
-            &contour,
-            Stroke::default()
-                .with_color(Color::from_rgba(0.84, 0.90, 0.87, 0.88))
-                .with_width(1.0),
-        );
+        // Quiet contour: a single soft line at the softest RMS per column,
+        // matching the original editor's white minimum-level trace.
+        if self.selected {
+            let min_line: Vec<f32> = columns
+                .iter()
+                .map(|column| center - Self::rms_radius(column.min))
+                .collect();
+            let contour = Path::new(|builder| {
+                builder.move_to(Point::new(row.leading, min_line[0]));
+                for (index, y) in min_line.iter().enumerate().skip(1) {
+                    builder.line_to(Point::new(row.leading + index as f32, *y));
+                }
+            });
+            frame.stroke(
+                &contour,
+                Stroke::default()
+                    .with_color(Color::from_rgba(0.93, 0.96, 0.95, 0.35))
+                    .with_width(1.0),
+            );
+        }
     }
 
     fn draw_peaks(&self, frame: &mut Frame, row: &RowLayout, top: f32) {
@@ -357,6 +447,19 @@ impl<'a> TrackCanvas<'a> {
         let span = last - first;
         let channels = self.audio.channel_count().max(1);
         let stride = (span / (width * 64)).max(1);
+        let center = Self::content_center(top);
+        let half = Self::content_height() / 2.0;
+        let color = if self.selected {
+            Color {
+                a: 0.78,
+                ..theme::WAVE_FILL
+            }
+        } else {
+            Color {
+                a: 0.85,
+                ..theme::WAVE_FILL_DIM
+            }
+        };
         let path = Path::new(|builder| {
             for x in 0..width {
                 let bin_start = first + span * x / width;
@@ -379,17 +482,13 @@ impl<'a> TrackCanvas<'a> {
                     min = 0.0;
                     max = 0.0;
                 }
-                let center = top + ROW_HEIGHT / 2.0;
-                let half = ROW_HEIGHT / 2.0;
                 builder.move_to(Point::new(row.leading + x as f32, center + min * half));
                 builder.line_to(Point::new(row.leading + x as f32, center + max * half));
             }
         });
         frame.stroke(
             &path,
-            Stroke::default()
-                .with_color(Color::from_rgb(0.46, 0.68, 0.58))
-                .with_width(1.0),
+            Stroke::default().with_color(color).with_width(1.0),
         );
     }
 
@@ -397,7 +496,8 @@ impl<'a> TrackCanvas<'a> {
         let rows = layout_rows(bounds.width, self.duration, self.pixels_per_second);
         for row in &rows {
             let top = Self::row_top(row.index);
-            let center = top + ROW_HEIGHT / 2.0;
+            let content_top = Self::content_top(top);
+            let center = Self::content_center(top);
 
             for region in &self.deleted {
                 let start = region.start.max(row.start);
@@ -408,16 +508,26 @@ impl<'a> TrackCanvas<'a> {
                 let left = Self::x_at_time(row, start);
                 let width = (Self::x_at_time(row, end) - left).max(1.0);
                 frame.fill_rectangle(
-                    Point::new(left, top),
-                    Size::new(width, ROW_HEIGHT),
-                    Color::from_rgba(0.06, 0.07, 0.07, 0.72),
+                    Point::new(left, content_top),
+                    Size::new(width, Self::content_height()),
+                    Color::from_rgba(0.05, 0.06, 0.07, 0.78),
                 );
-                if width > 58.0 {
+                draw_hatch(
+                    frame,
+                    left,
+                    content_top,
+                    width,
+                    Self::content_height(),
+                    Color::from_rgba(0.72, 0.78, 0.79, 0.16),
+                );
+                // A small restore glyph only: full labels on every cut turned
+                // the waveform into a wall of text.
+                if width > 26.0 {
                     frame.fill_text(Text {
-                        content: "Restore".into(),
-                        position: Point::new(left + 7.0, center - 7.0),
-                        color: Color::from_rgba(0.85, 0.89, 0.88, 0.85),
-                        size: 11.0.into(),
+                        content: "↺".into(),
+                        position: Point::new(left + 6.0, center - 8.0),
+                        color: Color::from_rgba(0.82, 0.88, 0.87, 0.55),
+                        size: 12.0.into(),
                         ..Text::default()
                     });
                 }
@@ -432,16 +542,26 @@ impl<'a> TrackCanvas<'a> {
                 let left = Self::x_at_time(row, start);
                 let width = (Self::x_at_time(row, end) - left).max(1.0);
                 frame.fill_rectangle(
-                    Point::new(left, top),
-                    Size::new(width, ROW_HEIGHT),
-                    Color::from_rgba(0.84, 0.74, 0.35, 0.16),
+                    Point::new(left, content_top),
+                    Size::new(width, Self::content_height()),
+                    Color::from_rgba(0.84, 0.74, 0.35, 0.14),
+                );
+                frame.fill_rectangle(
+                    Point::new(left, content_top),
+                    Size::new(1.0, Self::content_height()),
+                    Color::from_rgba(0.84, 0.74, 0.35, 0.45),
+                );
+                frame.fill_rectangle(
+                    Point::new(left + width - 1.0, content_top),
+                    Size::new(1.0, Self::content_height()),
+                    Color::from_rgba(0.84, 0.74, 0.35, 0.45),
                 );
                 if width > 46.0 {
                     frame.fill_text(Text {
                         content: "Muted".into(),
-                        position: Point::new(left + 7.0, center - 7.0),
-                        color: Color::from_rgba(0.84, 0.74, 0.35, 0.85),
-                        size: 11.0.into(),
+                        position: Point::new(left + 8.0, center - 7.0),
+                        color: Color::from_rgba(0.90, 0.81, 0.47, 0.9),
+                        size: 10.0.into(),
                         ..Text::default()
                     });
                 }
@@ -454,19 +574,26 @@ impl<'a> TrackCanvas<'a> {
                     let left = Self::x_at_time(row, start);
                     let width = (Self::x_at_time(row, end) - left).max(1.0);
                     frame.fill_rectangle(
-                        Point::new(left, top),
-                        Size::new(width, ROW_HEIGHT),
-                        Color::from_rgba(0.41, 0.58, 0.67, 0.20),
+                        Point::new(left, content_top),
+                        Size::new(width, Self::content_height()),
+                        Color::from_rgba(0.37, 0.75, 0.68, 0.20),
+                    );
+                    // Solid edges plus a bar under the ruler make the range
+                    // readable even when it sits on top of a deleted region.
+                    frame.fill_rectangle(
+                        Point::new(left, content_top),
+                        Size::new(1.5, Self::content_height()),
+                        theme::CYAN,
                     );
                     frame.fill_rectangle(
-                        Point::new(left, top),
-                        Size::new(1.0, ROW_HEIGHT),
-                        Color::from_rgba(0.70, 0.85, 0.92, 0.75),
+                        Point::new(left + width - 1.5, content_top),
+                        Size::new(1.5, Self::content_height()),
+                        theme::CYAN,
                     );
                     frame.fill_rectangle(
-                        Point::new(left + width - 1.0, top),
-                        Size::new(1.0, ROW_HEIGHT),
-                        Color::from_rgba(0.70, 0.85, 0.92, 0.75),
+                        Point::new(left, top + RULER_HEIGHT - 2.0),
+                        Size::new(width, 2.0),
+                        theme::CYAN,
                     );
                 }
             }
@@ -480,7 +607,7 @@ impl<'a> TrackCanvas<'a> {
                         let gain = envelope_gain_at_time(&self.envelope, self.duration, time);
                         let point = Point::new(
                             Self::x_at_time(row, time),
-                            top + Self::y_at_gain(gain),
+                            content_top + Self::y_at_gain(gain),
                         );
                         if index == 0 {
                             builder.move_to(point);
@@ -492,20 +619,23 @@ impl<'a> TrackCanvas<'a> {
                 frame.stroke(
                     &path,
                     Stroke::default()
-                        .with_color(Color::from_rgba(0.84, 0.74, 0.35, 0.9))
+                        .with_color(Color {
+                            a: if self.show_envelope { 0.92 } else { 0.45 },
+                            ..theme::ACCENT
+                        })
                         .with_width(1.6),
                 );
                 for point in self.visible_envelope(row) {
                     let center = Point::new(
                         Self::x_at_time(row, point.time),
-                        top + Self::y_at_gain(point.gain),
+                        content_top + Self::y_at_gain(point.gain),
                     );
                     let circle = Path::circle(center, 4.5);
                     frame.fill(&circle, Color::from_rgba(0.95, 0.86, 0.52, 0.95));
                     frame.stroke(
                         &circle,
                         Stroke::default()
-                            .with_color(Color::from_rgba(0.16, 0.18, 0.16, 0.9))
+                            .with_color(Color::from_rgba(0.13, 0.15, 0.14, 0.9))
                             .with_width(1.0),
                     );
                 }
@@ -517,17 +647,17 @@ impl<'a> TrackCanvas<'a> {
                 }
                 let x = Self::x_at_time(row, *edit_point);
                 frame.fill_rectangle(
-                    Point::new(x - 0.5, top),
-                    Size::new(1.0, ROW_HEIGHT),
-                    Color::from_rgba(0.47, 0.72, 0.82, 0.85),
+                    Point::new(x - 0.5, content_top),
+                    Size::new(1.0, Self::content_height()),
+                    Color::from_rgba(0.37, 0.75, 0.68, 0.85),
                 );
                 let marker = Path::new(|builder| {
-                    builder.move_to(Point::new(x - 4.0, top));
-                    builder.line_to(Point::new(x + 4.0, top));
-                    builder.line_to(Point::new(x, top + 7.0));
+                    builder.move_to(Point::new(x - 4.0, top + RULER_HEIGHT - 8.0));
+                    builder.line_to(Point::new(x + 4.0, top + RULER_HEIGHT - 8.0));
+                    builder.line_to(Point::new(x, top + RULER_HEIGHT));
                     builder.close();
                 });
-                frame.fill(&marker, Color::from_rgba(0.47, 0.72, 0.82, 0.95));
+                frame.fill(&marker, Color::from_rgba(0.37, 0.75, 0.68, 0.95));
             }
 
             if let Some(drag) = &state.drag {
@@ -546,11 +676,22 @@ impl<'a> TrackCanvas<'a> {
                             }
                         };
                         frame.fill_rectangle(
-                            Point::new(left, top),
-                            Size::new(width, ROW_HEIGHT),
+                            Point::new(left, content_top),
+                            Size::new(width, Self::content_height()),
                             color,
                         );
                     }
+                }
+            }
+
+            if let Some(hover) = state.hover_time {
+                if hover >= row.start && hover <= row.end {
+                    let x = Self::x_at_time(row, hover);
+                    frame.fill_rectangle(
+                        Point::new(x, content_top),
+                        Size::new(1.0, Self::content_height()),
+                        Color::from_rgba(0.85, 0.90, 0.92, 0.18),
+                    );
                 }
             }
 
@@ -560,8 +701,15 @@ impl<'a> TrackCanvas<'a> {
                     frame.fill_rectangle(
                         Point::new(x - 1.0, top),
                         Size::new(2.0, ROW_HEIGHT),
-                        theme::ACCENT,
+                        theme::PLAYHEAD,
                     );
+                    let handle = Path::new(|builder| {
+                        builder.move_to(Point::new(x - 5.0, top));
+                        builder.line_to(Point::new(x + 5.0, top));
+                        builder.line_to(Point::new(x, top + 7.0));
+                        builder.close();
+                    });
+                    frame.fill(&handle, theme::PLAYHEAD);
                 }
             }
         }
@@ -571,28 +719,49 @@ impl<'a> TrackCanvas<'a> {
         if let Some((x, y, gain)) = state.envelope_hover {
             let text_position = Point::new(
                 (x + 10.0).min(bounds.width - 70.0).max(4.0),
-                (y - 30.0).clamp(4.0, (bounds.height - 24.0).max(4.0)),
+                (y - 26.0).clamp(4.0, (bounds.height - 20.0).max(4.0)),
             );
             frame.fill_text(Text {
                 content: format_gain(gain),
                 position: text_position,
                 color: theme::ACCENT,
-                size: 11.0.into(),
+                size: 10.0.into(),
                 ..Text::default()
             });
         }
+        if let Some(hover) = state.hover_time {
+            let rows = layout_rows(bounds.width, self.duration, self.pixels_per_second);
+            if let Some(row) = rows
+                .iter()
+                .find(|row| hover >= row.start && hover <= row.end)
+            {
+                let x = Self::x_at_time(row, hover);
+                let label = format_time_precise(hover);
+                let width = (label.len() as f32 * 5.6 + 10.0).max(38.0);
+                let left = (x + 6.0).min(bounds.width - width - 4.0).max(4.0);
+                frame.fill_rectangle(
+                    Point::new(left, bounds.height - 16.0),
+                    Size::new(width, 14.0),
+                    Color::from_rgba(0.06, 0.07, 0.08, 0.88),
+                );
+                frame.fill_text(Text {
+                    content: label,
+                    position: Point::new(left + 5.0, bounds.height - 15.0),
+                    color: theme::TEXT_SOFT,
+                    size: 9.0.into(),
+                    ..Text::default()
+                });
+            }
+        }
     }
 
-    fn hit_envelope_point(
-        &self,
-        row: &RowLayout,
-        local: Point,
-    ) -> Option<EnvelopePoint> {
+    fn hit_envelope_point(&self, row: &RowLayout, local: Point) -> Option<EnvelopePoint> {
+        let y = local.y - RULER_HEIGHT;
         self.visible_envelope(row)
             .into_iter()
             .find(|point| {
                 let dx = Self::x_at_time(row, point.time) - local.x;
-                let dy = Self::y_at_gain(point.gain) - local.y;
+                let dy = Self::y_at_gain(point.gain) - y;
                 (dx * dx + dy * dy).sqrt() <= HIT_RADIUS
             })
             .cloned()
@@ -601,7 +770,10 @@ impl<'a> TrackCanvas<'a> {
     fn hit_envelope_line(&self, local: Point, time: f64) -> Option<f64> {
         let gain = envelope_gain_at_time(&self.envelope, self.duration, time);
         let y = Self::y_at_gain(gain);
-        (y - local.y).abs().le(&LINE_HIT_RADIUS).then_some(gain)
+        (y - (local.y - RULER_HEIGHT))
+            .abs()
+            .le(&LINE_HIT_RADIUS)
+            .then_some(gain)
     }
 
     fn hit_edit_point(&self, row: &RowLayout, local: Point) -> Option<f64> {
@@ -626,54 +798,20 @@ fn deleted_at_time(regions: &[Region], time: f64) -> Option<Region> {
         .find(|region| time >= region.start && time < region.end)
 }
 
-/// One waveform pixel column reduced to the quietest and loudest RMS frame it
-/// covers.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RmsColumn {
-    min: f64,
-    max: f64,
-}
-
-/// Buckets RMS frames into pixel columns, the way the original canvas did.
-fn rms_columns(rms: &[RmsFrame], start: f64, end: f64, width: usize) -> Vec<RmsColumn> {
-    let mut columns = Vec::with_capacity(width);
-    if width == 0 || rms.is_empty() || end <= start {
-        return columns;
-    }
-    let mut index = rms.partition_point(|frame| frame.time < start).saturating_sub(1);
-    let mut previous = rms[index].amplitude;
-    let span = end - start;
-    for column in 0..width {
-        let bin_end = start + span * (column + 1) as f64 / width as f64;
-        let mut min = f64::INFINITY;
-        let mut max = 0.0_f64;
-        while index < rms.len() && rms[index].time < bin_end && rms[index].time <= end {
-            min = min.min(rms[index].amplitude);
-            max = max.max(rms[index].amplitude);
-            previous = rms[index].amplitude;
-            index += 1;
+/// Chooses the ruler interval that keeps labels at least
+/// [`RULER_MIN_LABEL_GAP`] pixels apart.
+pub fn ruler_step(pixels_per_second: f32) -> f64 {
+    const STEPS: [f64; 15] = [
+        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+        3600.0,
+    ];
+    let pps = pixels_per_second.max(0.25) as f64;
+    for step in STEPS {
+        if step * pps >= RULER_MIN_LABEL_GAP as f64 {
+            return step;
         }
-        if !min.is_finite() {
-            min = previous;
-        }
-        if max == 0.0 {
-            max = previous;
-        }
-        columns.push(RmsColumn { min, max });
     }
-    columns
-}
-
-/// Draws a dashed horizontal rule (5px dash, 4px gap) at `y`.
-fn draw_dashed_rule(frame: &mut Frame, x: f32, y: f32, length: f32, color: Color) {
-    const DASH: f32 = 5.0;
-    const GAP: f32 = 4.0;
-    let mut offset = 0.0;
-    while offset < length {
-        let segment = DASH.min(length - offset);
-        frame.fill_rectangle(Point::new(x + offset, y), Size::new(segment, 1.0), color);
-        offset += DASH + GAP;
-    }
+    STEPS[STEPS.len() - 1]
 }
 
 fn format_gain(gain: f64) -> String {
@@ -689,6 +827,7 @@ fn format_gain(gain: f64) -> String {
 pub struct CanvasState {
     drag: Option<Drag>,
     envelope_hover: Option<(f32, f32, f64)>,
+    hover_time: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -774,6 +913,12 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                 if *button != mouse::Button::Left {
                     return None;
                 }
+                // The ruler is a scrub strip: clicking it seeks without ever
+                // starting a range selection.
+                if local.y < RULER_HEIGHT {
+                    state.drag = None;
+                    return publish(WaveformEvent::Seek(time));
+                }
                 if self.blade {
                     state.drag = None;
                     return publish(WaveformEvent::Blade(time));
@@ -788,7 +933,11 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                         return Some(Action::capture());
                     }
                     if let Some(gain) = self.hit_envelope_line(local, time) {
-                        let point = EnvelopePoint::new(format!("point-{}", crate::model::new_id()), time, gain);
+                        let point = EnvelopePoint::new(
+                            format!("point-{}", crate::model::new_id()),
+                            time,
+                            gain,
+                        );
                         state.drag = Some(Drag::Envelope {
                             id: point.id.clone(),
                         });
@@ -809,6 +958,7 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let Some(position) = cursor.position_in(bounds) else {
                     state.envelope_hover = None;
+                    state.hover_time = None;
                     return None;
                 };
                 if let Some(drag) = state.drag.clone() {
@@ -834,27 +984,31 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                         Drag::Envelope { id } => {
                             let (row, local) = Self::row_at(bounds, &rows, position)?;
                             let time = Self::time_at_x(&row, local.x);
-                            let gain = Self::gain_at_y(local.y);
+                            let gain = Self::gain_at_y(local.y - RULER_HEIGHT);
                             state.envelope_hover =
                                 Some((local.x, Self::row_top(row.index) + local.y, gain));
                             return publish(WaveformEvent::EnvelopeMove { id, time, gain });
                         }
                     }
                 }
-                if self.show_envelope {
-                    if let Some((row, local)) = Self::row_at(bounds, &rows, position) {
-                        let time = Self::time_at_x(&row, local.x);
+                if let Some((row, local)) = Self::row_at(bounds, &rows, position) {
+                    let time = Self::time_at_x(&row, local.x);
+                    state.hover_time = Some(time);
+                    if self.show_envelope {
                         let gain = envelope_gain_at_time(&self.envelope, self.duration, time);
                         let y = Self::y_at_gain(gain);
-                        state.envelope_hover = if (y - local.y).abs() <= 12.0 {
-                            Some((local.x, Self::row_top(row.index) + y, gain))
+                        state.envelope_hover = if (y - (local.y - RULER_HEIGHT)).abs() <= 12.0 {
+                            Some((local.x, Self::row_top(row.index) + RULER_HEIGHT + y, gain))
                         } else {
                             None
                         };
+                    } else {
+                        state.envelope_hover = None;
                     }
-                } else {
-                    state.envelope_hover = None;
+                    return Some(Action::request_redraw());
                 }
+                state.hover_time = None;
+                state.envelope_hover = None;
                 None
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => {
@@ -896,6 +1050,7 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 state.envelope_hover = None;
+                state.hover_time = None;
                 Some(Action::request_redraw())
             }
             _ => None,
@@ -910,9 +1065,10 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        if self.cache.revision.get() != self.revision {
+        let key = self.cache_key();
+        if self.cache.revision.get() != key {
             self.cache.cache.clear();
-            self.cache.revision.set(self.revision);
+            self.cache.revision.set(key);
         }
         let base = self.cache.cache.draw(renderer, bounds.size(), |frame| {
             self.draw_base(frame, bounds);
@@ -924,7 +1080,7 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
                 Point::ORIGIN,
                 bounds.size(),
                 Stroke::default()
-                    .with_color(Color::from_rgba(0.46, 0.68, 0.58, 0.55))
+                    .with_color(Color::from_rgba(0.37, 0.75, 0.68, 0.35))
                     .with_width(1.0),
             );
         }
@@ -945,9 +1101,95 @@ impl canvas::Program<Message> for TrackCanvas<'_> {
     }
 }
 
+/// One waveform pixel column reduced to the quietest and loudest RMS frame it
+/// covers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RmsColumn {
+    min: f64,
+    max: f64,
+}
+
+/// Buckets RMS frames into pixel columns, the way the original canvas did.
+fn rms_columns(rms: &[RmsFrame], start: f64, end: f64, width: usize) -> Vec<RmsColumn> {
+    let mut columns = Vec::with_capacity(width);
+    if width == 0 || rms.is_empty() || end <= start {
+        return columns;
+    }
+    let mut index = rms
+        .partition_point(|frame| frame.time < start)
+        .saturating_sub(1);
+    let mut previous = rms[index].amplitude;
+    let span = end - start;
+    for column in 0..width {
+        let bin_end = start + span * (column + 1) as f64 / width as f64;
+        let mut min = f64::INFINITY;
+        let mut max = 0.0_f64;
+        while index < rms.len() && rms[index].time < bin_end && rms[index].time <= end {
+            min = min.min(rms[index].amplitude);
+            max = max.max(rms[index].amplitude);
+            previous = rms[index].amplitude;
+            index += 1;
+        }
+        if !min.is_finite() {
+            min = previous;
+        }
+        if max == 0.0 {
+            max = previous;
+        }
+        columns.push(RmsColumn { min, max });
+    }
+    columns
+}
+
+/// Draws a dashed horizontal rule (5px dash, 4px gap) at `y`.
+fn draw_dashed_rule(frame: &mut Frame, x: f32, y: f32, length: f32, color: Color) {
+    const DASH: f32 = 5.0;
+    const GAP: f32 = 4.0;
+    let mut offset = 0.0;
+    while offset < length {
+        let segment = DASH.min(length - offset);
+        frame.fill_rectangle(Point::new(x + offset, y), Size::new(segment, 1.0), color);
+        offset += DASH + GAP;
+    }
+}
+
+/// Diagonal hatching that marks audio removed from the output.
+fn draw_hatch(
+    frame: &mut Frame,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    color: Color,
+) {
+    const SPACING: f32 = 9.0;
+    let mut offset = -height;
+    while offset < width {
+        let start_x = left + offset.max(0.0);
+        let start_y = top + (-offset).max(0.0);
+        let visible = (width - offset.max(0.0)).min(height + offset);
+        if visible > 0.0 {
+            let path = Path::new(|builder| {
+                builder.move_to(Point::new(start_x, start_y));
+                builder.line_to(Point::new(
+                    start_x + visible.min(height - (-offset).max(0.0)),
+                    start_y + visible.min(height - (-offset).max(0.0)),
+                ));
+            });
+            frame.stroke(
+                &path,
+                Stroke::default().with_color(color).with_width(1.0),
+            );
+        }
+        offset += SPACING;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{canvas_height, deleted_at_time, layout_rows, rms_columns, ROW_GAP, ROW_HEIGHT};
+    use super::{
+        canvas_height, deleted_at_time, layout_rows, rms_columns, ruler_step, ROW_GAP, ROW_HEIGHT,
+    };
     use simple_audio_cut_core::analysis::RmsFrame;
     use simple_audio_cut_core::region::Region;
 
@@ -1014,5 +1256,19 @@ mod tests {
         assert_eq!(deleted_at_time(&regions, 1.0), Some(Region::new(1.0, 2.0)));
         assert_eq!(deleted_at_time(&regions, 1.5), Some(Region::new(1.0, 2.0)));
         assert_eq!(deleted_at_time(&regions, 2.0), None);
+    }
+
+    #[test]
+    fn ruler_step_keeps_labels_readable_at_every_zoom_level() {
+        for pps in [0.25_f32, 4.0, 12.0, 48.0, 120.0, 400.0] {
+            let step = ruler_step(pps) as f32;
+            assert!(
+                step * pps >= 64.0,
+                "labels would collide at {pps} px/s (step {step})"
+            );
+        }
+        // Zooming in must never make the interval coarser.
+        assert!(ruler_step(400.0) <= ruler_step(48.0));
+        assert!(ruler_step(48.0) <= ruler_step(1.0));
     }
 }

@@ -99,9 +99,8 @@ impl DenoiseProvider for MockDenoiseProvider {
     }
 
     fn prepare(&self, _source_sample_rate: u32) -> Result<Box<dyn DenoiseSession>, String> {
-        if !self.configured().enabled {
-            return Err("Mock denoising is disabled.".into());
-        }
+        // `enabled` only controls automatic runs for new media; an explicit
+        // request from the inspector is always served.
         Ok(Box::new(MockDenoiseSession))
     }
 }
@@ -112,14 +111,15 @@ mod tests {
     use crate::denoise::DenoiseProvider;
 
     #[test]
-    fn saved_configuration_controls_mock_availability() {
+    fn saved_configuration_controls_automatic_mock_availability() {
         let provider = MockDenoiseProvider::new();
         let mut config = provider.status().configured;
         config.enabled = false;
 
         let status = provider.save_config(config).expect("save mock config");
 
+        // Automatic runs stop, but an explicit per-take request still works.
         assert!(!status.ready);
-        assert!(provider.prepare(48_000).is_err());
+        assert!(provider.prepare(48_000).is_ok());
     }
 }

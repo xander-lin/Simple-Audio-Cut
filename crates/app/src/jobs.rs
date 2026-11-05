@@ -190,6 +190,14 @@ pub fn export_tracks(
     });
 }
 
+/// Loads a take's normalized (pre-denoise) audio back into the editor.
+pub fn restore_original_audio(events: SharedSink, id: MediaId, path: String) {
+    spawn(move || match load_audio(&path) {
+        Ok((audio, rms)) => events.emit(AppEvent::OriginalAudioRestored { id, path, audio, rms }),
+        Err(error) => events.emit(AppEvent::OriginalAudioRestoreFailed { id, error }),
+    });
+}
+
 pub fn provider_status(denoise: Arc<dyn DenoiseProvider>, events: SharedSink) {
     spawn(move || {
         events.emit(AppEvent::SettingsStatus(Ok(denoise.status())));

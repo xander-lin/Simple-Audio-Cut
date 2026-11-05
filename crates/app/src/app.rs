@@ -10,6 +10,9 @@ use crate::services::Services;
 use crate::theme;
 use crate::update::App;
 
+/// Initial window size, shared by the window settings and the layout state.
+pub const DEFAULT_WINDOW_SIZE: Size = Size::new(1280.0, 820.0);
+
 /// Launches an application whose initial state is produced by `boot`.
 ///
 /// Used by `examples/seed_preview` for visual inspection of the editor with
@@ -17,16 +20,41 @@ use crate::update::App;
 pub fn preview(
     boot: impl Fn() -> App + Clone + Send + Sync + 'static,
 ) -> iced::Application<impl iced::Program<State = App, Message = Message, Theme = iced::Theme>> {
+    // `boot` builds the state only; the monitor probe still has to run so the
+    // layout can tell a full-screen window from a half-screen one.
+    let boot = move || {
+        let monitor = iced::window::latest()
+            .and_then(iced::window::monitor_size)
+            .map(Message::MonitorResolved);
+        let mut app = boot();
+        app.window_size = preview_size();
+        (app, monitor)
+    };
     iced::application(boot, App::update, App::view)
         .title("Simple Audio Cut — preview")
         .theme(|_: &App| theme::theme())
         .window(window::Settings {
-            size: Size::new(1100.0, 760.0),
-            min_size: Some(Size::new(760.0, 600.0)),
+            size: preview_size(),
+            min_size: Some(Size::new(860.0, 620.0)),
             ..window::Settings::default()
         })
         .exit_on_close_request(false)
         .subscription(subscription)
+}
+
+/// Preview size, overridable so the two layouts can be inspected.
+pub fn preview_size() -> Size {
+    let read = |key: &str, fallback: f32| {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 320.0)
+            .unwrap_or(fallback)
+    };
+    Size::new(
+        read("PREVIEW_WIDTH", 1360.0),
+        read("PREVIEW_HEIGHT", 880.0),
+    )
 }
 
 pub fn run() -> iced::Result {
@@ -53,8 +81,8 @@ pub fn run() -> iced::Result {
     .title("Simple Audio Cut")
     .theme(|_: &App| theme::theme())
     .window(window::Settings {
-        size: Size::new(1100.0, 760.0),
-        min_size: Some(Size::new(760.0, 600.0)),
+        size: DEFAULT_WINDOW_SIZE,
+        min_size: Some(Size::new(860.0, 620.0)),
         ..window::Settings::default()
     })
     .exit_on_close_request(false)
@@ -103,11 +131,17 @@ fn keyboard_shortcut(
     }
     let shortcut = match key {
         Key::Named(Named::Escape) => return Some(Message::Dismiss),
+        Key::Named(Named::Enter) => Shortcut::AddSelected,
+        Key::Named(Named::Delete) | Key::Named(Named::Backspace) => Shortcut::DeleteSelection,
+        Key::Named(Named::Home) => Shortcut::JumpStart,
+        Key::Named(Named::End) => Shortcut::JumpEnd,
         Key::Named(Named::Space) => Shortcut::TogglePlayback,
         Key::Character("k" | "K") => Shortcut::TogglePlayback,
         Key::Character("j" | "J") => Shortcut::Back,
         Key::Character("l" | "L") => Shortcut::Forward,
         Key::Character("m" | "M") => Shortcut::MuteRange,
+        Key::Character("[" | "{") => Shortcut::ZoomOut,
+        Key::Character("]" | "}") => Shortcut::ZoomIn,
         Key::Character("b" | "B") | Key::Character("c" | "C") => Shortcut::Blade,
         Key::Character("a" | "A") | Key::Character("v" | "V") => Shortcut::DirectEdit,
         _ => return None,

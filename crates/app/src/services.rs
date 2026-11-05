@@ -219,9 +219,28 @@ impl Services {
         dialogs: Arc<dyn DialogService>,
         events: SharedSink,
     ) -> Self {
+        Self::headless_with(
+            engine,
+            Arc::new(MockDenoiseProvider::new()),
+            player,
+            dialogs,
+            events,
+        )
+    }
+
+    /// Like [`Services::headless`], but shares one denoise provider with the
+    /// engine — the production wiring. Tests that configure the provider must
+    /// use this, or the engine and the UI would disagree about availability.
+    pub fn headless_with(
+        engine: Arc<dyn AudioEngine>,
+        denoise: Arc<dyn DenoiseProvider>,
+        player: Arc<dyn AudioPlayer>,
+        dialogs: Arc<dyn DialogService>,
+        events: SharedSink,
+    ) -> Self {
         Self {
             engine,
-            denoise: Arc::new(MockDenoiseProvider::new()),
+            denoise,
             player,
             dialogs,
             export_dirs: Arc::new(MemoryExportDirectoryStore::new()),
