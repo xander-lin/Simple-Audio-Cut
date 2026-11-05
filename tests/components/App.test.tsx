@@ -90,8 +90,24 @@ class FakeAudioContext {
   close = vi.fn(async () => { this.state = "closed"; });
 }
 
+interface TestResizeObserver {
+  callback: () => void;
+  element: Element | null;
+}
+
+const resizeObservers: TestResizeObserver[] = [];
+
+function resizeObservedElements(width: number) {
+  for (const observer of resizeObservers) {
+    if (!observer.element) continue;
+    Object.defineProperty(observer.element, "clientWidth", { configurable: true, value: width });
+    observer.callback();
+  }
+}
+
 beforeEach(() => {
   mocks.listeners.clear();
+  resizeObservers.length = 0;
   mocks.confirm.mockResolvedValue(true);
   mocks.open.mockResolvedValue("/tmp/voice.wav");
   mocks.invoke.mockImplementation((command: string) => {
@@ -103,7 +119,18 @@ beforeEach(() => {
   vi.stubGlobal("AudioBuffer", FakeAudioBuffer);
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(16) })));
   vi.stubGlobal("ResizeObserver", class {
-    observe() {}
+    callback: () => void;
+    element: Element | null = null;
+
+    constructor(callback: () => void) {
+      this.callback = callback;
+      resizeObservers.push(this);
+    }
+
+    observe(element: Element) {
+      this.element = element;
+    }
+
     disconnect() {}
   });
 });
@@ -236,5 +263,66 @@ describe("App playback recovery", () => {
     });
     expect(replacement.createBufferSource).toHaveBeenCalledTimes(1);
     expect(replacement.sources[0].start).toHaveBeenCalledTimes(1);
+  });
+
+  it("restarts playback after seeking to another position in the selected track", async () => {
+    const contexts: PlaybackAudioContext[] = [];
+
+    class PlaybackAudioContext extends FakeAudioContext {
+      destination = {};
+      readonly sources: Array<{
+        start: ReturnType<typeof vi.fn>;
+        stop: ReturnType<typeof vi.fn>;
+        connect: ReturnType<typeof vi.fn>;
+        onended: (() => void) | null;
+      }> = [];
+      createBufferSource = vi.fn(() => {
+        const source = {
+          buffer: null,
+          connect: vi.fn(),
+          onended: null as (() => void) | null,
+          start: vi.fn(),
+          stop: vi.fn(),
+        };
+        this.sources.push(source);
+        return source;
+      });
+
+      constructor() {
+        super();
+        contexts.push(this);
+      }
+    }
+
+    vi.stubGlobal("AudioContext", PlaybackAudioContext);
+    render(<App />);
+    await importReadySource();
+    fireEvent.click(screen.getByRole("button", { name: "Add voice to timeline" }));
+    const context = contexts[0];
+
+    fireEvent.click(screen.getByTitle("Play / pause (Space)"));
+    await act(async () => {
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+    });
+    expect(context.sources).toHaveLength(1);
+    expect(context.sources[0].start).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resizeObservedElements(800);
+      await Promise.resolve();
+    });
+    const waveform = screen.getByRole("application");
+    Object.defineProperty(waveform, "getBoundingClientRect", {
+      value: () => ({ left: 0, top: 0, width: 800, height: 120, right: 800, bottom: 120, x: 0, y: 0, toJSON() {} }),
+    });
+    fireEvent.mouseDown(waveform, { button: 0, buttons: 1, clientX: 300, clientY: 20, detail: 1 });
+    fireEvent.mouseUp(waveform, { button: 0, clientX: 300, clientY: 20 });
+    await act(async () => {
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+    });
+
+    expect(context.sources).toHaveLength(2);
+    expect(context.sources[0].stop).toHaveBeenCalled();
+    expect(context.sources[1].start).toHaveBeenCalledTimes(1);
   });
 });

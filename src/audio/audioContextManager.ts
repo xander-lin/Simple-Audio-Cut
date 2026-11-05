@@ -61,6 +61,12 @@ export class MockAudioContextFactory implements AudioContextFactory<MockAudioCon
   }
 }
 
+export type AudioContextLifecycleReason = "reset" | "context-closed";
+
+export interface AudioContextLifecycleEvent {
+  reason: AudioContextLifecycleReason;
+}
+
 export const AUDIO_CONTEXT_PLAYBACK_TIMEOUT_MS = 2_000;
 
 export class AudioContextOperationTimeoutError extends Error {
@@ -112,10 +118,28 @@ export class AudioContextManager<T extends ManagedAudioContext> {
   private closed = false;
   private closePromise: Promise<void> | null = null;
   private lifecycleVersion = 0;
+  private readonly lifecycleListeners = new Set<(event: AudioContextLifecycleEvent) => void>();
   private readonly factory: AudioContextFactory<T>;
 
   constructor(factory: AudioContextFactory<T>) {
     this.factory = factory;
+  }
+
+  subscribe(listener: (event: AudioContextLifecycleEvent) => void) {
+    this.lifecycleListeners.add(listener);
+    return () => {
+      this.lifecycleListeners.delete(listener);
+    };
+  }
+
+  private notifyLifecycle(reason: AudioContextLifecycleReason) {
+    for (const listener of [...this.lifecycleListeners]) {
+      try {
+        listener({ reason });
+      } catch {
+        // Playback cleanup must never prevent the context from being replaced.
+      }
+    }
   }
 
   requestReset() {
@@ -190,6 +214,7 @@ export class AudioContextManager<T extends ManagedAudioContext> {
         this.resetRequested = false;
         this.context = this.factory.create();
       } else if (this.context.state === "closed") {
+        this.notifyLifecycle("context-closed");
         this.lifecycleVersion += 1;
         this.resetRequested = false;
         this.context = this.factory.create();
@@ -211,6 +236,7 @@ export class AudioContextManager<T extends ManagedAudioContext> {
     if (this.resetPromise) return this.resetPromise;
     this.resetRequested = false;
     const previous = this.context;
+    if (previous && previous.state !== "closed") this.notifyLifecycle("reset");
     this.resetPromise = (async () => {
       await this.waitForIdle();
       if (previous && previous.state !== "closed") await previous.close();

@@ -204,6 +204,50 @@ test("keeps a reset request made while the previous reset is closing", async () 
   assert.equal(factory.contexts.length, 3);
 });
 
+test("notifies playback listeners before resetting a context", async () => {
+  const manager = new AudioContextManager(new MockAudioContextFactory());
+  const first = await manager.get();
+  const events = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event.reason));
+
+  manager.requestReset();
+  const replacement = await manager.get();
+  unsubscribe();
+  manager.requestReset();
+  await manager.get();
+
+  assert.deepEqual(events, ["reset"]);
+  assert.notStrictEqual(replacement, first);
+  assert.equal(first.closeCalls, 1);
+});
+
+test("notifies playback listeners when a closed context is replaced", async () => {
+  const manager = new AudioContextManager(new MockAudioContextFactory());
+  const first = await manager.get();
+  const events = [];
+  manager.subscribe((event) => events.push(event.reason));
+
+  first.state = "closed";
+  const replacement = await manager.get();
+
+  assert.deepEqual(events, ["context-closed"]);
+  assert.notStrictEqual(replacement, first);
+});
+
+test("keeps context replacement working when a playback listener throws", async () => {
+  const manager = new AudioContextManager(new MockAudioContextFactory());
+  const first = await manager.get();
+  manager.subscribe(() => {
+    throw new Error("playback cleanup failed");
+  });
+
+  manager.requestReset();
+  const replacement = await manager.get();
+
+  assert.notStrictEqual(replacement, first);
+  assert.equal(first.closeCalls, 1);
+});
+
 test("waits for active operations before closing and rejects later use", async () => {
   const finishOperation = deferred();
   const factory = new MockAudioContextFactory();

@@ -20,7 +20,7 @@ import {
   BrowserAudioContextFactory,
   resumeAudioContext,
 } from "./audio/audioContextManager";
-import { savedPlaybackPosition } from "./utils/playbackUtils";
+import { playbackSourceMatches, savedPlaybackPosition } from "./utils/playbackUtils";
 import { addEditPoint } from "./utils/directEdit";
 import "./App.css";
 
@@ -181,6 +181,7 @@ function App() {
   const editedPlaybackOffsetRef = useRef(0);
   const playbackKeptRegionsRef = useRef<Region[]>([]);
   const playbackRequestRef = useRef(0);
+  const isPlayingRef = useRef(false);
   const animationFrameRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const trackContextMenuRef = useRef<HTMLDivElement>(null);
@@ -225,6 +226,7 @@ function App() {
     return () => {
       document.removeEventListener("contextmenu", suppressWebViewContextMenu, true);
       playbackRequestRef.current += 1;
+      isPlayingRef.current = false;
       if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
       if (sourceNodeRef.current) {
@@ -319,6 +321,7 @@ function App() {
 
   const stopPlayback = (savePosition: boolean) => {
     playbackRequestRef.current += 1;
+    isPlayingRef.current = false;
     const source = sourceNodeRef.current;
     if (source) {
       source.onended = null;
@@ -348,6 +351,15 @@ function App() {
     editedPlaybackOffsetRef.current = 0;
     setIsPlaying(false);
   };
+
+  useEffect(() => {
+    const manager = audioContextManagerRef.current;
+    if (!manager) return;
+    return manager.subscribe(() => {
+      if (!sourceNodeRef.current && !isPlayingRef.current) return;
+      stopPlayback(true);
+    });
+  }, []);
 
   const decodeRecording = async (info: RecordingInfo): Promise<ReadyRecording> => {
     const response = await fetch(convertFileSrc(info.path));
@@ -693,7 +705,7 @@ function App() {
       playbackContext = context;
       const isCurrentRequest = () => playbackRequest === playbackRequestRef.current
         && selectedTrackIdRef.current === playbackTrackId
-        && editorTracksRef.current.find((track) => track.id === playbackTrackId) === selectedTrack
+        && playbackSourceMatches(editorTracksRef.current.find((track) => track.id === playbackTrackId), selectedTrack)
         && manager.isCurrent(context, playbackContextVersion);
       if (!isCurrentRequest()) return;
       resumeInProgress = true;
@@ -723,6 +735,7 @@ function App() {
         editedPlaybackOffsetRef.current = 0;
         playbackContextRef.current = null;
         playbackKeptRegionsRef.current = [];
+        isPlayingRef.current = false;
         setIsPlaying(false);
         playbackOffsetRef.current = 0;
         setCurrentTime(0);
@@ -739,6 +752,7 @@ function App() {
         return;
       }
       setIsPlaying(true);
+      isPlayingRef.current = true;
       const tick = () => {
         if (sourceNodeRef.current !== source || playbackRequest !== playbackRequestRef.current) return;
         const editedTime = editedPlaybackOffsetRef.current + context.currentTime - startedAtRef.current;
@@ -1058,8 +1072,30 @@ function App() {
     }));
   };
 
+  const shortcutStateRef = useRef({
+    startPlayback,
+    stopPlayback,
+    toggleSelectedRangeMute,
+    selectedTrack,
+    settingsOpen,
+  });
+  shortcutStateRef.current = {
+    startPlayback,
+    stopPlayback,
+    toggleSelectedRangeMute,
+    selectedTrack,
+    settingsOpen,
+  };
+
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      const {
+        startPlayback: startCurrentPlayback,
+        stopPlayback: stopCurrentPlayback,
+        toggleSelectedRangeMute: toggleCurrentRangeMute,
+        selectedTrack: currentTrack,
+        settingsOpen: settingsAreOpen,
+      } = shortcutStateRef.current;
       const target = event.target as HTMLElement | null;
       const key = event.key.toLowerCase();
       if ((event.ctrlKey || event.metaKey) && key === ",") {
@@ -1067,13 +1103,13 @@ function App() {
         setSettingsOpen(true);
         return;
       }
-      if (target?.closest("input, textarea, select, [contenteditable='true']") || settingsOpen) return;
+      if (target?.closest("input, textarea, select, [contenteditable='true']") || settingsAreOpen) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       if (key === " " || key === "k") {
         event.preventDefault();
-        if (!selectedTrack) return;
-        if (isPlaying) stopPlayback(true);
-        else void startPlayback(playbackOffsetRef.current);
+        if (!currentTrack) return;
+        if (isPlayingRef.current) stopCurrentPlayback(true);
+        else void startCurrentPlayback(playbackOffsetRef.current);
         return;
       }
       if (key === "j") {
@@ -1081,20 +1117,20 @@ function App() {
         const next = Math.max(0, playbackOffsetRef.current - 5);
         playbackOffsetRef.current = next;
         setCurrentTime(next);
-        if (isPlaying) void startPlayback(next);
+        if (isPlayingRef.current) void startCurrentPlayback(next);
         return;
       }
       if (key === "l") {
         event.preventDefault();
-        const next = Math.min(selectedTrack?.buffer.duration ?? 0, playbackOffsetRef.current + 5);
+        const next = Math.min(currentTrack?.buffer.duration ?? 0, playbackOffsetRef.current + 5);
         playbackOffsetRef.current = next;
         setCurrentTime(next);
-        if (selectedTrack) void startPlayback(next);
+        if (currentTrack) void startCurrentPlayback(next);
         return;
       }
       if (key === "m") {
         event.preventDefault();
-        toggleSelectedRangeMute();
+        toggleCurrentRangeMute();
         return;
       }
       if (key === "b" || key === "c") {
@@ -1111,7 +1147,7 @@ function App() {
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  });
+  }, []);
 
   return <main className="app-shell">
     <header className="titlebar">
@@ -1186,7 +1222,7 @@ function App() {
         <header className="timeline-heading">
           <div className="timeline-title"><p className="section-kicker">Timeline</p><h2>{selectedTrack?.name ?? (editorTracks.length ? "Select a track" : "Untitled session")}</h2></div>
           <div className="timeline-playback">
-            <button type="button" className="play-control" onClick={() => isPlaying ? stopPlayback(true) : void startPlayback(playbackOffsetRef.current)} disabled={!selectedTrack} title="Play / pause (Space)"><Icon name={isPlaying ? "pause" : "play"} /></button>
+            <button type="button" className="play-control" onClick={() => { if (isPlayingRef.current) stopPlayback(true); else void startPlayback(playbackOffsetRef.current); }} disabled={!selectedTrack} title="Play / pause (Space)"><Icon name={isPlaying ? "pause" : "play"} /></button>
             <span className="timecode"><strong>{formatTimeStandard(currentTime)}</strong><i>/</i><span>{formatTimeStandard(selectedTrack?.buffer.duration ?? 0)}</span></span>
           </div>
           <div className="timeline-heading-meta"><span>{editorTracks.length} {editorTracks.length === 1 ? "track" : "tracks"}</span><span>{pendingExportCount} changed</span></div>
@@ -1224,7 +1260,7 @@ function App() {
               if (track.id === selectedTrackId) return;
               stopPlayback(false); setSelectedTrackId(track.id); selectedTrackIdRef.current = track.id; setCurrentTime(0); playbackOffsetRef.current = 0; editedPlaybackOffsetRef.current = 0;
             }} onScaleContextMenu={(x, y) => setTrackContextMenu({ trackId: track.id, x: Math.max(4, Math.min(x, window.innerWidth - 156)), y: Math.max(4, Math.min(y, window.innerHeight - 52)), kind: "export" })} onScale={(deltaY) => updateTrack(track.id, (current) => ({ ...current, pixelsPerSecond: Math.max(0.25, current.pixelsPerSecond * (deltaY < 0 ? 1.15 : 1 / 1.15)) }))} onSeek={(time) => {
-              setCurrentTime(time); playbackOffsetRef.current = time; updateTrack(track.id, (current) => ({ ...current, selectedRange: null })); if (isPlaying && isSelected) void startPlayback(time);
+              setCurrentTime(time); playbackOffsetRef.current = time; updateTrack(track.id, (current) => ({ ...current, selectedRange: null })); if (isPlayingRef.current && isSelected) void startPlayback(time);
             }} onRangeSelect={(start, end) => {
               setSelectedTrackId(track.id); selectedTrackIdRef.current = track.id; updateTrack(track.id, (current) => ({ ...current, selectedRange: { start, end } })); setMessage(`Range selected: ${formatTimeStandard(end - start)}. Press M to mute or restore sound.`);
             }} onDirectRegionEdit={(start, end, operation) => {

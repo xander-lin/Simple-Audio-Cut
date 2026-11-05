@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { savedPlaybackPosition } from "../src/utils/playbackUtils.ts";
+import { playbackSourceMatches, savedPlaybackPosition } from "../src/utils/playbackUtils.ts";
 
 const timing = {
   contextTime: 12,
@@ -31,4 +31,37 @@ test("uses the playback region snapshot when edits change during playback", () =
 
   assert.equal(savedPlaybackPosition(true, { ...timing, keptRegions: playbackSnapshot }), 8);
   assert.equal(savedPlaybackPosition(true, { ...timing, keptRegions: changedRegions }), 5);
+});
+
+function playbackSource(overrides = {}) {
+  return {
+    buffer: { duration: 10 },
+    manualDeletedRegions: [],
+    silenceRegions: [],
+    mutedRegions: [],
+    envelopePoints: [],
+    ...overrides,
+  };
+}
+
+test("keeps playback valid when a selection updates the track object", () => {
+  const snapshot = playbackSource();
+  const selected = { ...snapshot, selectedRange: { start: 1, end: 2 } };
+
+  assert.equal(playbackSourceMatches(selected, snapshot), true);
+});
+
+test("invalidates playback when audio-affecting edits change the source", () => {
+  const snapshot = playbackSource();
+  const changed = (overrides) => ({ ...snapshot, ...overrides });
+
+  assert.equal(playbackSourceMatches(changed({ buffer: { duration: 10 } }), snapshot), false);
+  assert.equal(playbackSourceMatches(changed({ silenceRegions: [{ start: 1, end: 2 }] }), snapshot), false);
+  assert.equal(playbackSourceMatches(changed({ manualDeletedRegions: [{ start: 1, end: 2 }] }), snapshot), false);
+  assert.equal(playbackSourceMatches(changed({ mutedRegions: [{ start: 1, end: 2 }] }), snapshot), false);
+  assert.equal(playbackSourceMatches(changed({ envelopePoints: [{ id: "point", time: 1, gain: 0.5 }] }), snapshot), false);
+});
+
+test("invalidates playback when the track disappeared", () => {
+  assert.equal(playbackSourceMatches(undefined, playbackSource()), false);
 });

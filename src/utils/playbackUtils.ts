@@ -1,5 +1,25 @@
-import type { Region } from "./regionUtils";
+import type { EnvelopePoint, Region } from "./regionUtils";
 import { originalTimeAtEditedOffset } from "./exportUtils.ts";
+
+export interface PlaybackSourceSnapshot {
+  buffer: AudioBuffer;
+  manualDeletedRegions: Region[];
+  silenceRegions: Region[];
+  mutedRegions: Region[];
+  envelopePoints: EnvelopePoint[];
+}
+
+export function playbackSourceMatches(
+  candidate: PlaybackSourceSnapshot | undefined,
+  snapshot: PlaybackSourceSnapshot,
+) {
+  return candidate !== undefined
+    && candidate.buffer === snapshot.buffer
+    && candidate.manualDeletedRegions === snapshot.manualDeletedRegions
+    && candidate.silenceRegions === snapshot.silenceRegions
+    && candidate.mutedRegions === snapshot.mutedRegions
+    && candidate.envelopePoints === snapshot.envelopePoints;
+}
 
 interface PlaybackTiming {
   contextTime: number;
